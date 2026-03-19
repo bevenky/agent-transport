@@ -2,7 +2,7 @@
 #[derive(Debug, thiserror::Error)]
 pub enum EndpointError {
     #[error("SIP error (code {code}): {message}")]
-    Pjsua { code: i32, message: String },
+    Sip { code: i32, message: String },
 
     #[error("endpoint not initialized")]
     NotInitialized,

@@ -3,14 +3,20 @@ name = "agent-transport"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "SIP transport for AI agents with PJSUA backend"
+description = "SIP transport for AI agents — pure Rust (rsipstack + rtc-rtp)"
 
 [dependencies]
-pjsua-sys = { path = "../pjsua-sys" }
 beep-detector.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 crossbeam-channel.workspace = true
+tokio.workspace = true
+
+rsipstack = "0.4"
+rtc-rtp = "0.9"
+bytes = "1"
+rand = "0.9"
+tokio-util = { version = "0.7", features = ["rt"] }
 
 [features]
 integration = []

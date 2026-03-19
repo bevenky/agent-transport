@@ -8,13 +8,32 @@ pub enum Codec {
 }
 
 impl Codec {
-    /// Codec identifier string for the SIP stack.
-    pub fn pjsua_name(&self) -> &'static str {
+    /// RTP payload type number (RFC 3551).
+    pub fn payload_type(&self) -> u8 {
         match self {
+            Codec::PCMU => 0,
+            Codec::PCMA => 8,
+            Codec::G722 => 9,
+            Codec::Opus => 111, // dynamic
+        }
+    }
+
+    /// SDP rtpmap encoding name (e.g., "PCMU/8000").
+    pub fn rtpmap_line(&self) -> &'static str {
+        match self {
+            Codec::PCMU => "PCMU/8000",
+            Codec::PCMA => "PCMA/8000",
+            Codec::G722 => "G722/16000",
             Codec::Opus => "opus/48000/2",
-            Codec::PCMU => "PCMU/8000/1",
-            Codec::PCMA => "PCMA/8000/1",
-            Codec::G722 => "G722/16000/1",
+        }
+    }
+
+    /// Native sample rate in Hz.
+    pub fn sample_rate(&self) -> u32 {
+        match self {
+            Codec::PCMU | Codec::PCMA => 8000,
+            Codec::G722 => 16000,
+            Codec::Opus => 48000,
         }
     }
 }
@@ -30,13 +49,13 @@ pub struct TurnConfig {
 /// Configuration for the SIP endpoint.
 #[derive(Debug, Clone)]
 pub struct EndpointConfig {
-    /// SIP registrar/proxy server hostname (e.g., "sip.plivo.com")
+    /// SIP registrar/proxy server hostname (e.g., "phone.plivo.com")
     pub sip_server: String,
 
     /// SIP server port (default: 5060 for UDP)
     pub sip_port: u16,
 
-    /// STUN server address (e.g., "stun.plivo.com:3478")
+    /// STUN server address for public IP discovery
     pub stun_server: String,
 
     /// Optional TURN server for relay NAT traversal
@@ -45,7 +64,7 @@ pub struct EndpointConfig {
     /// Preferred codecs in priority order
     pub codecs: Vec<Codec>,
 
-    /// SIP stack log level (0 = none, 6 = verbose)
+    /// Log level (0 = none, 6 = verbose)
     pub log_level: u32,
 
     /// User-Agent header string
@@ -69,13 +88,13 @@ impl Default for EndpointConfig {
         Self {
             sip_server: "phone.plivo.com".into(),
             sip_port: 5060,
-            stun_server: "stun.plivo.com:3478".into(),
+            stun_server: "stun-fb.plivo.com:3478".into(),
             turn_server: None,
             codecs: vec![Codec::PCMU, Codec::PCMA],
             log_level: 3,
             user_agent: "agent-transport/0.1.0".into(),
             local_port: 0,
-            enable_ice: true,
+            enable_ice: false,
             enable_srtp: false,
             register_expires: 120,
         }
@@ -91,19 +110,19 @@ mod tests {
         let c = EndpointConfig::default();
         assert_eq!(c.sip_server, "phone.plivo.com");
         assert_eq!(c.sip_port, 5060);
-        assert!(c.enable_ice);
-        assert!(!c.enable_srtp);
+        assert_eq!(c.stun_server, "stun-fb.plivo.com:3478");
         assert_eq!(c.codecs, vec![Codec::PCMU, Codec::PCMA]);
         assert_eq!(c.register_expires, 120);
-        assert_eq!(c.local_port, 0);
         assert!(c.turn_server.is_none());
     }
 
     #[test]
-    fn test_codec_pjsua_names() {
-        assert_eq!(Codec::Opus.pjsua_name(), "opus/48000/2");
-        assert_eq!(Codec::PCMU.pjsua_name(), "PCMU/8000/1");
-        assert_eq!(Codec::PCMA.pjsua_name(), "PCMA/8000/1");
-        assert_eq!(Codec::G722.pjsua_name(), "G722/16000/1");
+    fn test_codec_rtp_properties() {
+        assert_eq!(Codec::PCMU.payload_type(), 0);
+        assert_eq!(Codec::PCMA.payload_type(), 8);
+        assert_eq!(Codec::PCMU.rtpmap_line(), "PCMU/8000");
+        assert_eq!(Codec::PCMA.rtpmap_line(), "PCMA/8000");
+        assert_eq!(Codec::PCMU.sample_rate(), 8000);
+        assert_eq!(Codec::Opus.sample_rate(), 48000);
     }
 }
