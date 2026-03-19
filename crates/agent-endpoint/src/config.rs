@@ -81,3 +81,29 @@ impl Default for EndpointConfig {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_default_config() {
+        let c = EndpointConfig::default();
+        assert_eq!(c.sip_server, "phone.plivo.com");
+        assert_eq!(c.sip_port, 5060);
+        assert!(c.enable_ice);
+        assert!(!c.enable_srtp);
+        assert_eq!(c.codecs, vec![Codec::PCMU, Codec::PCMA]);
+        assert_eq!(c.register_expires, 120);
+        assert_eq!(c.local_port, 0);
+        assert!(c.turn_server.is_none());
+    }
+
+    #[test]
+    fn test_codec_pjsua_names() {
+        assert_eq!(Codec::Opus.pjsua_name(), "opus/48000/2");
+        assert_eq!(Codec::PCMU.pjsua_name(), "PCMU/8000/1");
+        assert_eq!(Codec::PCMA.pjsua_name(), "PCMA/8000/1");
+        assert_eq!(Codec::G722.pjsua_name(), "G722/16000/1");
+    }
+}

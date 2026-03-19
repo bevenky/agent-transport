@@ -26,17 +26,4 @@ pub enum EndpointError {
     Other(String),
 }
 
-impl EndpointError {
-    /// Create an error from a SIP stack status code.
-    #[allow(dead_code)]
-    pub(crate) fn from_pj_status(status: i32) -> Self {
-        // The SIP stack provides human-readable messages via FFI.
-        // We format them in the endpoint module where we have access to FFI.
-        Self::Pjsua {
-            code: status,
-            message: format!("pj_status={}", status),
-        }
-    }
-}
-
 pub type Result<T> = std::result::Result<T, EndpointError>;

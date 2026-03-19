@@ -1,7 +1,7 @@
 use tracing::{debug, info};
 
-use super::config::BeepDetectorConfig;
-use super::goertzel::GoertzelFilter;
+use crate::config::BeepDetectorConfig;
+use crate::goertzel::GoertzelFilter;
 
 /// Result of processing one audio frame.
 #[derive(Debug, Clone, Copy, PartialEq)]

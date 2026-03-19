@@ -74,3 +74,38 @@ impl CallSession {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_new_outbound_call() {
+        let session = CallSession::new(0, CallDirection::Outbound);
+        assert_eq!(session.state, CallState::Calling);
+        assert_eq!(session.direction, CallDirection::Outbound);
+        assert_eq!(session.call_id, 0);
+        assert!(session.call_uuid.is_none());
+        assert!(session.extra_headers.is_empty());
+        assert!(session.remote_uri.is_empty());
+    }
+
+    #[test]
+    fn test_new_inbound_call() {
+        let session = CallSession::new(1, CallDirection::Inbound);
+        assert_eq!(session.state, CallState::Incoming);
+        assert_eq!(session.direction, CallDirection::Inbound);
+        assert_eq!(session.call_id, 1);
+    }
+
+    #[test]
+    fn test_call_state_is_active() {
+        assert!(CallState::Calling.is_active());
+        assert!(CallState::Incoming.is_active());
+        assert!(CallState::Early.is_active());
+        assert!(CallState::Connecting.is_active());
+        assert!(CallState::Confirmed.is_active());
+        assert!(!CallState::Disconnected.is_active());
+        assert!(!CallState::Failed("err".into()).is_active());
+    }
+}

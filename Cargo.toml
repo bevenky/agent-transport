@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/pjsua-sys",
+    "crates/beep-detector",
     "crates/agent-endpoint",
     "crates/agent-endpoint-python",
     "crates/agent-endpoint-node",
@@ -14,6 +15,7 @@ license = "MIT"
 repository = "https://github.com/bevenky/agent_endpoint"
 
 [workspace.dependencies]
+beep-detector = { path = "crates/beep-detector" }
 thiserror = "2"
 tracing = "0.1"
 crossbeam-channel = "0.5"

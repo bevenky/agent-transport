@@ -7,9 +7,13 @@ description = "SIP user agent for Plivo with PJSUA backend"
 
 [dependencies]
 pjsua-sys = { path = "../pjsua-sys" }
+beep-detector.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 crossbeam-channel.workspace = true
+
+[features]
+integration = []
 
 [dev-dependencies]
 tracing-subscriber = "0.3"

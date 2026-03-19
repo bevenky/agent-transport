@@ -1,0 +1,9 @@
+[package]
+name = "beep-detector"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Voicemail beep detector using Goertzel filters"
+
+[dependencies]
+tracing.workspace = true
