@@ -10,7 +10,7 @@ use napi::threadsafe_function::{
 use napi::JsFunction;
 use napi_derive::napi;
 
-use agent_endpoint::{
+use agent_transport_core::{
     AudioFrame as RustAudioFrame, BeepDetectorConfig as RustBeepConfig,
     CallSession as RustCallSession, Codec as RustCodec,
     EndpointConfig as RustEndpointConfig, EndpointEvent, SipEndpoint as RustSipEndpoint,
@@ -223,14 +223,14 @@ type EventTsfn = ThreadsafeFunction<EventInfo, ErrorStrategy::CalleeHandled>;
 
 /// The main Plivo SIP endpoint.
 #[napi]
-pub struct PlivoEndpoint {
+pub struct SipEndpoint {
     inner: RustSipEndpoint,
     callbacks: Arc<Mutex<HashMap<String, Vec<EventTsfn>>>>,
     event_thread_running: Arc<AtomicBool>,
 }
 
 #[napi]
-impl PlivoEndpoint {
+impl SipEndpoint {
     #[napi(constructor)]
     pub fn new(config: Option<EndpointConfig>) -> Result<Self> {
         let cfg = config.unwrap_or(EndpointConfig {
@@ -502,7 +502,7 @@ impl PlivoEndpoint {
     }
 }
 
-impl PlivoEndpoint {
+impl SipEndpoint {
     fn ensure_event_loop(&self) {
         if self.event_thread_running.swap(true, Ordering::Relaxed) {
             return;

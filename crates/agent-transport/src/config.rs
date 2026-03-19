@@ -73,7 +73,7 @@ impl Default for EndpointConfig {
             turn_server: None,
             codecs: vec![Codec::PCMU, Codec::PCMA],
             log_level: 3,
-            user_agent: "plivo-agent-endpoint/0.1.0".into(),
+            user_agent: "agent-transport/0.1.0".into(),
             local_port: 0,
             enable_ice: true,
             enable_srtp: false,

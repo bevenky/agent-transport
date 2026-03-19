@@ -5,7 +5,7 @@
 //!
 //! # Example
 //! ```no_run
-//! use agent_endpoint::{SipEndpoint, EndpointConfig, Codec, AudioFrame};
+//! use agent_transport::{SipEndpoint, EndpointConfig, Codec, AudioFrame};
 //!
 //! let config = EndpointConfig {
 //!     sip_server: "sip.plivo.com".into(),

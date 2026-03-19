@@ -2,7 +2,7 @@
 //!
 //! Usage: SIP_USERNAME=xxx SIP_PASSWORD=yyy cargo run --example inbound_echo
 
-use agent_endpoint::{EndpointConfig, EndpointEvent, SipEndpoint};
+use agent_transport::{EndpointConfig, EndpointEvent, SipEndpoint};
 use std::env;
 
 fn main() -> anyhow::Result<()> {

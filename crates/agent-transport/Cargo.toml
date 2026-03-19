@@ -1,9 +1,9 @@
 [package]
-name = "agent-endpoint"
+name = "agent-transport"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "SIP user agent for Plivo with PJSUA backend"
+description = "SIP transport for AI agents with PJSUA backend"
 
 [dependencies]
 pjsua-sys = { path = "../pjsua-sys" }

@@ -3,16 +3,16 @@ resolver = "2"
 members = [
     "crates/pjsua-sys",
     "crates/beep-detector",
-    "crates/agent-endpoint",
-    "crates/agent-endpoint-python",
-    "crates/agent-endpoint-node",
+    "crates/agent-transport",
+    "crates/agent-transport-python",
+    "crates/agent-transport-node",
 ]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-repository = "https://github.com/bevenky/agent_endpoint"
+repository = "https://github.com/bevenky/agent_transport"
 
 [workspace.dependencies]
 beep-detector = { path = "crates/beep-detector" }

@@ -5,7 +5,7 @@
 //!
 //! For Plivo endpoints, dial format: sip:<number>@phone.plivo.com
 
-use agent_endpoint::{EndpointConfig, EndpointEvent, SipEndpoint};
+use agent_transport::{EndpointConfig, EndpointEvent, SipEndpoint};
 use std::env;
 use std::time::{Duration, Instant};
 

@@ -3,7 +3,7 @@
 //! Usage:
 //!   SIP_USERNAME=xxx SIP_PASSWORD=yyy cargo run --example call_and_record -- sip:+14157583659@phone.plivo.com
 
-use agent_endpoint::{AudioFrame, EndpointConfig, EndpointEvent, SipEndpoint};
+use agent_transport::{AudioFrame, EndpointConfig, EndpointEvent, SipEndpoint};
 use std::env;
 use std::fs::File;
 use std::io::Write;

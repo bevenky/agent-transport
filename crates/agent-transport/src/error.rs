@@ -1,4 +1,4 @@
-/// Errors returned by the agent endpoint.
+/// Errors returned by the agent transport.
 #[derive(Debug, thiserror::Error)]
 pub enum EndpointError {
     #[error("SIP error (code {code}): {message}")]

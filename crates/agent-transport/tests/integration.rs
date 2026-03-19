@@ -1,12 +1,12 @@
 //! Integration tests — require a live SIP account.
 //!
-//! Run: SIP_USERNAME=xxx SIP_PASSWORD=yyy cargo test -p agent-endpoint --features integration
+//! Run: SIP_USERNAME=xxx SIP_PASSWORD=yyy cargo test -p agent-transport --features integration
 //!
 //! These tests register with a SIP server, make real calls, and verify the full
 //! call lifecycle including audio I/O.
 #![cfg(feature = "integration")]
 
-use agent_endpoint::{AudioFrame, EndpointConfig, EndpointEvent, SipEndpoint};
+use agent_transport::{AudioFrame, EndpointConfig, EndpointEvent, SipEndpoint};
 use std::env;
 use std::time::Duration;
 

@@ -1,12 +1,12 @@
 {
-  "name": "plivo-endpoint",
+  "name": "agent-transport",
   "version": "0.1.0",
-  "description": "Plivo SIP endpoint for AI agents (PJSUA-backed, Rust native)",
+  "description": "SIP transport for AI agents (PJSUA-backed, Rust native)",
   "main": "index.js",
   "types": "index.d.ts",
   "license": "MIT",
   "napi": {
-    "binaryName": "plivo-endpoint",
+    "binaryName": "agent-transport",
     "targets": [
       "aarch64-apple-darwin",
       "x86_64-apple-darwin",

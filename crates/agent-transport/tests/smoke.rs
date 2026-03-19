@@ -1,6 +1,6 @@
 //! Smoke test — verifies PJSUA initializes and shuts down without credentials.
 
-use agent_endpoint::{EndpointConfig, SipEndpoint};
+use agent_transport::{EndpointConfig, SipEndpoint};
 
 #[test]
 fn pjsua_init_and_shutdown() {
@@ -16,7 +16,7 @@ fn pjsua_init_and_shutdown() {
 
 #[test]
 fn audio_frame_basics() {
-    use agent_endpoint::AudioFrame;
+    use agent_transport::AudioFrame;
 
     // 20ms of silence at 48kHz mono
     let frame = AudioFrame::silence(48000, 1, 20);

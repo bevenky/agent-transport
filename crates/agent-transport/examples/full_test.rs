@@ -2,7 +2,7 @@
 //!
 //! Usage: SIP_USERNAME=xxx SIP_PASSWORD=yyy cargo run --example full_test
 
-use agent_endpoint::{AudioFrame, EndpointConfig, EndpointEvent, SipEndpoint};
+use agent_transport::{AudioFrame, EndpointConfig, EndpointEvent, SipEndpoint};
 use std::env;
 use std::fs::File;
 use std::io::Write;

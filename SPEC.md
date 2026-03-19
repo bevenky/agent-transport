@@ -1,4 +1,4 @@
-# Agent Endpoint Specification
+# Agent Transport Specification
 
 ## Overview
 
@@ -160,7 +160,7 @@ pub struct EndpointConfig {
     pub turn_server: Option<TurnConfig>,
     pub codecs: Vec<Codec>,        // [Codec::Opus, Codec::PCMU]
     pub log_level: u32,            // SIP stack log level (0-6)
-    pub user_agent: String,        // e.g., "plivo-agent-endpoint/0.1.0"
+    pub user_agent: String,        // e.g., "plivo-agent-transport/0.1.0"
 }
 
 pub enum Codec {
@@ -321,10 +321,10 @@ Receive via the DTMF callback.
 ## Python Binding API (PyO3)
 
 ```python
-from plivo_endpoint import PlivoEndpoint, AudioFrame, CallSession
+from agent_transport import SipEndpoint, AudioFrame, CallSession
 
 # Create endpoint
-ep = PlivoEndpoint(
+ep = SipEndpoint(
     sip_server="sip.plivo.com",
     stun_server="stun.plivo.com:3478",
     codecs=["opus", "pcmu"],
@@ -366,9 +366,9 @@ ep.shutdown()
 ## TypeScript Binding API (napi-rs)
 
 ```typescript
-import { PlivoEndpoint, AudioFrame, CallSession } from 'plivo-endpoint';
+import { SipEndpoint, AudioFrame, CallSession } from 'agent-transport';
 
-const ep = new PlivoEndpoint({
+const ep = new SipEndpoint({
   sipServer: 'sip.plivo.com',
   stunServer: 'stun.plivo.com:3478',
   codecs: ['opus', 'pcmu'],
@@ -443,7 +443,7 @@ explicitly per platform in build.rs.
 ## File Structure
 
 ```
-agent_endpoint/
+agent_transport/
 ├── SPEC.md                           # This file
 ├── CLAUDE.md                         # Build conventions for Claude
 ├── Cargo.toml                        # Workspace root
@@ -455,7 +455,7 @@ agent_endpoint/
 │   │   ├── wrapper.h                 # #include <pjsua-lib/pjsua.h>
 │   │   └── src/lib.rs                # bindgen output re-export
 │   │
-│   ├── agent-endpoint/               # Safe Rust API
+│   ├── agent-transport/               # Safe Rust API
 │   │   ├── Cargo.toml
 │   │   └── src/
 │   │       ├── lib.rs                # Public API re-exports
@@ -467,12 +467,12 @@ agent_endpoint/
 │   │       ├── events.rs             # EndpointEvent, dispatcher
 │   │       └── error.rs              # Error types
 │   │
-│   ├── agent-endpoint-python/        # Python bindings
+│   ├── agent-transport-python/        # Python bindings
 │   │   ├── Cargo.toml
 │   │   ├── pyproject.toml
 │   │   └── src/lib.rs
 │   │
-│   └── agent-endpoint-node/          # Node.js bindings
+│   └── agent-transport-node/          # Node.js bindings
 │       ├── Cargo.toml
 │       ├── package.json
 │       └── src/lib.rs

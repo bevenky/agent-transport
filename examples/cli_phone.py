@@ -2,11 +2,11 @@
 """
 CLI Example Phone — make a real SIP call and talk from your terminal.
 
-Uses the plivo_endpoint Python binding for SIP + sounddevice for mic/speaker.
+Uses the agent_transport Python binding for SIP + sounddevice for mic/speaker.
 Demonstrates the full programmatic audio API: recv_audio -> speaker, mic -> send_audio.
 
 Prerequisites:
-    cd crates/agent-endpoint-python && maturin develop
+    cd crates/agent-transport-python && maturin develop
     pip install sounddevice numpy
 
 Usage:
@@ -30,7 +30,7 @@ import time
 import threading
 import numpy as np
 import sounddevice as sd
-from plivo_endpoint import PlivoEndpoint, AudioFrame
+from agent_transport import SipEndpoint, AudioFrame
 
 # Audio config — must match the endpoint's conference bridge rate
 SAMPLE_RATE = 16000
@@ -52,7 +52,7 @@ def main():
 
     # --- Initialize endpoint ---
     print("Initializing SIP endpoint...")
-    ep = PlivoEndpoint(sip_server=sip_domain, log_level=log_level)
+    ep = SipEndpoint(sip_server=sip_domain, log_level=log_level)
 
     print(f"Registering as {username}@{sip_domain}...")
     ep.register(username, password)

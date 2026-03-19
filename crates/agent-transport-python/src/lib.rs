@@ -7,7 +7,7 @@ use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
-use agent_endpoint::{
+use agent_transport_core::{
     AudioFrame as RustAudioFrame, BeepDetectorConfig as RustBeepConfig,
     CallSession as RustCallSession, Codec as RustCodec,
     EndpointConfig as RustEndpointConfig, EndpointEvent, SipEndpoint as RustSipEndpoint,
@@ -232,14 +232,14 @@ fn dispatch_event(
 
 /// The main Plivo SIP endpoint.
 #[pyclass]
-struct PlivoEndpoint {
+struct SipEndpoint {
     inner: RustSipEndpoint,
     callbacks: Arc<Mutex<HashMap<String, Vec<Py<PyAny>>>>>,
     event_thread_running: Arc<AtomicBool>,
 }
 
 #[pymethods]
-impl PlivoEndpoint {
+impl SipEndpoint {
     #[new]
     #[pyo3(signature = (sip_server="phone.plivo.com", stun_server="stun.plivo.com:3478", codecs=None, log_level=3))]
     fn new(
@@ -544,7 +544,7 @@ impl PlivoEndpoint {
     }
 }
 
-impl PlivoEndpoint {
+impl SipEndpoint {
     /// Start the background event dispatch thread if not already running.
     fn ensure_event_loop(&self) {
         if self.event_thread_running.swap(true, Ordering::Relaxed) {
@@ -572,8 +572,8 @@ impl PlivoEndpoint {
 }
 
 #[pymodule]
-fn plivo_endpoint(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add_class::<PlivoEndpoint>()?;
+fn agent_transport(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_class::<SipEndpoint>()?;
     m.add_class::<AudioFrame>()?;
     m.add_class::<CallSession>()?;
     Ok(())
