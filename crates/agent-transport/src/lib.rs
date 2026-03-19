@@ -29,6 +29,7 @@ mod dtmf;
 mod endpoint;
 mod error;
 mod events;
+mod recorder;
 mod rtp_transport;
 mod sdp;
 

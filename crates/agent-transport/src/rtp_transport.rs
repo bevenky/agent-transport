@@ -1,20 +1,19 @@
-//! RTP transport — sends and receives audio over UDP with G.711 codec.
+//! RTP transport — audio send/recv over UDP with G.711 codec.
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
+use audio_codec_algorithms::{decode_alaw, decode_ulaw, encode_alaw, encode_ulaw};
 use crossbeam_channel::{Receiver, Sender};
-use rtp::packet::Packet;
-use rtp::header::Header;
+use rtp::{header::Header, packet::Packet};
 use tokio::net::UdpSocket;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, warn};
+use tracing::warn;
 use webrtc_util::marshal::{Marshal, MarshalSize, Unmarshal};
 
 use beep_detector::{BeepDetector, BeepDetectorResult};
-
 use crate::audio::AudioFrame;
 use crate::config::Codec;
 use crate::dtmf;
@@ -22,14 +21,13 @@ use crate::events::EndpointEvent;
 
 pub(crate) const DTMF_PAYLOAD_TYPE: u8 = 101;
 
-/// RTP transport for a single call.
 pub(crate) struct RtpTransport {
     pub socket: Arc<UdpSocket>,
     pub remote_addr: SocketAddr,
-    pub ssrc: u32,
-    pub codec: Codec,
-    pub seq: AtomicU16,
-    pub timestamp: AtomicU32,
+    ssrc: u32,
+    codec: Codec,
+    seq: AtomicU16,
+    timestamp: AtomicU32,
     pub cancel: CancellationToken,
 }
 
@@ -38,109 +36,69 @@ impl RtpTransport {
         Self { socket, remote_addr, ssrc: rand::random(), codec, seq: AtomicU16::new(0), timestamp: AtomicU32::new(0), cancel }
     }
 
-    async fn send_packet(&self, pt: u8, ts: u32, marker: bool, payload: Vec<u8>) -> std::io::Result<()> {
-        let seq = self.seq.fetch_add(1, Ordering::Relaxed);
+    async fn send_rtp(&self, pt: u8, ts: u32, marker: bool, payload: Vec<u8>) -> std::io::Result<()> {
         let pkt = Packet {
-            header: Header { version: 2, marker, payload_type: pt, sequence_number: seq, timestamp: ts, ssrc: self.ssrc, ..Default::default() },
+            header: Header { version: 2, marker, payload_type: pt, sequence_number: self.seq.fetch_add(1, Ordering::Relaxed), timestamp: ts, ssrc: self.ssrc, ..Default::default() },
             payload: bytes::Bytes::from(payload),
         };
-        let buf = pkt.marshal().map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
-        self.socket.send_to(&buf, self.remote_addr).await?;
+        self.socket.send_to(&pkt.marshal().map_err(|e| std::io::Error::other(e.to_string()))?, self.remote_addr).await?;
         Ok(())
     }
 
-    pub async fn send_dtmf_event(&self, digit: char, duration_samples: u16) -> std::io::Result<()> {
-        let event_code = dtmf::digit_to_event(digit).unwrap_or(0);
+    pub async fn send_dtmf_event(&self, digit: char, dur: u16) -> std::io::Result<()> {
+        let ev = dtmf::digit_to_event(digit).unwrap_or(0);
         let ts = self.timestamp.load(Ordering::Relaxed);
-        self.send_packet(DTMF_PAYLOAD_TYPE, ts, true, dtmf::encode_rfc4733(event_code, false, 10, 0).to_vec()).await?;
-        for _ in 0..3 {
-            self.send_packet(DTMF_PAYLOAD_TYPE, ts, false, dtmf::encode_rfc4733(event_code, true, 10, duration_samples).to_vec()).await?;
-        }
+        self.send_rtp(DTMF_PAYLOAD_TYPE, ts, true, dtmf::encode_rfc4733(ev, false, 10, 0).to_vec()).await?;
+        for _ in 0..3 { self.send_rtp(DTMF_PAYLOAD_TYPE, ts, false, dtmf::encode_rfc4733(ev, true, 10, dur).to_vec()).await?; }
         Ok(())
     }
 
-    pub fn start_send_loop(
-        self: &Arc<Self>, outgoing_rx: Receiver<Vec<i16>>,
-        muted: Arc<AtomicBool>, paused: Arc<AtomicBool>,
-        flush_flag: Arc<AtomicBool>, playout_notify: Arc<(Mutex<bool>, Condvar)>,
-    ) -> tokio::task::JoinHandle<()> {
+    pub fn start_send_loop(self: &Arc<Self>, rx: Receiver<Vec<i16>>, muted: Arc<AtomicBool>, paused: Arc<AtomicBool>, flush: Arc<AtomicBool>, playout: Arc<(Mutex<bool>, Condvar)>) -> tokio::task::JoinHandle<()> {
         let t = Arc::clone(self);
-        let cancel = self.cancel.clone();
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_millis(20));
-            let samples_per_frame = 160u32; // 20ms at 8kHz
+            let mut iv = tokio::time::interval(Duration::from_millis(20));
+            let sil = silence_byte(t.codec);
             loop {
-                tokio::select! { _ = cancel.cancelled() => break, _ = interval.tick() => {} }
-                if flush_flag.swap(false, Ordering::Relaxed) {
-                    while outgoing_rx.try_recv().is_ok() {}
-                    notify_playout(&playout_notify);
-                    continue;
-                }
-                let ts = t.timestamp.fetch_add(samples_per_frame, Ordering::Relaxed);
-                if paused.load(Ordering::Relaxed) {
-                    let silence = vec![silence_byte(t.codec); samples_per_frame as usize];
-                    let _ = t.send_packet(t.codec.payload_type(), ts, false, silence).await;
-                    continue;
-                }
-                match outgoing_rx.try_recv() {
-                    Ok(samples_16k) => {
-                        let payload = if muted.load(Ordering::Relaxed) {
-                            vec![silence_byte(t.codec); samples_per_frame as usize]
-                        } else {
-                            g711_encode(&resample_16k_to_8k(&samples_16k), t.codec)
-                        };
-                        let _ = t.send_packet(t.codec.payload_type(), ts, false, payload).await;
-                    }
-                    Err(_) => {
-                        let _ = t.send_packet(t.codec.payload_type(), ts, false, vec![silence_byte(t.codec); samples_per_frame as usize]).await;
-                        notify_playout(&playout_notify);
-                    }
-                }
+                tokio::select! { _ = t.cancel.cancelled() => break, _ = iv.tick() => {} }
+                let ts = t.timestamp.fetch_add(160, Ordering::Relaxed);
+                if flush.swap(false, Ordering::Relaxed) { while rx.try_recv().is_ok() {} notify(&playout); continue; }
+                if paused.load(Ordering::Relaxed) { let _ = t.send_rtp(t.codec.payload_type(), ts, false, vec![sil; 160]).await; continue; }
+                let payload = match rx.try_recv() {
+                    Ok(s) if !muted.load(Ordering::Relaxed) => encode_g711(&downsample(&s), t.codec),
+                    Ok(_) => vec![sil; 160],
+                    Err(_) => { notify(&playout); vec![sil; 160] }
+                };
+                let _ = t.send_rtp(t.codec.payload_type(), ts, false, payload).await;
             }
         })
     }
 
-    pub fn start_recv_loop(
-        self: &Arc<Self>, incoming_tx: Sender<AudioFrame>, event_tx: Sender<EndpointEvent>,
-        call_id: i32, beep_detector: Arc<Mutex<Option<BeepDetector>>>,
-    ) -> tokio::task::JoinHandle<()> {
+    pub fn start_recv_loop(self: &Arc<Self>, tx: Sender<AudioFrame>, etx: Sender<EndpointEvent>, cid: i32, bd: Arc<Mutex<Option<BeepDetector>>>) -> tokio::task::JoinHandle<()> {
         let t = Arc::clone(self);
-        let cancel = self.cancel.clone();
         tokio::spawn(async move {
             let mut buf = vec![0u8; 2048];
             loop {
                 tokio::select! {
-                    _ = cancel.cancelled() => break,
-                    result = t.socket.recv_from(&mut buf) => {
-                        let (len, _) = match result { Ok(r) => r, Err(_) => continue };
-                        let pkt = match Packet::unmarshal(&mut &buf[..len]) {
-                            Ok(p) => p, Err(_) => continue,
-                        };
+                    _ = t.cancel.cancelled() => break,
+                    r = t.socket.recv_from(&mut buf) => {
+                        let (len, _) = match r { Ok(r) => r, Err(_) => continue };
+                        let pkt = match Packet::unmarshal(&mut &buf[..len]) { Ok(p) => p, Err(_) => continue };
                         if pkt.header.payload_type == DTMF_PAYLOAD_TYPE {
-                            if let Some((event, is_end, _, _)) = dtmf::decode_rfc4733(&pkt.payload) {
-                                if is_end { if let Some(d) = dtmf::event_to_digit(event) {
-                                    let _ = event_tx.try_send(EndpointEvent::DtmfReceived { call_id, digit: d, method: "rfc2833".into() });
-                                }}
+                            if let Some((ev, end, _, _)) = dtmf::decode_rfc4733(&pkt.payload) {
+                                if end { if let Some(d) = dtmf::event_to_digit(ev) { let _ = etx.try_send(EndpointEvent::DtmfReceived { call_id: cid, digit: d, method: "rfc2833".into() }); } }
                             }
                             continue;
                         }
-                        let samples_8k = g711_decode(&pkt.payload, t.codec);
-                        let samples_16k = resample_8k_to_16k(&samples_8k);
-                        // Feed beep detector
-                        if let Ok(mut guard) = beep_detector.lock() {
-                            if let Some(ref mut det) = *guard {
-                                match det.process_frame(&samples_16k) {
-                                    BeepDetectorResult::Detected(e) => {
-                                        let _ = event_tx.try_send(EndpointEvent::BeepDetected { call_id, frequency_hz: e.frequency_hz, duration_ms: e.duration_ms });
-                                        *guard = None;
-                                    }
-                                    BeepDetectorResult::Timeout => { let _ = event_tx.try_send(EndpointEvent::BeepTimeout { call_id }); *guard = None; }
-                                    BeepDetectorResult::Listening => {}
-                                }
+                        let pcm = upsample(&decode_g711(&pkt.payload, t.codec));
+                        if let Ok(mut g) = bd.lock() { if let Some(ref mut det) = *g {
+                            match det.process_frame(&pcm) {
+                                BeepDetectorResult::Detected(e) => { let _ = etx.try_send(EndpointEvent::BeepDetected { call_id: cid, frequency_hz: e.frequency_hz, duration_ms: e.duration_ms }); *g = None; }
+                                BeepDetectorResult::Timeout => { let _ = etx.try_send(EndpointEvent::BeepTimeout { call_id: cid }); *g = None; }
+                                BeepDetectorResult::Listening => {}
                             }
-                        }
-                        let n = samples_16k.len() as u32;
-                        let _ = incoming_tx.try_send(AudioFrame { data: samples_16k, sample_rate: 16000, num_channels: 1, samples_per_channel: n });
+                        }}
+                        let n = pcm.len() as u32;
+                        let _ = tx.try_send(AudioFrame { data: pcm, sample_rate: 16000, num_channels: 1, samples_per_channel: n });
                     }
                 }
             }
@@ -148,47 +106,39 @@ impl RtpTransport {
     }
 }
 
-fn notify_playout(p: &Arc<(Mutex<bool>, Condvar)>) {
-    if let Ok(mut done) = p.0.lock() { *done = true; p.1.notify_all(); }
-}
+fn notify(p: &Arc<(Mutex<bool>, Condvar)>) { if let Ok(mut d) = p.0.lock() { *d = true; p.1.notify_all(); } }
 
-// ─── G.711 via audio-codec-algorithms ────────────────────────────────────────
-
-fn g711_encode(samples: &[i16], codec: Codec) -> Vec<u8> {
-    match codec {
-        Codec::PCMU => samples.iter().map(|&s| audio_codec_algorithms::encode_ulaw(s)).collect(),
-        Codec::PCMA => samples.iter().map(|&s| audio_codec_algorithms::encode_alaw(s)).collect(),
-        _ => samples.iter().map(|&s| audio_codec_algorithms::encode_ulaw(s)).collect(),
+fn encode_g711(samples: &[i16], c: Codec) -> Vec<u8> {
+    match c {
+        Codec::PCMU => samples.iter().map(|&s| encode_ulaw(s)).collect(),
+        Codec::PCMA => samples.iter().map(|&s| encode_alaw(s)).collect(),
+        _ => samples.iter().map(|&s| encode_ulaw(s)).collect(),
     }
 }
 
-fn g711_decode(bytes: &[u8], codec: Codec) -> Vec<i16> {
-    match codec {
-        Codec::PCMU => bytes.iter().map(|&b| audio_codec_algorithms::decode_ulaw(b)).collect(),
-        Codec::PCMA => bytes.iter().map(|&b| audio_codec_algorithms::decode_alaw(b)).collect(),
-        _ => bytes.iter().map(|&b| audio_codec_algorithms::decode_ulaw(b)).collect(),
+fn decode_g711(bytes: &[u8], c: Codec) -> Vec<i16> {
+    match c {
+        Codec::PCMU => bytes.iter().map(|&b| decode_ulaw(b)).collect(),
+        Codec::PCMA => bytes.iter().map(|&b| decode_alaw(b)).collect(),
+        _ => bytes.iter().map(|&b| decode_ulaw(b)).collect(),
     }
 }
 
-fn silence_byte(codec: Codec) -> u8 {
-    match codec { Codec::PCMU => 0xFF, Codec::PCMA => 0xD5, _ => 0xFF }
-}
+fn silence_byte(c: Codec) -> u8 { match c { Codec::PCMU => 0xFF, Codec::PCMA => 0xD5, _ => 0xFF } }
 
-// ─── Resampling (linear interpolation, from rtpsip pattern) ──────────────────
-
-fn resample_8k_to_16k(input: &[i16]) -> Vec<i16> {
-    let mut out = Vec::with_capacity(input.len() * 2);
-    for i in 0..input.len() {
-        out.push(input[i]);
-        let next = if i + 1 < input.len() { input[i + 1] } else { input[i] };
-        out.push(((input[i] as i32 + next as i32) / 2) as i16);
+/// 8kHz → 16kHz linear interpolation
+fn upsample(s: &[i16]) -> Vec<i16> {
+    let mut o = Vec::with_capacity(s.len() * 2);
+    for i in 0..s.len() {
+        o.push(s[i]);
+        let n = if i + 1 < s.len() { s[i + 1] } else { s[i] };
+        o.push(((s[i] as i32 + n as i32) / 2) as i16);
     }
-    out
+    o
 }
 
-fn resample_16k_to_8k(input: &[i16]) -> Vec<i16> {
-    input.iter().step_by(2).copied().collect()
-}
+/// 16kHz → 8kHz decimation
+fn downsample(s: &[i16]) -> Vec<i16> { s.iter().step_by(2).copied().collect() }
 
 #[cfg(test)]
 mod tests {
@@ -197,41 +147,29 @@ mod tests {
     #[test]
     fn test_pcmu_roundtrip() {
         for &s in &[0i16, 100, 1000, 8000, -100, -1000, -8000] {
-            let enc = audio_codec_algorithms::encode_ulaw(s);
-            let dec = audio_codec_algorithms::decode_ulaw(enc);
-            let diff = (s as i32 - dec as i32).unsigned_abs();
-            assert!(diff < (s.unsigned_abs() as u32 / 10).max(100), "PCMU: {} -> {} (diff {})", s, dec, diff);
+            let d = decode_ulaw(encode_ulaw(s));
+            assert!((s as i32 - d as i32).unsigned_abs() < (s.unsigned_abs() as u32 / 10).max(100), "PCMU: {s} -> {d}");
         }
     }
 
     #[test]
     fn test_pcma_roundtrip() {
         for &s in &[0i16, 100, 1000, 8000, -100, -1000, -8000] {
-            let enc = audio_codec_algorithms::encode_alaw(s);
-            let dec = audio_codec_algorithms::decode_alaw(enc);
-            let diff = (s as i32 - dec as i32).unsigned_abs();
-            assert!(diff < (s.unsigned_abs() as u32 / 10).max(100), "PCMA: {} -> {} (diff {})", s, dec, diff);
+            let d = decode_alaw(encode_alaw(s));
+            assert!((s as i32 - d as i32).unsigned_abs() < (s.unsigned_abs() as u32 / 10).max(100), "PCMA: {s} -> {d}");
         }
     }
 
     #[test]
-    fn test_resample_8k_16k_length() {
-        let input = vec![0i16; 160]; // 20ms at 8kHz
-        assert_eq!(resample_8k_to_16k(&input).len(), 320); // 20ms at 16kHz
-    }
-
-    #[test]
-    fn test_resample_16k_8k_length() {
-        let input = vec![0i16; 320]; // 20ms at 16kHz
-        assert_eq!(resample_16k_to_8k(&input).len(), 160); // 20ms at 8kHz
+    fn test_resample_lengths() {
+        assert_eq!(upsample(&vec![0i16; 160]).len(), 320);
+        assert_eq!(downsample(&vec![0i16; 320]).len(), 160);
     }
 
     #[test]
     fn test_g711_encode_decode() {
-        let samples = vec![0i16, 1000, -1000, 8000, -8000];
-        let encoded = g711_encode(&samples, Codec::PCMU);
-        assert_eq!(encoded.len(), 5);
-        let decoded = g711_decode(&encoded, Codec::PCMU);
-        assert_eq!(decoded.len(), 5);
+        let s = vec![0i16, 1000, -1000, 8000];
+        assert_eq!(encode_g711(&s, Codec::PCMU).len(), 4);
+        assert_eq!(decode_g711(&encode_g711(&s, Codec::PCMU), Codec::PCMU).len(), 4);
     }
 }

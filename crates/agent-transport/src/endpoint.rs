@@ -26,6 +26,7 @@ use crate::call::{CallDirection, CallSession, CallState};
 use crate::config::{Codec, EndpointConfig};
 use crate::error::{EndpointError, Result};
 use crate::events::EndpointEvent;
+use crate::recorder::WavRecorder;
 use crate::rtp_transport::RtpTransport;
 use crate::sdp;
 
@@ -45,37 +46,6 @@ struct CallContext {
     cancel: CancellationToken,
     client_dialog: Option<rsipstack::dialog::client_dialog::ClientInviteDialog>,
     server_dialog: Option<rsipstack::dialog::server_dialog::ServerInviteDialog>,
-}
-
-struct WavRecorder { file: std::fs::File, sample_count: u32 }
-
-impl WavRecorder {
-    fn new(path: &str) -> std::io::Result<Self> {
-        let mut f = std::fs::File::create(path)?;
-        std::io::Write::write_all(&mut f, &[0u8; 44])?;
-        Ok(Self { file: f, sample_count: 0 })
-    }
-    fn write_samples(&mut self, samples: &[i16]) {
-        for &s in samples { let _ = std::io::Write::write_all(&mut self.file, &s.to_le_bytes()); }
-        self.sample_count += samples.len() as u32;
-    }
-    fn finalize(&mut self) {
-        use std::io::{Seek, SeekFrom, Write};
-        let ds = self.sample_count * 2;
-        let _ = self.file.seek(SeekFrom::Start(0));
-        let _ = self.file.write_all(b"RIFF");
-        let _ = self.file.write_all(&(36 + ds).to_le_bytes());
-        let _ = self.file.write_all(b"WAVEfmt ");
-        let _ = self.file.write_all(&16u32.to_le_bytes());
-        let _ = self.file.write_all(&1u16.to_le_bytes());
-        let _ = self.file.write_all(&1u16.to_le_bytes());
-        let _ = self.file.write_all(&16000u32.to_le_bytes());
-        let _ = self.file.write_all(&32000u32.to_le_bytes());
-        let _ = self.file.write_all(&2u16.to_le_bytes());
-        let _ = self.file.write_all(&16u16.to_le_bytes());
-        let _ = self.file.write_all(b"data");
-        let _ = self.file.write_all(&ds.to_le_bytes());
-    }
 }
 
 // ─── Shared state ────────────────────────────────────────────────────────────
