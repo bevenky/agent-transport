@@ -220,7 +220,8 @@ impl SipEndpoint {
             session.state = CallState::Confirmed;
 
             let cc = CancellationToken::new();
-            let rtp = Arc::new(RtpTransport::new(Arc::new(rtp_sock), remote_rtp, answer.codec, cc.clone()));
+            let dtmf_pt = answer.dtmf_payload_type.unwrap_or(crate::rtp_transport::DEFAULT_DTMF_PT);
+            let rtp = Arc::new(RtpTransport::new(Arc::new(rtp_sock), remote_rtp, answer.codec, cc.clone(), dtmf_pt, answer.ptime_ms));
             let (otx, orx) = crossbeam_channel::bounded(50);
             let (itx, irx) = crossbeam_channel::bounded(50);
             let (m, p, f, pn, bd) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)), Arc::new((Mutex::new(false), Condvar::new())), Arc::new(Mutex::new(None)));
@@ -318,7 +319,7 @@ impl SipEndpoint {
                         if let Some(ref dl) = ctx.client_dialog { let _ = dl.info(Some(hdrs), Some(body.into_bytes())).await; }
                         else if let Some(ref dl) = ctx.server_dialog { let _ = dl.info(Some(hdrs), Some(body.into_bytes())).await; }
                     }
-                    _ => { if let Some(ref rtp) = ctx.rtp { let _ = rtp.send_dtmf_event(d, 1600).await; } }
+                    _ => { if let Some(ref rtp) = ctx.rtp { let _ = rtp.send_dtmf_event(d, 200).await; } } // 200ms duration
                 }
             }
             Ok(())
