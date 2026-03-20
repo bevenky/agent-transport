@@ -21,7 +21,7 @@ Environment variables:
     SIP_USERNAME   - SIP account username (required)
     SIP_PASSWORD   - SIP account password (required)
     SIP_DOMAIN     - SIP server hostname (default: phone.plivo.com)
-    SIP_LOG_LEVEL  - pjsua log level 0-6 (default: 3)
+    SIP_LOG_LEVEL  - log level 0-6 (default: 3)
 """
 
 import os
@@ -32,7 +32,7 @@ import numpy as np
 import sounddevice as sd
 from agent_transport import SipEndpoint, AudioFrame
 
-# Audio config — must match the endpoint's conference bridge rate
+# Audio config — must match the endpoint's sample rate (16kHz mono)
 SAMPLE_RATE = 16000
 CHANNELS = 1
 FRAME_DURATION_MS = 20

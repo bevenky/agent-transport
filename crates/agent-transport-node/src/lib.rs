@@ -221,7 +221,7 @@ fn event_to_info(event: &EndpointEvent) -> EventInfo {
 
 type EventTsfn = ThreadsafeFunction<EventInfo, ErrorStrategy::CalleeHandled>;
 
-/// The main Plivo SIP endpoint.
+/// SIP endpoint — call control and audio I/O.
 #[napi]
 pub struct SipEndpoint {
     inner: RustSipEndpoint,
@@ -259,7 +259,7 @@ impl SipEndpoint {
                 .unwrap_or_else(|| "phone.plivo.com".into()),
             stun_server: cfg
                 .stun_server
-                .unwrap_or_else(|| "stun.plivo.com:3478".into()),
+                .unwrap_or_else(|| "stun-fb.plivo.com:3478".into()),
             codecs: codec_list,
             log_level: cfg.log_level.unwrap_or(3),
             ..Default::default()
@@ -405,6 +405,24 @@ impl SipEndpoint {
             .recv_audio(call_id)
             .map(|opt| opt.map(AudioFrame::from_rust))
             .map_err(napi_err)
+    }
+
+    /// Number of audio frames queued for sending. Multiply by 0.02 for seconds.
+    #[napi]
+    pub fn queued_frames(&self, call_id: i32) -> Result<u32> {
+        self.inner.queued_frames(call_id).map(|n| n as u32).map_err(napi_err)
+    }
+
+    /// Audio sample rate in Hz (always 16000).
+    #[napi(getter)]
+    pub fn sample_rate(&self) -> u32 {
+        16000
+    }
+
+    /// Number of audio channels (always 1 = mono).
+    #[napi(getter)]
+    pub fn num_channels(&self) -> u32 {
+        1
     }
 
     #[napi]

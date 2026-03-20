@@ -378,6 +378,11 @@ impl SipEndpoint {
         self.with_call(call_id, |c| c.incoming_rx.try_recv().ok())
     }
 
+    /// Number of audio frames queued for sending (outgoing buffer depth).
+    pub fn queued_frames(&self, call_id: i32) -> Result<usize> {
+        self.with_call(call_id, |c| c.outgoing_tx.len())
+    }
+
     pub fn start_recording(&self, call_id: i32, path: &str) -> Result<()> {
         let p = path.to_string();
         self.with_call_mut(call_id, |c| {

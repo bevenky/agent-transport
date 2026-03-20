@@ -230,7 +230,7 @@ fn dispatch_event(
     }
 }
 
-/// The main Plivo SIP endpoint.
+/// SIP endpoint — call control and audio I/O.
 #[pyclass]
 struct SipEndpoint {
     inner: RustSipEndpoint,
@@ -241,7 +241,7 @@ struct SipEndpoint {
 #[pymethods]
 impl SipEndpoint {
     #[new]
-    #[pyo3(signature = (sip_server="phone.plivo.com", stun_server="stun.plivo.com:3478", codecs=None, log_level=3))]
+    #[pyo3(signature = (sip_server="phone.plivo.com", stun_server="stun-fb.plivo.com:3478", codecs=None, log_level=3))]
     fn new(
         sip_server: &str,
         stun_server: &str,
@@ -424,6 +424,24 @@ impl SipEndpoint {
             .recv_audio(call_id)
             .map(|opt| opt.map(AudioFrame::from_rust))
             .map_err(py_err)
+    }
+
+    /// Number of audio frames queued for sending (outgoing buffer depth).
+    /// Multiply by 0.02 to get queued duration in seconds (each frame = 20ms).
+    fn queued_frames(&self, call_id: i32) -> PyResult<usize> {
+        self.inner.queued_frames(call_id).map_err(py_err)
+    }
+
+    /// Audio sample rate in Hz (always 16000).
+    #[getter]
+    fn sample_rate(&self) -> u32 {
+        16000
+    }
+
+    /// Number of audio channels (always 1 = mono).
+    #[getter]
+    fn num_channels(&self) -> u32 {
+        1
     }
 
     /// Start recording a call to a WAV file.
