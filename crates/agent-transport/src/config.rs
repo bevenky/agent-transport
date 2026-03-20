@@ -81,6 +81,42 @@ pub struct EndpointConfig {
 
     /// Registration expiry in seconds
     pub register_expires: u32,
+
+    /// Optional audio processing settings.
+    /// Requires corresponding Cargo features: `jitter-buffer`, `plc`, `comfort-noise`.
+    pub audio_processing: AudioProcessingConfig,
+}
+
+/// Configuration for optional audio processing features.
+///
+/// All features require corresponding Cargo feature flags to be enabled.
+/// If a feature is requested but not compiled in, it is silently ignored.
+#[derive(Debug, Clone)]
+pub struct AudioProcessingConfig {
+    /// Enable adaptive jitter buffer (requires `jitter-buffer` feature).
+    pub jitter_buffer: bool,
+
+    /// Enable packet loss concealment using G.711 Appendix I pitch-based
+    /// concealment (requires `plc` feature).
+    pub plc: bool,
+
+    /// Enable comfort noise generation during silence to keep NAT pinholes
+    /// open and prevent carrier timeouts (requires `comfort-noise` feature).
+    pub comfort_noise: bool,
+
+    /// Comfort noise level in dBov (0 = loud, 127 = silence). Default: 60.
+    pub comfort_noise_level: u8,
+}
+
+impl Default for AudioProcessingConfig {
+    fn default() -> Self {
+        Self {
+            jitter_buffer: false,
+            plc: false,
+            comfort_noise: false,
+            comfort_noise_level: 60,
+        }
+    }
 }
 
 impl Default for EndpointConfig {
@@ -97,6 +133,7 @@ impl Default for EndpointConfig {
             enable_ice: false,
             enable_srtp: false,
             register_expires: 120,
+            audio_processing: AudioProcessingConfig::default(),
         }
     }
 }

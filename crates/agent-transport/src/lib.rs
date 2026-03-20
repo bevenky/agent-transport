@@ -24,11 +24,15 @@
 
 mod audio;
 mod call;
+#[cfg(feature = "comfort-noise")]
+pub mod comfort_noise;
 mod config;
 mod dtmf;
 mod endpoint;
 mod error;
 mod events;
+#[cfg(feature = "plc")]
+pub mod plc;
 mod recorder;
 mod rtp_transport;
 mod sdp;
@@ -36,7 +40,7 @@ mod sdp;
 pub use audio::AudioFrame;
 pub use beep_detector::BeepDetectorConfig;
 pub use call::{CallDirection, CallSession, CallState};
-pub use config::{Codec, EndpointConfig, TurnConfig};
+pub use config::{AudioProcessingConfig, Codec, EndpointConfig, TurnConfig};
 pub use endpoint::SipEndpoint;
 pub use error::EndpointError;
 pub use events::EndpointEvent;

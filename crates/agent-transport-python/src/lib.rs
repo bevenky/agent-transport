@@ -241,12 +241,21 @@ struct SipEndpoint {
 #[pymethods]
 impl SipEndpoint {
     #[new]
-    #[pyo3(signature = (sip_server="phone.plivo.com", stun_server="stun-fb.plivo.com:3478", codecs=None, log_level=3))]
+    /// Create a new SIP endpoint.
+    ///
+    /// Audio processing options (requires Cargo features):
+    ///   jitter_buffer: Enable adaptive jitter buffer (feature: jitter-buffer)
+    ///   plc: Enable packet loss concealment (feature: plc)
+    ///   comfort_noise: Enable comfort noise generation (feature: comfort-noise)
+    #[pyo3(signature = (sip_server="phone.plivo.com", stun_server="stun-fb.plivo.com:3478", codecs=None, log_level=3, jitter_buffer=false, plc=false, comfort_noise=false))]
     fn new(
         sip_server: &str,
         stun_server: &str,
         codecs: Option<Vec<String>>,
         log_level: u32,
+        jitter_buffer: bool,
+        plc: bool,
+        comfort_noise: bool,
     ) -> PyResult<Self> {
         let codec_list = codecs
             .unwrap_or_else(|| vec!["pcmu".into(), "pcma".into()])
@@ -265,6 +274,12 @@ impl SipEndpoint {
             stun_server: stun_server.into(),
             codecs: codec_list,
             log_level,
+            audio_processing: agent_transport_core::AudioProcessingConfig {
+                jitter_buffer,
+                plc,
+                comfort_noise,
+                ..Default::default()
+            },
             ..Default::default()
         };
 

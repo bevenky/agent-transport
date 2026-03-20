@@ -79,6 +79,12 @@ pub struct EndpointConfig {
     pub stun_server: Option<String>,
     pub codecs: Option<Vec<String>>,
     pub log_level: Option<u32>,
+    /// Enable adaptive jitter buffer (requires jitter-buffer feature).
+    pub jitter_buffer: Option<bool>,
+    /// Enable packet loss concealment (requires plc feature).
+    pub plc: Option<bool>,
+    /// Enable comfort noise generation (requires comfort-noise feature).
+    pub comfort_noise: Option<bool>,
 }
 
 /// Structured event info returned by pollEvent() and waitForEvent().
@@ -238,6 +244,9 @@ impl SipEndpoint {
             stun_server: None,
             codecs: None,
             log_level: None,
+            jitter_buffer: None,
+            plc: None,
+            comfort_noise: None,
         });
 
         let codec_list = cfg
@@ -254,14 +263,16 @@ impl SipEndpoint {
             .collect();
 
         let rust_config = RustEndpointConfig {
-            sip_server: cfg
-                .sip_server
-                .unwrap_or_else(|| "phone.plivo.com".into()),
-            stun_server: cfg
-                .stun_server
-                .unwrap_or_else(|| "stun-fb.plivo.com:3478".into()),
+            sip_server: cfg.sip_server.unwrap_or_else(|| "phone.plivo.com".into()),
+            stun_server: cfg.stun_server.unwrap_or_else(|| "stun-fb.plivo.com:3478".into()),
             codecs: codec_list,
             log_level: cfg.log_level.unwrap_or(3),
+            audio_processing: agent_transport_core::AudioProcessingConfig {
+                jitter_buffer: cfg.jitter_buffer.unwrap_or(false),
+                plc: cfg.plc.unwrap_or(false),
+                comfort_noise: cfg.comfort_noise.unwrap_or(false),
+                ..Default::default()
+            },
             ..Default::default()
         };
 

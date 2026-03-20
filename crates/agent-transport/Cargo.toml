@@ -28,8 +28,15 @@ bytes = "1"
 rand = "0.8"
 tokio-util = { version = "0.7", features = ["rt"] }
 
+# Optional audio processing
+neteq = { version = "0.8", default-features = false, optional = true }
+
 [features]
 integration = []
+jitter-buffer = ["neteq"]
+plc = []
+comfort-noise = []
+audio-processing = ["jitter-buffer", "plc", "comfort-noise"]
 
 [dev-dependencies]
 tracing-subscriber = "0.3"
