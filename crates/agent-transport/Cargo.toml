@@ -31,12 +31,21 @@ tokio-util = { version = "0.7", features = ["rt"] }
 # Optional audio processing
 neteq = { version = "0.8", default-features = false, optional = true }
 
+# Optional audio streaming (Plivo WebSocket)
+tokio-tungstenite = { version = "0.24", optional = true }
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
+base64 = { version = "0.22", optional = true }
+reqwest = { version = "0.12", optional = true, default-features = false, features = ["json", "rustls-tls"] }
+futures-util = { version = "0.3", optional = true }
+
 [features]
 integration = []
 jitter-buffer = ["neteq"]
 plc = []
 comfort-noise = []
 audio-processing = ["jitter-buffer", "plc", "comfort-noise"]
+audio-stream = ["tokio-tungstenite", "serde", "serde_json", "base64", "reqwest", "futures-util"]
 
 [dev-dependencies]
 tracing-subscriber = "0.3"
