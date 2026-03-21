@@ -95,14 +95,20 @@ class AudioStreamOutput(AudioOutput):
     def next_in_chain(self): return self._next_in_chain
 
     async def capture_frame(self, frame: rtc.AudioFrame) -> None:
-        if not self._capturing:
+        first_frame = not self._capturing
+        if first_frame:
             self._capturing = True
             self._segment_count += 1
             self._interrupted_event.clear()
-            self.on_playback_started(created_at=time.time())
+
+        # Send first, emit after (matches LiveKit timing)
+        self._ep.send_audio_bytes(self._sid, bytes(frame.data), frame.sample_rate, frame.num_channels)
+
         if frame.sample_rate > 0:
             self._pushed_duration += frame.samples_per_channel / frame.sample_rate
-        self._ep.send_audio_bytes(self._sid, bytes(frame.data), frame.sample_rate, frame.num_channels)
+
+        if first_frame:
+            self.on_playback_started(created_at=time.time())
 
     def flush(self) -> None:
         try: self._ep.flush(self._sid)

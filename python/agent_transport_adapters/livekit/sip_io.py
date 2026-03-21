@@ -116,18 +116,22 @@ class SipAudioOutput(AudioOutput):
         return True
 
     async def capture_frame(self, frame: rtc.AudioFrame) -> None:
-        # Accept frames even when paused (LiveKit behavior — frames queue up)
-        if not self._capturing:
+        first_frame = not self._capturing
+        if first_frame:
             self._capturing = True
             self._segment_count += 1
             self._interrupted_event.clear()
-            self.on_playback_started(created_at=time.time())
+
+        # Send to transport first (matches LiveKit: emit after frame queued)
+        self._ep.send_audio_bytes(self._cid, bytes(frame.data), frame.sample_rate, frame.num_channels)
 
         # Track duration for playback position calculation
         if frame.sample_rate > 0:
             self._pushed_duration += frame.samples_per_channel / frame.sample_rate
 
-        self._ep.send_audio_bytes(self._cid, bytes(frame.data), frame.sample_rate, frame.num_channels)
+        # Emit playback_started AFTER frame is sent (matches LiveKit timing)
+        if first_frame:
+            self.on_playback_started(created_at=time.time())
 
     def flush(self) -> None:
         """Non-blocking flush — starts async playout wait (matches LiveKit)."""

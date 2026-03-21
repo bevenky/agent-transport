@@ -225,8 +225,8 @@ impl SipEndpoint {
             let cc = CancellationToken::new();
             let dtmf_pt = answer.dtmf_payload_type.unwrap_or(crate::sip::rtp_transport::DEFAULT_DTMF_PT);
             let rtp = Arc::new(RtpTransport::new(Arc::new(rtp_sock), remote_rtp, answer.codec, cc.clone(), dtmf_pt, answer.ptime_ms));
-            let (otx, orx) = crossbeam_channel::bounded(50);
-            let (itx, irx) = crossbeam_channel::bounded(50);
+            let (otx, orx) = crossbeam_channel::bounded(6000);
+            let (itx, irx) = crossbeam_channel::bounded(6000);
             let (m, p, f, pn, bd) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)), Arc::new((Mutex::new(false), Condvar::new())), Arc::new(Mutex::new(None)));
 
             rtp.start_send_loop(orx, m.clone(), p.clone(), f.clone(), pn.clone());
@@ -454,8 +454,8 @@ async fn handle_incoming(dl: &Arc<DialogLayer>, st: &Arc<Mutex<EndpointState>>, 
 
     info!("Incoming call {} from {} (uuid={:?})", call_id, session.remote_uri, session.call_uuid);
     let cc = CancellationToken::new();
-    let (otx, _orx) = crossbeam_channel::bounded(50);
-    let (_itx, irx) = crossbeam_channel::bounded(50);
+    let (otx, _orx) = crossbeam_channel::bounded(6000);
+    let (_itx, irx) = crossbeam_channel::bounded(6000);
     st.lock().unwrap().calls.insert(call_id, CallContext {
         session: session.clone(), rtp: None, outgoing_tx: otx, incoming_rx: irx,
         muted: Arc::new(AtomicBool::new(false)), paused: Arc::new(AtomicBool::new(false)),
