@@ -12,7 +12,7 @@ use crossbeam_channel::{Receiver, Sender};
 use rtp::{header::Header, packet::Packet};
 use tokio::net::UdpSocket;
 use tokio_util::sync::CancellationToken;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use webrtc_util::marshal::{Marshal, MarshalSize, Unmarshal};
 
 use beep_detector::{BeepDetector, BeepDetectorResult};
@@ -81,10 +81,12 @@ impl RtpTransport {
                 tokio::select! {
                     _ = t.cancel.cancelled() => break,
                     _ = rtcp_iv.tick() => {
-                        // Send RTCP Sender Report every 5 seconds
+                        // Send RTCP Sender Report + log stats every 5 seconds
                         let ts = t.timestamp.load(Ordering::Relaxed);
                         let sr = super::rtcp::build_sender_report(t.ssrc, ts, pkt_count, octet_count);
                         let _ = t.socket.send_to(&sr, t.remote()).await;
+                        let queued = rx.len();
+                        debug!("RTP TX: pkts={} octets={} queued={} codec={:?} remote={}", pkt_count, octet_count, queued, t.codec, t.remote());
                     }
                     _ = iv.tick() => {}
                 }
@@ -113,6 +115,7 @@ impl RtpTransport {
             let (mut last_rtp, mut remote_ssrc) = (Instant::now(), None::<u32>);
             let mut ka = tokio::time::interval(NAT_KEEPALIVE);
             let (mut dtmf_ev, mut dtmf_timer): (Option<u8>, Option<Instant>) = (None, None);
+            let (mut rx_pkts, mut rx_log_time) = (0u32, Instant::now());
 
             loop {
                 tokio::select! {
@@ -160,6 +163,11 @@ impl RtpTransport {
                         }}
                         let n = pcm.len() as u32;
                         let _ = tx.try_send(AudioFrame { data: pcm, sample_rate: 16000, num_channels: 1, samples_per_channel: n });
+                        rx_pkts += 1;
+                        if rx_log_time.elapsed() >= Duration::from_secs(5) {
+                            debug!("RTP RX: pkts={} ssrc={:?} remote={}", rx_pkts, remote_ssrc, from);
+                            rx_log_time = Instant::now();
+                        }
                     }
                 }
                 if last_rtp.elapsed() > MEDIA_TIMEOUT {

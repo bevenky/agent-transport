@@ -782,11 +782,33 @@ impl AudioStreamEndpoint {
     }
 }
 
+/// Initialize Rust tracing with the given log level filter.
+/// Call this before creating any endpoints to see Rust-level logs.
+///
+/// Examples:
+///   init_logging("debug")                  # all agent-transport debug logs
+///   init_logging("agent_transport=trace")  # full trace
+///   init_logging("info")                   # default
+#[pyfunction]
+#[pyo3(signature = (filter="info"))]
+fn init_logging(filter: &str) -> PyResult<()> {
+    use tracing_subscriber::EnvFilter;
+    let f = std::env::var("RUST_LOG").unwrap_or_else(|_| filter.to_string());
+    tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::new(f))
+        .with_target(true)
+        .with_thread_ids(false)
+        .with_file(false)
+        .try_init()
+        .map_err(|e| PyRuntimeError::new_err(format!("tracing already initialized: {}", e)))
+}
+
 #[pymodule]
 fn agent_transport(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<SipEndpoint>()?;
     m.add_class::<AudioStreamEndpoint>()?;
     m.add_class::<AudioFrame>()?;
     m.add_class::<CallSession>()?;
+    m.add_function(wrap_pyfunction!(init_logging, m)?)?;
     Ok(())
 }

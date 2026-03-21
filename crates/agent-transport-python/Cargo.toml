@@ -13,3 +13,4 @@ crate-type = ["cdylib"]
 agent_transport_core = { path = "../agent-transport", package = "agent-transport", features = ["audio-stream"] }
 crossbeam-channel.workspace = true
 pyo3 = { version = "0.23", features = ["extension-module"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

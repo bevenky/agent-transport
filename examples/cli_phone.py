@@ -30,7 +30,7 @@ import time
 import threading
 import numpy as np
 import sounddevice as sd
-from agent_transport import SipEndpoint, AudioFrame
+from agent_transport import SipEndpoint, AudioFrame, init_logging
 
 # Audio config — must match the endpoint's sample rate (16kHz mono)
 SAMPLE_RATE = 16000
@@ -49,6 +49,10 @@ def main():
     if not username or not password:
         print("Set SIP_USERNAME and SIP_PASSWORD environment variables.")
         sys.exit(1)
+
+    # --- Initialize logging ---
+    # Set RUST_LOG=debug for full SIP/RTP tracing, or RUST_LOG=trace for everything
+    init_logging(os.environ.get("RUST_LOG", "info"))
 
     # --- Initialize endpoint ---
     print("Initializing SIP endpoint...")

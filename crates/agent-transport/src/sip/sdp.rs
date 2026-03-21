@@ -33,11 +33,13 @@ pub(crate) fn build_offer(local_ip: IpAddr, rtp_port: u16, codecs: &[Codec]) -> 
     }
     // #1: Fix fmtp — 0-15 not 0-16 (16 DTMF events: digits 0-9, *, #, A-D = 0-15)
     sdp.push_str(&format!("a=rtpmap:{} telephone-event/8000\r\na=fmtp:{} 0-15\r\na=ptime:20\r\na=sendrecv\r\n", DEFAULT_DTMF_PT, DEFAULT_DTMF_PT));
+    debug!("SDP offer:\n{}", sdp);
     sdp
 }
 
 pub(crate) fn parse_answer(sdp_bytes: &[u8], offered_codecs: &[Codec]) -> Result<SdpAnswer> {
     let sdp = std::str::from_utf8(sdp_bytes).map_err(|_| EndpointError::Other("invalid UTF-8 in SDP".into()))?;
+    debug!("SDP answer:\n{}", sdp);
 
     // #23: Validate mandatory SDP fields
     let has_v = sdp.lines().any(|l| l.trim().starts_with("v="));
