@@ -1,0 +1,80 @@
+"""LiveKit Agents AudioInput/AudioOutput adapters for Plivo audio streaming transport.
+
+Same interface as SIP adapters but wraps AudioStreamEndpoint instead of SipEndpoint.
+"""
+
+import asyncio
+from typing import Optional
+
+try:
+    from livekit import rtc
+    from livekit.agents.voice.io import AudioInput, AudioOutput
+except ImportError:
+    raise ImportError("livekit-agents is required: pip install livekit-agents")
+
+from .sip_io import _to_livekit_frame, _from_livekit_frame
+
+
+class AudioStreamInput(AudioInput):
+    """Async iterator yielding AudioFrames from Plivo audio stream."""
+
+    def __init__(self, endpoint, session_id: int):
+        self._ep = endpoint
+        self._sid = session_id
+        self._closed = False
+
+    async def __anext__(self) -> rtc.AudioFrame:
+        while not self._closed:
+            frame = self._ep.recv_audio(self._sid)
+            if frame is not None:
+                return _to_livekit_frame(frame)
+            await asyncio.sleep(0.005)
+        raise StopAsyncIteration
+
+    def __aiter__(self):
+        return self
+
+    def on_attached(self) -> None:
+        pass
+
+    def on_detached(self) -> None:
+        self._closed = True
+
+
+class AudioStreamOutput(AudioOutput):
+    """Sends AudioFrames to Plivo audio stream."""
+
+    def __init__(self, endpoint, session_id: int):
+        super().__init__()
+        self._ep = endpoint
+        self._sid = session_id
+
+    @property
+    def sample_rate(self) -> Optional[int]:
+        return 16000
+
+    @property
+    def can_pause(self) -> bool:
+        return False  # Audio streaming doesn't support pause
+
+    async def capture_frame(self, frame: rtc.AudioFrame) -> None:
+        agent_frame = _from_livekit_frame(frame)
+        self._ep.send_audio(self._sid, agent_frame)
+
+    def flush(self) -> None:
+        pass  # Audio streaming is fire-and-forget
+
+    def clear_buffer(self) -> None:
+        self._ep.clear_buffer(self._sid)
+
+    def pause(self) -> None:
+        pass  # Not supported
+
+    def resume(self) -> None:
+        pass  # Not supported
+
+    def on_attached(self) -> None:
+        pass
+
+    def on_detached(self) -> None:
+        pass

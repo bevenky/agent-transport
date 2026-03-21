@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agent-transport-adapters"
+version = "0.1.0"
+description = "LiveKit and Pipecat adapters for agent-transport SIP/audio streaming"
+requires-python = ">=3.9"
+license = "MIT"
+dependencies = [
+    "agent-transport",
+]
+
+[project.optional-dependencies]
+livekit = ["livekit-agents>=1.0"]
+pipecat = ["pipecat-ai>=0.0.50"]
+all = ["agent-transport-adapters[livekit,pipecat]"]
+
+[tool.setuptools.packages.find]
+include = ["agent_transport_adapters*"]
