@@ -79,7 +79,7 @@ class SipAudioOutput(AudioOutput):
 
     @property
     def sample_rate(self) -> Optional[int]:
-        return 16000
+        return self._ep.sample_rate  # Transport's native rate (16kHz for SIP)
 
     @property
     def can_pause(self) -> bool:

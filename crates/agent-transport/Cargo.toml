@@ -51,6 +51,9 @@ audio-stream = ["tokio-tungstenite", "serde", "serde_json", "base64", "reqwest",
 tracing-subscriber = "0.3"
 anyhow.workspace = true
 crossbeam-channel.workspace = true
+audio-codec-algorithms = "0.7"
+base64 = "0.22"
+serde_json = "1"
 
 [[example]]
 name = "register"

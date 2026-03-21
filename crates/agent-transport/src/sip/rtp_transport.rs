@@ -72,15 +72,35 @@ impl RtpTransport {
             let mut iv = tokio::time::interval(Duration::from_millis(t.ptime_ms as u64));
             let (sil, spf) = (t.codec.silence_byte(), t.spf());
             let mut first = true;
+            let mut pkt_count = 0u32;
+            let mut octet_count = 0u32;
+            let mut rtcp_iv = tokio::time::interval(Duration::from_secs(5));
+            rtcp_iv.tick().await; // skip first tick
+
             loop {
-                tokio::select! { _ = t.cancel.cancelled() => break, _ = iv.tick() => {} }
+                tokio::select! {
+                    _ = t.cancel.cancelled() => break,
+                    _ = rtcp_iv.tick() => {
+                        // Send RTCP Sender Report every 5 seconds
+                        let ts = t.timestamp.load(Ordering::Relaxed);
+                        let sr = super::rtcp::build_sender_report(t.ssrc, ts, pkt_count, octet_count);
+                        let _ = t.socket.send_to(&sr, t.remote()).await;
+                    }
+                    _ = iv.tick() => {}
+                }
                 let ts = t.timestamp.fetch_add(spf, Ordering::Relaxed);
                 if flush.swap(false, Ordering::Relaxed) { while rx.try_recv().is_ok() {} notify(&playout); first = true; continue; }
-                if paused.load(Ordering::Relaxed) { let _ = t.send(t.codec.payload_type(), ts, false, vec![sil; spf as usize]).await; continue; }
+                if paused.load(Ordering::Relaxed) { let _ = t.send(t.codec.payload_type(), ts, false, vec![sil; spf as usize]).await; pkt_count += 1; octet_count += spf; continue; }
                 match rx.try_recv() {
-                    Ok(s) if !muted.load(Ordering::Relaxed) => { let m = first; first = false; let _ = t.send(t.codec.payload_type(), ts, m, t.codec.encode(&s.iter().step_by(2).copied().collect::<Vec<_>>())).await; }
-                    Ok(_) => { let _ = t.send(t.codec.payload_type(), ts, false, vec![sil; spf as usize]).await; }
-                    Err(_) => { notify(&playout); first = true; let _ = t.send(t.codec.payload_type(), ts, false, vec![sil; spf as usize]).await; }
+                    Ok(s) if !muted.load(Ordering::Relaxed) => {
+                        let m = first; first = false;
+                        let encoded = t.codec.encode(&s.iter().step_by(2).copied().collect::<Vec<_>>());
+                        octet_count += encoded.len() as u32;
+                        let _ = t.send(t.codec.payload_type(), ts, m, encoded).await;
+                        pkt_count += 1;
+                    }
+                    Ok(_) => { let _ = t.send(t.codec.payload_type(), ts, false, vec![sil; spf as usize]).await; pkt_count += 1; octet_count += spf; }
+                    Err(_) => { notify(&playout); first = true; let _ = t.send(t.codec.payload_type(), ts, false, vec![sil; spf as usize]).await; pkt_count += 1; octet_count += spf; }
                 }
             }
         })

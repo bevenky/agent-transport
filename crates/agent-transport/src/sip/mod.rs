@@ -3,5 +3,6 @@
 pub mod call;
 pub(crate) mod dtmf;
 pub mod endpoint;
+pub(crate) mod rtcp;
 pub(crate) mod rtp_transport;
 pub(crate) mod sdp;
