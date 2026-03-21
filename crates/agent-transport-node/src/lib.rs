@@ -435,6 +435,12 @@ impl SipEndpoint {
             .map_err(napi_err)
     }
 
+    /// Send a SIP INFO message with custom content type and body.
+    #[napi]
+    pub fn send_info(&self, call_id: i32, content_type: String, body: String) -> Result<()> {
+        self.inner.send_info(call_id, &content_type, &body).map_err(napi_err)
+    }
+
     #[napi]
     pub fn transfer(&self, call_id: i32, dest_uri: String) -> Result<()> {
         self.inner

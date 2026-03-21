@@ -329,6 +329,21 @@ impl SipEndpoint {
         })
     }
 
+    /// Send a SIP INFO message with JSON body (for OutputTransportMessageFrame support).
+    pub fn send_info(&self, call_id: i32, content_type: &str, body: &str) -> Result<()> {
+        let st = self.state.clone();
+        let ct = content_type.to_string();
+        let b = body.to_string();
+        self.runtime.block_on(async {
+            let s = st.lock().unwrap();
+            let ctx = s.calls.get(&call_id).ok_or(EndpointError::CallNotActive(call_id))?;
+            let hdrs = vec![rsip::Header::Other("Content-Type".into(), ct)];
+            if let Some(ref d) = ctx.client_dialog { d.info(Some(hdrs), Some(b.into_bytes())).await.map_err(err)?; }
+            else if let Some(ref d) = ctx.server_dialog { d.info(Some(hdrs), Some(b.into_bytes())).await.map_err(err)?; }
+            Ok(())
+        })
+    }
+
     pub fn transfer(&self, call_id: i32, dest_uri: &str) -> Result<()> {
         let (st, dest) = (self.state.clone(), dest_uri.to_string());
         self.runtime.block_on(async {
@@ -449,7 +464,7 @@ impl Drop for SipEndpoint { fn drop(&mut self) { let _ = self.shutdown(); } }
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 async fn handle_incoming(dl: &Arc<DialogLayer>, st: &Arc<Mutex<EndpointState>>, etx: &Sender<EndpointEvent>, tx: rsipstack::transaction::transaction::Transaction) {
-    let (ds, _dr) = dl.new_dialog_state_channel();
+    let (ds, dr) = dl.new_dialog_state_channel();
     let cred = st.lock().unwrap().credential.clone();
     let contact = st.lock().unwrap().contact_uri.clone();
     let dialog = match dl.get_or_create_server_invite(&tx, ds, cred, contact) { Ok(d) => d, Err(e) => { error!("server invite: {}", e); return; } };
@@ -470,10 +485,24 @@ async fn handle_incoming(dl: &Arc<DialogLayer>, st: &Arc<Mutex<EndpointState>>, 
         session: session.clone(), rtp: None, outgoing_tx: otx, incoming_rx: irx,
         muted: Arc::new(AtomicBool::new(false)), paused: Arc::new(AtomicBool::new(false)),
         flush_flag: Arc::new(AtomicBool::new(false)), playout_notify: Arc::new((Mutex::new(false), Condvar::new())),
-        beep_detector: Arc::new(Mutex::new(None)), recorder: None, cancel: cc,
+        beep_detector: Arc::new(Mutex::new(None)), recorder: None, cancel: cc.clone(),
         client_dialog: None, server_dialog: Some(dialog),
     });
     let _ = etx.try_send(EndpointEvent::IncomingCall { session });
+
+    // Watch dialog state for remote BYE (same as outbound call path)
+    let (etx2, st2, cc2) = (etx.clone(), st.clone(), cc);
+    tokio::spawn(async move {
+        let mut dr = dr;
+        while let Some(ds) = dr.recv().await {
+            if let DialogState::Terminated(_, reason) = ds {
+                let sess = st2.lock().unwrap().calls.remove(&call_id).map(|c| { c.cancel.cancel(); c.session });
+                if let Some(s) = sess { let _ = etx2.try_send(EndpointEvent::CallTerminated { session: s, reason: format!("{:?}", reason) }); }
+                cc2.cancel();
+                break;
+            }
+        }
+    });
 }
 
 fn extract_x_headers(resp: &rsip::Response, session: &mut CallSession) {

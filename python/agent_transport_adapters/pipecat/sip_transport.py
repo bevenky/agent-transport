@@ -21,6 +21,7 @@ Usage:
 """
 
 import asyncio
+import json
 import logging
 from typing import Optional
 
@@ -136,6 +137,22 @@ class SipOutputTransport(BaseOutputTransport):
         except Exception as e:
             logger.error("write_audio_frame failed: %s", e)
             return False
+
+    async def send_message(self, frame):
+        """Send OutputTransportMessageFrame as SIP INFO with JSON body.
+
+        Filters RTVI internal messages (matching should_ignore_frame).
+        """
+        if isinstance(frame.message, dict) and frame.message.get("label") == "rtvi-ai":
+            return
+        try:
+            msg = json.dumps(frame.message) if not isinstance(frame.message, str) else frame.message
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(
+                None, lambda: self._ep.send_info(self._cid, "application/json", msg)
+            )
+        except Exception as e:
+            logger.warning("send_message via SIP INFO failed: %s", e)
 
     def _supports_native_dtmf(self) -> bool:
         return True

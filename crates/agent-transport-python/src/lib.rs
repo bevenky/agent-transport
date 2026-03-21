@@ -410,6 +410,15 @@ impl SipEndpoint {
         py.allow_threads(move || inner.transfer_attended(call_id, target_call_id)).map_err(py_err)
     }
 
+    /// Send a SIP INFO message. Releases GIL.
+    #[pyo3(signature = (call_id, content_type="application/json", body=""))]
+    fn send_info(&self, py: Python, call_id: i32, content_type: &str, body: &str) -> PyResult<()> {
+        let inner = &self.inner;
+        let ct = content_type.to_string();
+        let b = body.to_string();
+        py.allow_threads(move || inner.send_info(call_id, &ct, &b)).map_err(py_err)
+    }
+
     /// Mute outgoing audio.
     fn mute(&self, call_id: i32) -> PyResult<()> {
         self.inner
