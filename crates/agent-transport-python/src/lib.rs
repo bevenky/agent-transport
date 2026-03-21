@@ -605,12 +605,11 @@ impl SipEndpoint {
         }
     }
 
-    /// Shut down the endpoint. Stops the event loop and tears down SIP stack.
-    fn shutdown(&self) -> PyResult<()> {
+    /// Shut down the endpoint. Stops the event loop and tears down SIP stack. Releases GIL.
+    fn shutdown(&self, py: Python) -> PyResult<()> {
         self.event_thread_running.store(false, Ordering::Relaxed);
-        self.inner
-            .shutdown()
-            .map_err(py_err)
+        let inner = &self.inner;
+        py.allow_threads(|| inner.shutdown()).map_err(py_err)
     }
 }
 
@@ -768,7 +767,10 @@ impl AudioStreamEndpoint {
     #[getter]
     fn sample_rate(&self) -> u32 { self.inner.sample_rate() }
 
-    fn shutdown(&self) -> PyResult<()> { self.inner.shutdown().map_err(py_err) }
+    fn shutdown(&self, py: Python) -> PyResult<()> {
+        let inner = &self.inner;
+        py.allow_threads(|| inner.shutdown()).map_err(py_err)
+    }
 }
 
 #[pymodule]
