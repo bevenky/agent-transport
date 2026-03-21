@@ -112,6 +112,7 @@ export class SipAudioOutput {
   private _firstFrameSent = false;
   private _interrupted = false;
   private _lastEvent: PlaybackFinishedEvent = { playbackPosition: 0, interrupted: false };
+  private _playoutResolve?: () => void;
   private _listeners: { [event: string]: Array<(ev: any) => void> } = {};
   readonly label: string;
   readonly capabilities: AudioOutputCapabilities;
@@ -212,14 +213,19 @@ export class SipAudioOutput {
   }
 
   onPlaybackFinished(event: PlaybackFinishedEvent): void {
+    if (this._finishedCount >= this._segmentCount) return; // Guard: don't exceed segment count
     this._finishedCount++;
     this._lastEvent = event;
     this._emit('playbackFinished', event);
+    if (this._playoutResolve) {
+      this._playoutResolve();
+      this._playoutResolve = undefined;
+    }
   }
 
   async waitForPlayout(): Promise<PlaybackFinishedEvent> {
     while (this._finishedCount < this._segmentCount) {
-      await new Promise((resolve) => setTimeout(resolve, 10));
+      await new Promise<void>((resolve) => { this._playoutResolve = resolve; });
     }
     return this._lastEvent;
   }

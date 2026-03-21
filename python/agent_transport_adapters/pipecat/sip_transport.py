@@ -141,7 +141,7 @@ class SipOutputTransport(BaseOutputTransport):
         return True
 
     async def _write_dtmf_native(self, frame):
-        digit = str(frame.button.value) if hasattr(frame, "button") else str(frame)
+        digit = str(frame.button.value)
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, lambda: self._ep.send_dtmf(self._cid, digit))
 

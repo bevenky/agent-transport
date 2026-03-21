@@ -136,7 +136,7 @@ class AudioStreamOutputTransport(BaseOutputTransport):
         return True
 
     async def _write_dtmf_native(self, frame):
-        digit = str(frame.button.value) if hasattr(frame, "button") else str(frame)
+        digit = str(frame.button.value)
         self._ep.send_dtmf(self._sid, digit)
 
     async def write_audio_frame(self, frame: OutputAudioRawFrame) -> bool:
@@ -156,7 +156,7 @@ class AudioStreamOutputTransport(BaseOutputTransport):
 
         Filters RTVI internal messages (matching PlivoFrameSerializer.should_ignore_frame).
         """
-        if isinstance(frame.message, dict) and frame.message.get("type", "").startswith("rtvi-"):
+        if isinstance(frame.message, dict) and frame.message.get("label") == "rtvi-ai":
             return
         try:
             msg = json.dumps(frame.message) if not isinstance(frame.message, str) else frame.message
