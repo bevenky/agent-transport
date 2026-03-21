@@ -657,6 +657,11 @@ impl AudioStreamEndpoint {
     }
 
     #[napi]
+    pub fn recv_audio_bytes_blocking(&self, session_id: i32, timeout_ms: Option<u32>) -> Result<Option<Vec<u8>>> {
+        self.inner.recv_audio_blocking(session_id, timeout_ms.unwrap_or(20) as u64).map(|o| o.map(|f| f.as_bytes())).map_err(napi_err)
+    }
+
+    #[napi]
     pub fn mute(&self, session_id: i32) -> Result<()> { self.inner.mute(session_id).map_err(napi_err) }
 
     #[napi]
