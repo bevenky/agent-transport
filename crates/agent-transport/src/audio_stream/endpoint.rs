@@ -306,7 +306,7 @@ async fn handle_ws(ws: tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>
     use futures_util::{SinkExt, StreamExt};
     let (mut sink, mut stream) = ws.split();
     let (ws_tx, mut ws_rx) = tokio::sync::mpsc::unbounded_channel::<Message>();
-    let (itx, irx) = crossbeam_channel::bounded(6000);
+    let (itx, irx) = crossbeam_channel::bounded(18000);
 
     let cc = cancel.clone();
     tokio::spawn(async move { loop { tokio::select! { _ = cc.cancelled() => break, msg = ws_rx.recv() => { match msg { Some(m) => { if sink.send(m).await.is_err() { break; } }, None => break } } } } });
@@ -336,7 +336,7 @@ async fn handle_ws(ws: tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>
                             }
 
                             // Create outgoing queue + control flags (same as SIP)
-                            let (otx, orx): (Sender<Vec<i16>>, Receiver<Vec<i16>>) = crossbeam_channel::bounded(6000);
+                            let (otx, orx): (Sender<Vec<i16>>, Receiver<Vec<i16>>) = crossbeam_channel::bounded(18000);
                             let muted = Arc::new(AtomicBool::new(false));
                             let paused = Arc::new(AtomicBool::new(false));
                             let flush_flag = Arc::new(AtomicBool::new(false));

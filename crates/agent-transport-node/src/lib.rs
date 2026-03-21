@@ -657,14 +657,45 @@ impl AudioStreamEndpoint {
     }
 
     #[napi]
-    pub fn clear_buffer(&self, session_id: i32) -> Result<()> {
-        self.inner.clear_buffer(session_id).map_err(napi_err)
+    pub fn mute(&self, session_id: i32) -> Result<()> { self.inner.mute(session_id).map_err(napi_err) }
+
+    #[napi]
+    pub fn unmute(&self, session_id: i32) -> Result<()> { self.inner.unmute(session_id).map_err(napi_err) }
+
+    #[napi]
+    pub fn pause(&self, session_id: i32) -> Result<()> { self.inner.pause(session_id).map_err(napi_err) }
+
+    #[napi]
+    pub fn resume(&self, session_id: i32) -> Result<()> { self.inner.resume(session_id).map_err(napi_err) }
+
+    #[napi]
+    pub fn clear_buffer(&self, session_id: i32) -> Result<()> { self.inner.clear_buffer(session_id).map_err(napi_err) }
+
+    #[napi]
+    pub fn flush(&self, session_id: i32) -> Result<()> { self.inner.flush(session_id).map_err(napi_err) }
+
+    #[napi]
+    pub fn wait_for_playout(&self, session_id: i32, timeout_ms: Option<u32>) -> Result<bool> {
+        self.inner.wait_for_playout(session_id, timeout_ms.unwrap_or(5000) as u64).map_err(napi_err)
     }
 
     #[napi]
-    pub fn hangup(&self, session_id: i32) -> Result<()> {
-        self.inner.hangup(session_id).map_err(napi_err)
+    pub fn checkpoint(&self, session_id: i32, name: Option<String>) -> Result<String> {
+        self.inner.checkpoint(session_id, name.as_deref()).map_err(napi_err)
     }
+
+    #[napi]
+    pub fn send_dtmf(&self, session_id: i32, digits: String) -> Result<()> {
+        self.inner.send_dtmf(session_id, &digits).map_err(napi_err)
+    }
+
+    #[napi]
+    pub fn queued_frames(&self, session_id: i32) -> Result<u32> {
+        self.inner.queued_frames(session_id).map(|n| n as u32).map_err(napi_err)
+    }
+
+    #[napi]
+    pub fn hangup(&self, session_id: i32) -> Result<()> { self.inner.hangup(session_id).map_err(napi_err) }
 
     #[napi]
     pub fn poll_event(&self) -> Result<Option<EventInfo>> {
@@ -676,6 +707,9 @@ impl AudioStreamEndpoint {
 
     #[napi(getter)]
     pub fn sample_rate(&self) -> u32 { self.inner.sample_rate() }
+
+    #[napi(getter)]
+    pub fn num_channels(&self) -> u32 { 1 }
 
     #[napi]
     pub fn shutdown(&self) -> Result<()> { self.inner.shutdown().map_err(napi_err) }
