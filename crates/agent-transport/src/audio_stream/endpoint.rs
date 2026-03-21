@@ -5,8 +5,9 @@
 //! Receives: start, media, dtmf, stop, playedStream, clearedAudio events.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
+use std::time::Duration;
 
 use audio_codec_algorithms::{decode_ulaw, encode_ulaw};
 use base64::Engine;
@@ -88,11 +89,18 @@ struct StreamSession {
     ws_tx: tokio::sync::mpsc::UnboundedSender<Message>,
     incoming_tx: Sender<AudioFrame>,
     incoming_rx: Receiver<AudioFrame>,
+    outgoing_tx: Sender<Vec<i16>>,  // Outgoing audio queue (same as SIP)
     extra_headers: HashMap<String, String>,
     encoding: AudioEncoding,
-    // Checkpoint tracking for flush/wait_for_playout
+    // Audio control flags (same as SIP RTP transport)
+    muted: Arc<AtomicBool>,
+    paused: Arc<AtomicBool>,
+    flush_flag: Arc<AtomicBool>,
+    playout_notify: Arc<(Mutex<bool>, Condvar)>,
+    // Checkpoint tracking
     checkpoint_counter: AtomicU64,
-    checkpoint_notify: Arc<(Mutex<Option<String>>, Condvar)>, // last completed checkpoint name
+    checkpoint_notify: Arc<(Mutex<Option<String>>, Condvar)>,
+    cancel: CancellationToken,
 }
 
 // ─── AudioStreamEndpoint ─────────────────────────────────────────────────────
@@ -123,37 +131,40 @@ impl AudioStreamEndpoint {
         Ok(Self { config, runtime: rt, sessions, next_id: AtomicI32::new(0), event_tx: etx, event_rx: erx, cancel })
     }
 
-    /// Send audio frame. Encodes based on negotiated format.
+    /// Send audio frame — queued and paced by Rust send loop (same as SIP).
     pub fn send_audio(&self, session_id: i32, frame: &AudioFrame) -> Result<()> {
         let s = self.sessions.lock().unwrap();
         let sess = s.get(&session_id).ok_or(EndpointError::CallNotActive(session_id))?;
+        sess.outgoing_tx.try_send(frame.data.clone())
+            .map_err(|_| EndpointError::Other("audio buffer full".into()))
+    }
 
-        let (payload_bytes, ct, sr) = match sess.encoding {
-            AudioEncoding::L16Rate16k => {
-                // Native 16kHz PCM — no resampling, no codec. Just raw int16 LE bytes.
-                let bytes: Vec<u8> = frame.data.iter().flat_map(|&s| s.to_le_bytes()).collect();
-                (bytes, "audio/x-l16", 16000u32)
-            }
-            AudioEncoding::L16Rate8k => {
-                // Downsample 16k→8k, send as raw PCM
-                let pcm_8k: Vec<i16> = frame.data.iter().step_by(2).copied().collect();
-                let bytes: Vec<u8> = pcm_8k.iter().flat_map(|&s| s.to_le_bytes()).collect();
-                (bytes, "audio/x-l16", 8000u32)
-            }
-            AudioEncoding::MulawRate8k => {
-                // Downsample 16k→8k, encode mu-law
-                let pcm_8k: Vec<i16> = frame.data.iter().step_by(2).copied().collect();
-                let ulaw: Vec<u8> = pcm_8k.iter().map(|&s| encode_ulaw(s)).collect();
-                (ulaw, "audio/x-mulaw", 8000u32)
-            }
-        };
+    /// Mute outgoing audio (send silence, preserve queue).
+    pub fn mute(&self, session_id: i32) -> Result<()> {
+        let s = self.sessions.lock().unwrap();
+        let sess = s.get(&session_id).ok_or(EndpointError::CallNotActive(session_id))?;
+        sess.muted.store(true, Ordering::Relaxed); Ok(())
+    }
 
-        let b64 = base64::engine::general_purpose::STANDARD.encode(&payload_bytes);
-        let json = serde_json::to_string(&serde_json::json!({
-            "event": "playAudio",
-            "media": { "contentType": ct, "sampleRate": sr, "payload": b64 }
-        })).map_err(|e| EndpointError::Other(e.to_string()))?;
-        sess.ws_tx.send(Message::Text(json)).map_err(|_| EndpointError::Other("WS send failed".into()))
+    /// Unmute outgoing audio.
+    pub fn unmute(&self, session_id: i32) -> Result<()> {
+        let s = self.sessions.lock().unwrap();
+        let sess = s.get(&session_id).ok_or(EndpointError::CallNotActive(session_id))?;
+        sess.muted.store(false, Ordering::Relaxed); Ok(())
+    }
+
+    /// Pause audio playback (send loop outputs nothing, queue preserved).
+    pub fn pause(&self, session_id: i32) -> Result<()> {
+        let s = self.sessions.lock().unwrap();
+        let sess = s.get(&session_id).ok_or(EndpointError::CallNotActive(session_id))?;
+        sess.paused.store(true, Ordering::Relaxed); Ok(())
+    }
+
+    /// Resume audio playback.
+    pub fn resume(&self, session_id: i32) -> Result<()> {
+        let s = self.sessions.lock().unwrap();
+        let sess = s.get(&session_id).ok_or(EndpointError::CallNotActive(session_id))?;
+        sess.paused.store(false, Ordering::Relaxed); Ok(())
     }
 
     pub fn recv_audio(&self, session_id: i32) -> Result<Option<AudioFrame>> {
@@ -167,10 +178,13 @@ impl AudioStreamEndpoint {
         Ok(rx.recv_timeout(std::time::Duration::from_millis(timeout_ms)).ok())
     }
 
-    /// Clear buffered audio — sends clearAudio to Plivo.
+    /// Clear buffered audio — drains local queue AND sends clearAudio to Plivo.
     pub fn clear_buffer(&self, session_id: i32) -> Result<()> {
         let s = self.sessions.lock().unwrap();
         let sess = s.get(&session_id).ok_or(EndpointError::CallNotActive(session_id))?;
+        // Drain local queue (same as SIP flush_flag)
+        sess.flush_flag.store(true, Ordering::Relaxed);
+        // Send clearAudio to Plivo to clear server-side buffer
         let json = serde_json::to_string(&serde_json::json!({ "event": "clearAudio", "streamId": sess.stream_id }))
             .map_err(|e| EndpointError::Other(e.to_string()))?;
         sess.ws_tx.send(Message::Text(json)).map_err(|_| EndpointError::Other("WS send failed".into()))
@@ -243,7 +257,11 @@ impl AudioStreamEndpoint {
         Ok(())
     }
 
-    pub fn queued_frames(&self, _: i32) -> Result<usize> { Ok(0) }
+    pub fn queued_frames(&self, session_id: i32) -> Result<usize> {
+        let s = self.sessions.lock().unwrap();
+        let sess = s.get(&session_id).ok_or(EndpointError::CallNotActive(session_id))?;
+        Ok(sess.outgoing_tx.len())
+    }
     pub fn sample_rate(&self) -> u32 { self.config.sample_rate }
     pub fn events(&self) -> Receiver<EndpointEvent> { self.event_rx.clone() }
 
@@ -305,24 +323,64 @@ async fn handle_ws(ws: tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>
                             encoding = start.media_format.as_ref().map(|f| AudioEncoding::from_format(f)).unwrap_or(AudioEncoding::MulawRate8k);
                             let mut headers = HashMap::new();
                             if let Some(ref h) = start.extra_headers {
-                                // Extra headers can be JSON or comma-separated key=value
                                 if h.starts_with('{') {
                                     if let Ok(p) = serde_json::from_str::<HashMap<String, String>>(h) { headers = p; }
                                 } else {
                                     for part in h.split(',') {
-                                        if let Some((k, v)) = part.split_once('=') {
-                                            headers.insert(k.trim().to_string(), v.trim().to_string());
-                                        }
+                                        if let Some((k, v)) = part.split_once('=') { headers.insert(k.trim().to_string(), v.trim().to_string()); }
                                     }
                                 }
                             }
+
+                            // Create outgoing queue + control flags (same as SIP)
+                            let (otx, orx): (Sender<Vec<i16>>, Receiver<Vec<i16>>) = crossbeam_channel::bounded(50);
+                            let muted = Arc::new(AtomicBool::new(false));
+                            let paused = Arc::new(AtomicBool::new(false));
+                            let flush_flag = Arc::new(AtomicBool::new(false));
+                            let playout_notify = Arc::new((Mutex::new(false), Condvar::new()));
                             let cp_notify = Arc::new((Mutex::new(None), Condvar::new()));
+                            let session_cancel = CancellationToken::new();
+
+                            // Spawn send loop — paces outgoing audio at 20ms intervals
+                            let enc = encoding;
+                            let wstx = ws_tx.clone();
+                            let (m, p, f, pn) = (muted.clone(), paused.clone(), flush_flag.clone(), playout_notify.clone());
+                            let sc = session_cancel.clone();
+                            tokio::spawn(async move {
+                                let mut iv = tokio::time::interval(Duration::from_millis(20));
+                                loop {
+                                    tokio::select! { _ = sc.cancelled() => break, _ = iv.tick() => {} }
+                                    if f.swap(false, Ordering::Relaxed) {
+                                        while orx.try_recv().is_ok() {}
+                                        if let Ok(mut d) = pn.0.lock() { *d = true; pn.1.notify_all(); }
+                                        continue;
+                                    }
+                                    if p.load(Ordering::Relaxed) { continue; } // Paused — send nothing
+                                    match orx.try_recv() {
+                                        Ok(samples) if !m.load(Ordering::Relaxed) => {
+                                            let payload = encode_for_plivo(&samples, enc);
+                                            let b64 = base64::engine::general_purpose::STANDARD.encode(&payload);
+                                            let json = serde_json::to_string(&serde_json::json!({
+                                                "event": "playAudio",
+                                                "media": { "contentType": enc.content_type(), "sampleRate": enc.send_sample_rate(), "payload": b64 }
+                                            })).unwrap_or_default();
+                                            let _ = wstx.send(Message::Text(json));
+                                        }
+                                        Ok(_) => {} // Muted — consume frame but don't send
+                                        Err(_) => { if let Ok(mut d) = pn.0.lock() { *d = true; pn.1.notify_all(); } } // Queue empty
+                                    }
+                                }
+                            });
+
                             sessions.lock().unwrap().insert(sid, StreamSession {
                                 call_id: start.call_id.clone(), stream_id: start.stream_id.clone(),
                                 ws_tx: ws_tx.clone(), incoming_tx: itx.clone(), incoming_rx: irx.clone(),
-                                extra_headers: headers.clone(), encoding,
+                                outgoing_tx: otx, extra_headers: headers.clone(), encoding,
+                                muted, paused, flush_flag, playout_notify,
                                 checkpoint_counter: AtomicU64::new(0), checkpoint_notify: cp_notify,
+                                cancel: session_cancel,
                             });
+
                             let mut session = crate::sip::call::CallSession::new(sid, crate::sip::call::CallDirection::Inbound);
                             session.remote_uri = start.call_id;
                             session.extra_headers = headers;
@@ -388,6 +446,23 @@ async fn handle_ws(ws: tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>
                     _ => {}
                 }
             }
+        }
+    }
+}
+
+/// Encode 16kHz PCM samples for Plivo based on negotiated format.
+fn encode_for_plivo(samples: &[i16], enc: AudioEncoding) -> Vec<u8> {
+    match enc {
+        AudioEncoding::L16Rate16k => {
+            samples.iter().flat_map(|&s| s.to_le_bytes()).collect()
+        }
+        AudioEncoding::L16Rate8k => {
+            let pcm_8k: Vec<i16> = samples.iter().step_by(2).copied().collect();
+            pcm_8k.iter().flat_map(|&s| s.to_le_bytes()).collect()
+        }
+        AudioEncoding::MulawRate8k => {
+            let pcm_8k: Vec<i16> = samples.iter().step_by(2).copied().collect();
+            pcm_8k.iter().map(|&s| encode_ulaw(s)).collect()
         }
     }
 }

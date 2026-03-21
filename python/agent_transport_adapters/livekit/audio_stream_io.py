@@ -90,7 +90,7 @@ class AudioStreamOutput(AudioOutput):
     def sample_rate(self) -> Optional[int]: return self._sample_rate or self._ep.sample_rate
 
     @property
-    def can_pause(self) -> bool: return False
+    def can_pause(self) -> bool: return True  # Now supported via Rust send loop
 
     @property
     def next_in_chain(self): return self._next_in_chain
@@ -137,8 +137,8 @@ class AudioStreamOutput(AudioOutput):
         self._segment_count = 0
         self._finished_count = 0
 
-    def pause(self) -> None: pass
-    def resume(self) -> None: pass
+    def pause(self) -> None: self._ep.pause(self._sid)
+    def resume(self) -> None: self._ep.resume(self._sid)
     def on_attached(self) -> None: pass
     def on_detached(self) -> None: pass
     def __repr__(self) -> str: return f"AudioStreamOutput(label={self._label_str!r})"

@@ -694,6 +694,22 @@ impl AudioStreamEndpoint {
         py.allow_threads(|| inner.recv_audio_blocking(session_id, timeout_ms).map(|opt| opt.map(|f| (f.as_bytes(), f.sample_rate, f.num_channels)))).map_err(py_err)
     }
 
+    fn mute(&self, session_id: i32) -> PyResult<()> {
+        self.inner.mute(session_id).map_err(py_err)
+    }
+
+    fn unmute(&self, session_id: i32) -> PyResult<()> {
+        self.inner.unmute(session_id).map_err(py_err)
+    }
+
+    fn pause(&self, session_id: i32) -> PyResult<()> {
+        self.inner.pause(session_id).map_err(py_err)
+    }
+
+    fn resume(&self, session_id: i32) -> PyResult<()> {
+        self.inner.resume(session_id).map_err(py_err)
+    }
+
     fn clear_buffer(&self, session_id: i32) -> PyResult<()> {
         self.inner.clear_buffer(session_id).map_err(py_err)
     }
