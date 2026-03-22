@@ -147,8 +147,22 @@ impl SipEndpoint {
             let resp = reg.register(server_uri.clone(), Some(exp)).await.map_err(err)?;
 
             if resp.status_code == rsip::StatusCode::OK {
-                info!("Registered {}@{}", user, srv);
-                { let mut s = st.lock().unwrap(); s.registered = true; s.credential = Some(cred); s.contact_uri = Some(contact_uri); s.public_addr = pa; }
+                // Use the NAT address discovered by rsipstack from rport/received (more accurate than STUN)
+                let discovered = reg.discovered_public_address();
+                let final_contact = if let Some(ref hp) = discovered {
+                    let h = hp.host.to_string();
+                    let p = hp.port.as_ref().map(|p| u16::from(p.clone())).unwrap_or(cp);
+                    info!("Registered {}@{} (NAT: {}:{})", user, srv, h, p);
+                    let uri: rsip::Uri = format!("sip:{}@{}:{}", user, h, p).try_into().map_err(|e| err(format!("{:?}", e)))?;
+                    let nat_addr = format!("{}:{}", h, p).parse::<std::net::SocketAddr>().ok();
+                    { let mut s = st.lock().unwrap(); s.registered = true; s.credential = Some(cred); s.contact_uri = Some(uri.clone()); s.public_addr = nat_addr.or(pa); }
+                    uri
+                } else {
+                    info!("Registered {}@{}", user, srv);
+                    { let mut s = st.lock().unwrap(); s.registered = true; s.credential = Some(cred); s.contact_uri = Some(contact_uri.clone()); s.public_addr = pa; }
+                    contact_uri
+                };
+                let _ = final_contact; // used via st.lock()
                 let _ = etx.try_send(EndpointEvent::Registered);
 
                 let re = reg.expires().max(50) as u64;
@@ -196,6 +210,7 @@ impl SipEndpoint {
             let rtp_sock = UdpSocket::bind("0.0.0.0:0").await.map_err(err)?;
             let rtp_port = rtp_sock.local_addr().unwrap().port();
             let sdp_ip = pa.map(|a| a.ip()).unwrap_or_else(|| la.addr.host.to_string().parse().unwrap_or(std::net::Ipv4Addr::UNSPECIFIED.into()));
+            debug!("Call setup: contact={} sdp_ip={} rtp_local_port={} public_addr={:?}", contact, sdp_ip, rtp_port, pa);
             let offer = sdp::build_offer(sdp_ip, rtp_port, &cfg.codecs);
 
             let custom_hdrs = headers.map(|h| h.into_iter().map(|(k, v)| rsip::Header::Other(k, v)).collect());
@@ -224,6 +239,7 @@ impl SipEndpoint {
 
             let cc = CancellationToken::new();
             let dtmf_pt = answer.dtmf_payload_type.unwrap_or(crate::sip::rtp_transport::DEFAULT_DTMF_PT);
+            debug!("Call negotiated: codec={:?} dtmf_pt={} ptime={}ms remote_rtp={}", answer.codec, dtmf_pt, answer.ptime_ms, remote_rtp);
             let rtp = Arc::new(RtpTransport::new(Arc::new(rtp_sock), remote_rtp, answer.codec, cc.clone(), dtmf_pt, answer.ptime_ms));
             let (otx, orx) = crossbeam_channel::bounded(18000);
             let (itx, irx) = crossbeam_channel::bounded(18000);
@@ -233,13 +249,15 @@ impl SipEndpoint {
             rtp.start_recv_loop(itx, etx.clone(), call_id, bd.clone());
             let _ = etx.try_send(EndpointEvent::CallMediaActive { call_id });
 
-            // Watch dialog state
+            // Watch dialog state for remote BYE
             let (etx2, st2, cc2) = (etx.clone(), st.clone(), cc.clone());
             tokio::spawn(async move {
                 let mut dr = dr;
                 while let Some(ds) = dr.recv().await {
+                    debug!("Dialog state change call {}", call_id);
                     if let DialogState::Terminated(_, reason) = ds {
-                        let sess = st2.lock().unwrap().calls.remove(&call_id).map(|c| c.session);
+                        info!("Call {} terminated by remote: {:?}", call_id, reason);
+                        let sess = st2.lock().unwrap().calls.remove(&call_id).map(|c| { c.cancel.cancel(); c.session });
                         if let Some(s) = sess { let _ = etx2.try_send(EndpointEvent::CallTerminated { session: s, reason: format!("{:?}", reason) }); }
                         cc2.cancel();
                         break;

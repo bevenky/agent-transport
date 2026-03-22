@@ -109,17 +109,32 @@ def main():
 
     def mic_to_sip():
         """Capture from microphone, push to SIP call via send_audio."""
+        mic_frames_sent = [0]
+        mic_errors = [0]
+        mic_silent = [0]
+
         def mic_callback(indata, frames, time_info, status):
+            if status:
+                print(f"  [MIC STATUS] {status}", flush=True)
             if not running.is_set():
                 raise sd.CallbackAbort
             # indata is float32 [-1, 1], convert to int16
             samples = (indata[:, 0] * 32767).astype(np.int16)
+            peak = int(np.max(np.abs(samples)))
+            if peak < 10:
+                mic_silent[0] += 1
             frame = AudioFrame(samples.tolist(), SAMPLE_RATE, CHANNELS)
             try:
                 ep.send_audio(call_id, frame)
-            except Exception:
-                pass
+                mic_frames_sent[0] += 1
+                if mic_frames_sent[0] % 250 == 0:  # every 5 seconds
+                    print(f"  [MIC] sent={mic_frames_sent[0]} errors={mic_errors[0]} silent={mic_silent[0]} peak={peak}", flush=True)
+            except Exception as e:
+                mic_errors[0] += 1
+                if mic_errors[0] <= 5:
+                    print(f"  [MIC ERROR] {e}", flush=True)
 
+        print(f"  [MIC] Opening input device: {sd.query_devices(kind='input')['name']}")
         with sd.InputStream(
             samplerate=SAMPLE_RATE,
             channels=CHANNELS,

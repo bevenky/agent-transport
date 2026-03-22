@@ -138,11 +138,19 @@ impl RtpTransport {
 
                         // DTMF
                         if pkt.header.payload_type == t.dtmf_pt {
-                            if let Some((ev, end, _, _)) = dtmf::decode_rfc4733(&pkt.payload) {
-                                if end { if let Some(d) = dtmf::event_to_digit(ev) { let _ = etx.try_send(EndpointEvent::DtmfReceived { call_id: cid, digit: d, method: "rfc2833".into() }); } dtmf_ev = None; dtmf_timer = None; }
+                            debug!("DTMF RTP: pt={} len={} payload={:?}", pkt.header.payload_type, pkt.payload.len(), &pkt.payload[..pkt.payload.len().min(8)]);
+                            if let Some((ev, end, vol, dur)) = dtmf::decode_rfc4733(&pkt.payload) {
+                                debug!("DTMF decoded: event={} end={} vol={} dur={}", ev, end, vol, dur);
+                                if end { if let Some(d) = dtmf::event_to_digit(ev) { debug!("DTMF digit: {}", d); let _ = etx.try_send(EndpointEvent::DtmfReceived { call_id: cid, digit: d, method: "rfc2833".into() }); } dtmf_ev = None; dtmf_timer = None; }
                                 else { dtmf_ev = Some(ev); if dtmf_timer.is_none() { dtmf_timer = Some(Instant::now()); } }
+                            } else {
+                                debug!("DTMF decode failed for payload len={}", pkt.payload.len());
                             }
                             continue;
+                        }
+                        // Log unexpected payload types
+                        if pkt.header.payload_type != t.codec.payload_type() && pkt.header.payload_type != 13 {
+                            debug!("RTP unexpected PT={} (expected {} or {})", pkt.header.payload_type, t.codec.payload_type(), t.dtmf_pt);
                         }
                         // DTMF END timeout
                         if let Some(ev) = dtmf_ev { if dtmf_timer.map(|t| t.elapsed() > DTMF_END_TIMEOUT).unwrap_or(false) { if let Some(d) = dtmf::event_to_digit(ev) { warn!("DTMF END timeout: {}", d); let _ = etx.try_send(EndpointEvent::DtmfReceived { call_id: cid, digit: d, method: "rfc2833".into() }); } dtmf_ev = None; dtmf_timer = None; } }
