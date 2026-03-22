@@ -108,7 +108,7 @@ impl RtpTransport {
         })
     }
 
-    pub fn start_recv_loop(self: &Arc<Self>, tx: Sender<AudioFrame>, etx: Sender<EndpointEvent>, cid: i32, bd: Arc<Mutex<Option<BeepDetector>>>) -> tokio::task::JoinHandle<()> {
+    pub fn start_recv_loop(self: &Arc<Self>, tx: Sender<AudioFrame>, etx: Sender<EndpointEvent>, cid: i32, bd: Arc<Mutex<Option<BeepDetector>>>, held: Arc<AtomicBool>) -> tokio::task::JoinHandle<()> {
         let t = Arc::clone(self);
         tokio::spawn(async move {
             let mut buf = vec![0u8; 2048];
@@ -136,15 +136,24 @@ impl RtpTransport {
                         else if ss != t.ssrc { remote_ssrc = Some(ss); }
                         last_rtp = Instant::now();
 
-                        // DTMF
+                        // DTMF (RFC 4733) — dedup END retransmissions
                         if pkt.header.payload_type == t.dtmf_pt {
-                            debug!("DTMF RTP: pt={} len={} payload={:?}", pkt.header.payload_type, pkt.payload.len(), &pkt.payload[..pkt.payload.len().min(8)]);
-                            if let Some((ev, end, vol, dur)) = dtmf::decode_rfc4733(&pkt.payload) {
-                                debug!("DTMF decoded: event={} end={} vol={} dur={}", ev, end, vol, dur);
-                                if end { if let Some(d) = dtmf::event_to_digit(ev) { debug!("DTMF digit: {}", d); let _ = etx.try_send(EndpointEvent::DtmfReceived { call_id: cid, digit: d, method: "rfc2833".into() }); } dtmf_ev = None; dtmf_timer = None; }
-                                else { dtmf_ev = Some(ev); if dtmf_timer.is_none() { dtmf_timer = Some(Instant::now()); } }
-                            } else {
-                                debug!("DTMF decode failed for payload len={}", pkt.payload.len());
+                            if let Some((ev, end, _vol, _dur)) = dtmf::decode_rfc4733(&pkt.payload) {
+                                if end {
+                                    // Only emit once per digit — dtmf_ev is Some during active event
+                                    if dtmf_ev.is_some() {
+                                        if let Some(d) = dtmf::event_to_digit(ev) {
+                                            debug!("DTMF digit: {}", d);
+                                            let _ = etx.try_send(EndpointEvent::DtmfReceived { call_id: cid, digit: d, method: "rfc2833".into() });
+                                        }
+                                        dtmf_ev = None;
+                                        dtmf_timer = None;
+                                    }
+                                    // else: END retransmission — already handled, ignore
+                                } else {
+                                    dtmf_ev = Some(ev);
+                                    if dtmf_timer.is_none() { dtmf_timer = Some(Instant::now()); }
+                                }
                             }
                             continue;
                         }
@@ -178,7 +187,8 @@ impl RtpTransport {
                         }
                     }
                 }
-                if last_rtp.elapsed() > MEDIA_TIMEOUT {
+                // Skip media timeout check during SIP hold (remote is expected to stop sending)
+                if last_rtp.elapsed() > MEDIA_TIMEOUT && !held.load(Ordering::Relaxed) {
                     warn!("Media timeout call {} ({}s)", cid, MEDIA_TIMEOUT.as_secs());
                     let _ = etx.try_send(EndpointEvent::CallTerminated { session: crate::sip::call::CallSession::new(cid, crate::sip::call::CallDirection::Outbound), reason: "media timeout".into() });
                     break;

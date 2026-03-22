@@ -433,6 +433,18 @@ impl SipEndpoint {
             .map_err(py_err)
     }
 
+    /// SIP hold — send Re-INVITE with a=sendonly. Releases GIL.
+    fn hold(&self, py: Python, call_id: i32) -> PyResult<()> {
+        let inner = &self.inner;
+        py.allow_threads(move || inner.hold(call_id)).map_err(py_err)
+    }
+
+    /// SIP unhold — send Re-INVITE with a=sendrecv. Releases GIL.
+    fn unhold(&self, py: Python, call_id: i32) -> PyResult<()> {
+        let inner = &self.inner;
+        py.allow_threads(move || inner.unhold(call_id)).map_err(py_err)
+    }
+
     /// Send an audio frame.
     fn send_audio(&self, call_id: i32, frame: &AudioFrame) -> PyResult<()> {
         self.inner
@@ -786,14 +798,23 @@ impl AudioStreamEndpoint {
 /// Call this before creating any endpoints to see Rust-level logs.
 ///
 /// Examples:
-///   init_logging("debug")                  # all agent-transport debug logs
-///   init_logging("agent_transport=trace")  # full trace
-///   init_logging("info")                   # default
+///   init_logging("debug")                          # agent-transport debug, rsipstack info
+///   init_logging("trace")                          # everything including rsipstack
+///   init_logging("agent_transport=debug,rsipstack=debug")  # both at debug
+///   init_logging("info")                           # default
+///
+/// RUST_LOG env var overrides the filter argument.
 #[pyfunction]
 #[pyo3(signature = (filter="info"))]
 fn init_logging(filter: &str) -> PyResult<()> {
     use tracing_subscriber::EnvFilter;
-    let f = std::env::var("RUST_LOG").unwrap_or_else(|_| filter.to_string());
+    let raw = std::env::var("RUST_LOG").unwrap_or_else(|_| filter.to_string());
+    // Expand shorthand levels to filtered versions that skip DNS/transport noise
+    let f = match raw.as_str() {
+        "debug" => "agent_transport=debug,rsipstack::transport::udp=debug,rsipstack::dialog=debug,rsipstack::transaction::transaction=debug,rsipstack=warn,hickory=warn".to_string(),
+        "trace" => "agent_transport=trace,rsipstack=debug,hickory=warn".to_string(),
+        other => other.to_string(),
+    };
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::new(f))
         .with_target(true)

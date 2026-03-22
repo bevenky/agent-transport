@@ -455,6 +455,14 @@ impl SipEndpoint {
             .map_err(napi_err)
     }
 
+    /// SIP hold — send Re-INVITE with a=sendonly
+    #[napi]
+    pub fn hold(&self, call_id: i32) -> Result<()> { self.inner.hold(call_id).map_err(napi_err) }
+
+    /// SIP unhold — send Re-INVITE with a=sendrecv
+    #[napi]
+    pub fn unhold(&self, call_id: i32) -> Result<()> { self.inner.unhold(call_id).map_err(napi_err) }
+
     #[napi]
     pub fn mute(&self, call_id: i32) -> Result<()> {
         self.inner

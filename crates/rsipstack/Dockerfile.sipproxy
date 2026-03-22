@@ -1,0 +1,25 @@
+FROM rust:bookworm AS rust-builder
+RUN mkdir /build
+ADD . /build/
+WORKDIR /build
+RUN mkdir -p .cargo && echo '[source.crates-io]\nreplace-with = "rsproxy-sparse"\n[source.rsproxy-sparse]\nregistry = "sparse+https://rsproxy.cn/index/"' > .cargo/config.toml
+RUN ln -fs /usr/share/zoneinfo/Asia/Shanghai /etc/localtime
+RUN --mount=type=cache,target=/build/.cargo/registry \
+    --mount=type=cache,target=/build/rsipstack/target/release/incremental\
+    --mount=type=cache,target=/build/rsipstack/target/release/build\
+    cargo build --release --example proxy
+
+FROM debian:bookworm
+LABEL maintainer="shenjindi@fourz.cn"
+RUN sed -i 's/deb.debian.org/mirrors.aliyun.com/g' /etc/apt/sources.list.d/debian.sources
+RUN --mount=type=cache,target=/var/apt apt-get update && apt-get install -y ca-certificates tzdata
+ENV DEBIAN_FRONTEND=noninteractive
+ENV LANG=C.UTF-8
+
+RUN ln -fs /usr/share/zoneinfo/Asia/Shanghai /etc/localtime
+
+WORKDIR /app
+COPY --from=rust-builder /build/target/release/examples/proxy /app/proxy
+
+EXPOSE 25060/UDP
+ENTRYPOINT ["/app/proxy"]

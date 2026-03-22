@@ -12,8 +12,8 @@ tracing.workspace = true
 crossbeam-channel.workspace = true
 tokio.workspace = true
 
-# SIP signaling
-rsipstack = "0.4"
+# SIP signaling (local fork with lr=on fix for ACK routing)
+rsipstack = { path = "../rsipstack" }
 rsip = "0.4"
 
 # RTP (webrtc-rs established crate)

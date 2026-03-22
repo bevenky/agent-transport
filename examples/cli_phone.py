@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """
-CLI Example Phone — make a real SIP call and talk from your terminal.
+CLI Phone — make a real SIP call and talk from your terminal.
 
-Uses the agent_transport Python binding for SIP + sounddevice for mic/speaker.
-Demonstrates the full programmatic audio API: recv_audio -> speaker, mic -> send_audio.
+Uses agent_transport for SIP + sounddevice for mic/speaker.
 
 Prerequisites:
     cd crates/agent-transport-python && maturin develop
@@ -11,64 +10,67 @@ Prerequisites:
 
 Usage:
     # Outbound call:
-    SIP_USERNAME=xxx SIP_PASSWORD=yyy SIP_DOMAIN=phone.plivo.com \
+    SIP_USERNAME=xxx SIP_PASSWORD=yyy \
         python examples/cli_phone.py sip:+15551234567@phone.plivo.com
 
     # Inbound (wait for a call):
     SIP_USERNAME=xxx SIP_PASSWORD=yyy python examples/cli_phone.py
 
-Environment variables:
-    SIP_USERNAME   - SIP account username (required)
-    SIP_PASSWORD   - SIP account password (required)
-    SIP_DOMAIN     - SIP server hostname (default: phone.plivo.com)
-    SIP_LOG_LEVEL  - log level 0-6 (default: 3)
+Keyboard controls during call:
+    0-9, *, #   Send DTMF digit
+    m           Mute mic
+    u           Unmute mic
+    h           Hold (SIP Re-INVITE sendonly)
+    H           Unhold (SIP Re-INVITE sendrecv)
+    q / Enter   Hang up
 """
 
 import os
 import sys
-import time
+import tty
+import termios
+import select
 import threading
 import numpy as np
 import sounddevice as sd
 from agent_transport import SipEndpoint, AudioFrame, init_logging
 
-# Audio config — must match the endpoint's sample rate (16kHz mono)
 SAMPLE_RATE = 16000
 CHANNELS = 1
-FRAME_DURATION_MS = 20
-FRAME_SAMPLES = SAMPLE_RATE * FRAME_DURATION_MS // 1000  # 320 samples per frame
+FRAME_SAMPLES = SAMPLE_RATE * 20 // 1000  # 320 samples per 20ms frame
+DTMF_KEYS = set("0123456789*#")
+
+
+def getch_nonblocking():
+    if select.select([sys.stdin], [], [], 0.0)[0]:
+        return sys.stdin.read(1)
+    return None
 
 
 def main():
     username = os.environ.get("SIP_USERNAME")
     password = os.environ.get("SIP_PASSWORD")
     sip_domain = os.environ.get("SIP_DOMAIN", "phone.plivo.com")
-    log_level = int(os.environ.get("SIP_LOG_LEVEL", "3"))
     dest_uri = sys.argv[1] if len(sys.argv) > 1 else None
 
     if not username or not password:
         print("Set SIP_USERNAME and SIP_PASSWORD environment variables.")
         sys.exit(1)
 
-    # --- Initialize logging ---
-    # Set RUST_LOG=debug for full SIP/RTP tracing, or RUST_LOG=trace for everything
     init_logging(os.environ.get("RUST_LOG", "info"))
 
-    # --- Initialize endpoint ---
     print("Initializing SIP endpoint...")
-    ep = SipEndpoint(sip_server=sip_domain, log_level=log_level)
+    ep = SipEndpoint(sip_server=sip_domain, log_level=3)
 
     print(f"Registering as {username}@{sip_domain}...")
     ep.register(username, password)
 
-    # Wait for registration
     event = ep.wait_for_event(timeout_ms=10000)
     if event is None or event["type"] != "registered":
         print(f"Registration failed: {event}")
         sys.exit(1)
     print("Registered.")
 
-    # --- Place or receive call ---
     if dest_uri:
         print(f"Calling {dest_uri}...")
         call_id = ep.call(dest_uri)
@@ -78,13 +80,11 @@ def main():
         while True:
             event = ep.wait_for_event(timeout_ms=1000)
             if event and event["type"] == "incoming_call":
-                call_id = event["session"].call_id
-                print(f"Incoming call from {event['session'].remote_uri}")
-                print("Answering...")
+                call_id = event["session"]["call_id"]
+                print(f"Incoming call from {event['session']['remote_uri']}")
                 ep.answer(call_id)
                 break
 
-    # Wait for media to become active
     while True:
         event = ep.wait_for_event(timeout_ms=500)
         if event is None:
@@ -95,119 +95,109 @@ def main():
             print(f"Call ended before connecting: {event.get('reason', '')}")
             ep.shutdown()
             return
-        if event["type"] == "call_state":
-            print(f"  Call state: {event['session'].state}")
 
     print()
-    print("=== CONNECTED — speak into your microphone ===")
-    print("Press Enter to hang up.")
+    print("=== CONNECTED ===")
+    print("  0-9,*,#  Send DTMF    m Mute    u Unmute    h Hold    H Unhold    q Hang up")
     print()
 
-    # --- Audio bridge: mic -> send_audio, recv_audio -> speaker ---
     running = threading.Event()
     running.set()
+    is_held = False
 
     def mic_to_sip():
-        """Capture from microphone, push to SIP call via send_audio."""
-        mic_frames_sent = [0]
-        mic_errors = [0]
-        mic_silent = [0]
-
-        def mic_callback(indata, frames, time_info, status):
-            if status:
-                print(f"  [MIC STATUS] {status}", flush=True)
-            if not running.is_set():
-                raise sd.CallbackAbort
-            # indata is float32 [-1, 1], convert to int16
-            samples = (indata[:, 0] * 32767).astype(np.int16)
-            peak = int(np.max(np.abs(samples)))
-            if peak < 10:
-                mic_silent[0] += 1
-            frame = AudioFrame(samples.tolist(), SAMPLE_RATE, CHANNELS)
-            try:
-                ep.send_audio(call_id, frame)
-                mic_frames_sent[0] += 1
-                if mic_frames_sent[0] % 250 == 0:  # every 5 seconds
-                    print(f"  [MIC] sent={mic_frames_sent[0]} errors={mic_errors[0]} silent={mic_silent[0]} peak={peak}", flush=True)
-            except Exception as e:
-                mic_errors[0] += 1
-                if mic_errors[0] <= 5:
-                    print(f"  [MIC ERROR] {e}", flush=True)
-
-        print(f"  [MIC] Opening input device: {sd.query_devices(kind='input')['name']}")
-        with sd.InputStream(
-            samplerate=SAMPLE_RATE,
-            channels=CHANNELS,
-            blocksize=FRAME_SAMPLES,
-            dtype="float32",
-            callback=mic_callback,
-        ):
-            running.wait()
+        try:
+            with sd.InputStream(samplerate=SAMPLE_RATE, channels=CHANNELS,
+                                blocksize=FRAME_SAMPLES, dtype="int16") as stream:
+                while running.is_set():
+                    data, _ = stream.read(FRAME_SAMPLES)
+                    try:
+                        ep.send_audio(call_id, AudioFrame(data[:, 0].tolist(), SAMPLE_RATE, CHANNELS))
+                    except Exception:
+                        break
+        except Exception:
+            pass
 
     def sip_to_speaker():
-        """Pull from SIP call via recv_audio, play through speaker."""
-        def speaker_callback(outdata, frames, time_info, status):
-            if not running.is_set():
-                raise sd.CallbackAbort
-            frame = ep.recv_audio(call_id)
-            if frame is not None:
-                samples = np.array(frame.data, dtype=np.int16).astype(np.float32) / 32767.0
-                if len(samples) >= frames:
-                    outdata[:, 0] = samples[:frames]
-                else:
-                    outdata[:len(samples), 0] = samples
-                    outdata[len(samples):, 0] = 0.0
-            else:
-                outdata[:] = 0.0
-
-        with sd.OutputStream(
-            samplerate=SAMPLE_RATE,
-            channels=CHANNELS,
-            blocksize=FRAME_SAMPLES,
-            dtype="float32",
-            callback=speaker_callback,
-        ):
-            running.wait()
-
-    mic_thread = threading.Thread(target=mic_to_sip, daemon=True)
-    speaker_thread = threading.Thread(target=sip_to_speaker, daemon=True)
-    mic_thread.start()
-    speaker_thread.start()
-
-    # --- Event loop: watch for hangup or call end ---
-    hangup = threading.Event()
-
-    def wait_for_enter():
         try:
-            input()
-        except EOFError:
+            with sd.OutputStream(samplerate=SAMPLE_RATE, channels=CHANNELS,
+                                 blocksize=FRAME_SAMPLES, dtype="int16") as stream:
+                while running.is_set():
+                    try:
+                        frame = ep.recv_audio_blocking(call_id, 20)
+                    except Exception:
+                        break
+                    if frame is not None:
+                        stream.write(np.array(frame.data, dtype=np.int16).reshape(-1, 1))
+                    else:
+                        stream.write(np.zeros((FRAME_SAMPLES, 1), dtype=np.int16))
+        except Exception:
             pass
-        hangup.set()
 
-    enter_thread = threading.Thread(target=wait_for_enter, daemon=True)
-    enter_thread.start()
+    call_ended = threading.Event()
 
-    while running.is_set():
-        if hangup.is_set():
-            print("Hanging up...")
-            ep.hangup(call_id)
-            break
+    def event_watcher():
+        while running.is_set():
+            event = ep.wait_for_event(timeout_ms=200)
+            if event is None:
+                continue
+            if event["type"] == "call_terminated":
+                sys.stdout.write(f"\r  Call ended: {event.get('reason', '')}\n")
+                sys.stdout.flush()
+                call_ended.set()
+                break
+            elif event["type"] == "dtmf_received":
+                sys.stdout.write(f"\r  DTMF recv: {event['digit']}\n")
+                sys.stdout.flush()
 
-        # Use wait_for_event with 200ms timeout — properly blocks and catches all events
-        event = ep.wait_for_event(timeout_ms=200)
-        if event is None:
-            continue
-        if event["type"] == "call_terminated":
-            print(f"Call ended: {event.get('reason', '')}")
-            break
-        elif event["type"] == "dtmf_received":
-            print(f"DTMF: {event['digit']}")
-        else:
-            print(f"Event: {event['type']}")
+    for t in [threading.Thread(target=f, daemon=True) for f in [mic_to_sip, sip_to_speaker, event_watcher]]:
+        t.start()
+
+    old_settings = termios.tcgetattr(sys.stdin)
+    try:
+        tty.setraw(sys.stdin.fileno())
+        while running.is_set() and not call_ended.is_set():
+            ch = getch_nonblocking()
+            if ch is None:
+                if call_ended.wait(timeout=0.1):
+                    break
+                continue
+
+            if ch in DTMF_KEYS:
+                ep.send_dtmf(call_id, ch)
+                sys.stdout.write(f"\r  DTMF sent: {ch}\n")
+                sys.stdout.flush()
+            elif ch == 'm':
+                ep.mute(call_id)
+                sys.stdout.write("\r  MUTED\n")
+                sys.stdout.flush()
+            elif ch == 'u':
+                ep.unmute(call_id)
+                sys.stdout.write("\r  UNMUTED\n")
+                sys.stdout.flush()
+            elif ch == 'h':
+                if not is_held:
+                    ep.hold(call_id)
+                    is_held = True
+                    sys.stdout.write("\r  HOLD — Re-INVITE sendonly\n")
+                    sys.stdout.flush()
+            elif ch == 'H':
+                if is_held:
+                    ep.unhold(call_id)
+                    is_held = False
+                    sys.stdout.write("\r  UNHOLD — Re-INVITE sendrecv\n")
+                    sys.stdout.flush()
+            elif ch in ('q', '\r', '\n', '\x03'):
+                sys.stdout.write("\r  Hanging up...\n")
+                sys.stdout.flush()
+                ep.hangup(call_id)
+                break
+    except Exception:
+        pass
+    finally:
+        termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
 
     running.clear()
-    mic_thread.join(timeout=1)
-    speaker_thread.join(timeout=1)
     ep.shutdown()
     print("Done.")
 
