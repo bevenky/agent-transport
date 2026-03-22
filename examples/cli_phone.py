@@ -191,15 +191,19 @@ def main():
         if hangup.is_set():
             print("Hanging up...")
             ep.hangup(call_id)
+            break
 
-        event = ep.poll_event()
-        if event and event["type"] == "call_terminated":
+        # Use wait_for_event with 200ms timeout — properly blocks and catches all events
+        event = ep.wait_for_event(timeout_ms=200)
+        if event is None:
+            continue
+        if event["type"] == "call_terminated":
             print(f"Call ended: {event.get('reason', '')}")
             break
-        if event and event["type"] == "dtmf_received":
+        elif event["type"] == "dtmf_received":
             print(f"DTMF: {event['digit']}")
-
-        time.sleep(0.05)
+        else:
+            print(f"Event: {event['type']}")
 
     running.clear()
     mic_thread.join(timeout=1)
