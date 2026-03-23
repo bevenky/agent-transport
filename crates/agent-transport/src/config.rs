@@ -1,10 +1,8 @@
 /// Audio codec selection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Codec {
-    Opus,
     PCMU,
     PCMA,
-    G722,
 }
 
 impl Codec {
@@ -13,8 +11,6 @@ impl Codec {
         match self {
             Codec::PCMU => 0,
             Codec::PCMA => 8,
-            Codec::G722 => 9,
-            Codec::Opus => 111, // dynamic
         }
     }
 
@@ -23,8 +19,6 @@ impl Codec {
         match self {
             Codec::PCMU => "PCMU/8000",
             Codec::PCMA => "PCMA/8000",
-            Codec::G722 => "G722/16000",
-            Codec::Opus => "opus/48000/2",
         }
     }
 
@@ -32,8 +26,6 @@ impl Codec {
     pub fn sample_rate(&self) -> u32 {
         match self {
             Codec::PCMU | Codec::PCMA => 8000,
-            Codec::G722 => 16000,
-            Codec::Opus => 48000,
         }
     }
 
@@ -42,7 +34,6 @@ impl Codec {
         match self {
             Codec::PCMU => samples.iter().map(|&s| audio_codec_algorithms::encode_ulaw(s)).collect(),
             Codec::PCMA => samples.iter().map(|&s| audio_codec_algorithms::encode_alaw(s)).collect(),
-            _ => samples.iter().map(|&s| audio_codec_algorithms::encode_ulaw(s)).collect(),
         }
     }
 
@@ -51,22 +42,13 @@ impl Codec {
         match self {
             Codec::PCMU => bytes.iter().map(|&b| audio_codec_algorithms::decode_ulaw(b)).collect(),
             Codec::PCMA => bytes.iter().map(|&b| audio_codec_algorithms::decode_alaw(b)).collect(),
-            _ => bytes.iter().map(|&b| audio_codec_algorithms::decode_ulaw(b)).collect(),
         }
     }
 
     /// Silence byte for this codec.
     pub fn silence_byte(&self) -> u8 {
-        match self { Codec::PCMU => 0xFF, Codec::PCMA => 0xD5, _ => 0xFF }
+        match self { Codec::PCMU => 0xFF, Codec::PCMA => 0xD5 }
     }
-}
-
-/// TURN server configuration.
-#[derive(Debug, Clone)]
-pub struct TurnConfig {
-    pub server: String,
-    pub username: String,
-    pub password: String,
 }
 
 /// Configuration for the SIP endpoint.
@@ -81,9 +63,6 @@ pub struct EndpointConfig {
     /// STUN server address for public IP discovery
     pub stun_server: String,
 
-    /// Optional TURN server for relay NAT traversal
-    pub turn_server: Option<TurnConfig>,
-
     /// Preferred codecs in priority order
     pub codecs: Vec<Codec>,
 
@@ -95,12 +74,6 @@ pub struct EndpointConfig {
 
     /// Local SIP port to bind (0 = auto)
     pub local_port: u16,
-
-    /// Enable ICE for media NAT traversal
-    pub enable_ice: bool,
-
-    /// Enable SRTP for media encryption
-    pub enable_srtp: bool,
 
     /// Registration expiry in seconds
     pub register_expires: u32,
@@ -148,13 +121,10 @@ impl Default for EndpointConfig {
             sip_server: "phone.plivo.com".into(),
             sip_port: 5060,
             stun_server: "stun-fb.plivo.com:3478".into(),
-            turn_server: None,
             codecs: vec![Codec::PCMU, Codec::PCMA],
             log_level: 3,
             user_agent: "agent-transport/0.1.0".into(),
             local_port: 0,
-            enable_ice: false,
-            enable_srtp: false,
             register_expires: 120,
             audio_processing: AudioProcessingConfig::default(),
         }
@@ -173,7 +143,6 @@ mod tests {
         assert_eq!(c.stun_server, "stun-fb.plivo.com:3478");
         assert_eq!(c.codecs, vec![Codec::PCMU, Codec::PCMA]);
         assert_eq!(c.register_expires, 120);
-        assert!(c.turn_server.is_none());
     }
 
     #[test]
@@ -183,6 +152,6 @@ mod tests {
         assert_eq!(Codec::PCMU.rtpmap_line(), "PCMU/8000");
         assert_eq!(Codec::PCMA.rtpmap_line(), "PCMA/8000");
         assert_eq!(Codec::PCMU.sample_rate(), 8000);
-        assert_eq!(Codec::Opus.sample_rate(), 48000);
+        assert_eq!(Codec::PCMA.sample_rate(), 8000);
     }
 }

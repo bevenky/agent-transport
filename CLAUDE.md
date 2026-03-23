@@ -50,6 +50,10 @@ cd python && pip install -e ".[all]"                 # Python adapters
 - **Feature-gated optional modules**: jitter-buffer, plc, comfort-noise, audio-stream
 - **Backward-compatible exports**: SipEndpoint re-exported at crate root for bindings
 
+## Git Conventions
+
+- Do NOT include "Co-Authored-By" lines or any mention of Claude/Anthropic in commit messages.
+
 ## Testing
 
 ```bash

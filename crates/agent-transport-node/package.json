@@ -1,7 +1,7 @@
 {
   "name": "agent-transport",
   "version": "0.1.0",
-  "description": "SIP transport for AI agents (PJSUA-backed, Rust native)",
+  "description": "SIP and audio streaming transport for AI voice agents (pure Rust)",
   "main": "index.js",
   "types": "index.d.ts",
   "license": "MIT",

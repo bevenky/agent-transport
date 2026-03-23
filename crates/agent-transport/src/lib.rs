@@ -43,7 +43,7 @@ pub mod audio_stream;
 // Shared types
 pub use audio::AudioFrame;
 pub use beep_detector::BeepDetectorConfig;
-pub use config::{AudioProcessingConfig, Codec, EndpointConfig, TurnConfig};
+pub use config::{AudioProcessingConfig, Codec, EndpointConfig};
 pub use error::EndpointError;
 pub use events::EndpointEvent;
 

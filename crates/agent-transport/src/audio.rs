@@ -1,14 +1,13 @@
 /// A PCM audio frame, compatible with LiveKit's AudioFrame format.
 ///
 /// Samples are signed 16-bit integers, interleaved by channel.
-/// For 20ms of Opus audio at 48kHz mono: 960 samples.
 /// For 20ms of PCMU/PCMA at 8kHz mono: 160 samples.
 #[derive(Debug, Clone)]
 pub struct AudioFrame {
     /// PCM samples, interleaved by channel.
     pub data: Vec<i16>,
 
-    /// Sample rate in Hz (e.g., 48000 for Opus, 8000 for G.711).
+    /// Sample rate in Hz (8000 for G.711, 16000 after resampling).
     pub sample_rate: u32,
 
     /// Number of audio channels (1 = mono, 2 = stereo).

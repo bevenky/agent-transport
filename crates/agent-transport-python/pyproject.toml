@@ -5,7 +5,7 @@ build-backend = "maturin"
 [project]
 name = "agent-transport"
 version = "0.1.0"
-description = "SIP transport for AI agents (PJSUA-backed)"
+description = "SIP and audio streaming transport for AI voice agents (pure Rust)"
 requires-python = ">=3.9"
 license = "MIT"
 

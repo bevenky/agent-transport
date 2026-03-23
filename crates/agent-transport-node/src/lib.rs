@@ -314,10 +314,8 @@ impl SipEndpoint {
             .unwrap_or_else(|| vec!["pcmu".into(), "pcma".into()])
             .iter()
             .filter_map(|c| match c.to_lowercase().as_str() {
-                "opus" => Some(RustCodec::Opus),
                 "pcmu" => Some(RustCodec::PCMU),
                 "pcma" => Some(RustCodec::PCMA),
-                "g722" => Some(RustCodec::G722),
                 _ => None,
             })
             .collect();
