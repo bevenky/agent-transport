@@ -313,6 +313,8 @@ class AgentServer:
             )
             sys.exit(1)
 
+        loop = asyncio.get_running_loop()
+
         # Initialize inference executor for local model inference (turn detection, etc.)
         # Same subprocess approach as LiveKit's AgentServer.
         # We set it on the job context var so MultilingualModel() works transparently —
@@ -332,7 +334,6 @@ class AgentServer:
             logger.info("Setup complete: %s", list(self._userdata.keys()))
 
         self._ep = SipEndpoint(sip_server=self._sip_server)
-        loop = asyncio.get_running_loop()
 
         # Register with SIP provider
         await loop.run_in_executor(
