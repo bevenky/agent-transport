@@ -5,6 +5,9 @@ Demonstrates multiple agents that can hand off to each other:
 - SalesAgent: handles product inquiries with tool calling
 - SupportAgent: handles support issues with tool calling
 
+Each agent can have its own instructions and tools. Returning an Agent
+from a function tool triggers automatic handoff.
+
 Usage:
     python examples/livekit/livekit_multi_agent.py start
     python examples/livekit/livekit_multi_agent.py dev
@@ -18,17 +21,33 @@ from dotenv import load_dotenv
 
 from agent_transport.sip.livekit import AgentServer, CallContext
 
-from livekit.agents import Agent, AgentSession, RunContext
+from livekit.agents import Agent, AgentSession, RunContext, TurnHandlingOptions
 from livekit.agents.llm import function_tool
 from livekit.plugins import deepgram, openai, silero
+from livekit.plugins.turn_detector.multilingual import MultilingualModel
 
 load_dotenv()
 
 logger = logging.getLogger("multi-agent")
 
+server = AgentServer(
+    sip_username=os.environ["SIP_USERNAME"],
+    sip_password=os.environ["SIP_PASSWORD"],
+    sip_server=os.environ.get("SIP_DOMAIN", "phone.plivo.com"),
+)
+
+
+@server.setup()
+def prewarm():
+    return {
+        "vad": silero.VAD.load(),
+        "turn_detector": MultilingualModel(),
+    }
+
 
 @dataclass
 class CallData:
+    """Shared data across agents — passed via RunContext.userdata."""
     caller_name: str | None = None
     intent: str | None = None
 
@@ -40,7 +59,7 @@ class GreeterAgent(Agent):
                 "You are a friendly receptionist. Your job is to greet the caller, "
                 "ask for their name, and determine if they need sales or support. "
                 "Keep responses brief and natural. "
-                "Do not use emojis, markdown, or special formatting."
+                "Do not use emojis, asterisks, markdown, or special formatting."
             ),
         )
 
@@ -87,7 +106,7 @@ class SalesAgent(Agent):
                 f"You are a sales agent speaking with {caller_name}. "
                 "Help them learn about products and pricing. "
                 "Be enthusiastic but not pushy. Keep responses concise. "
-                "Do not use emojis, markdown, or special formatting."
+                "Do not use emojis, asterisks, markdown, or special formatting."
             ),
         )
         self._caller_name = caller_name
@@ -128,6 +147,13 @@ class SalesAgent(Agent):
         logger.info("Sales transferring %s to support", self._caller_name)
         return SupportAgent(self._caller_name)
 
+    @function_tool
+    async def end_call(self, context: RunContext[CallData]) -> str:
+        """End the call when the conversation is complete and the user is done."""
+        logger.info("Sales ending call with %s", self._caller_name)
+        context.session.shutdown()
+        return "Say goodbye to the user."
+
 
 class SupportAgent(Agent):
     def __init__(self, caller_name: str) -> None:
@@ -136,7 +162,7 @@ class SupportAgent(Agent):
                 f"You are a support agent speaking with {caller_name}. "
                 "Help them resolve their issue. Be empathetic and solution-oriented. "
                 "Keep responses concise. "
-                "Do not use emojis, markdown, or special formatting."
+                "Do not use emojis, asterisks, markdown, or special formatting."
             ),
         )
         self._caller_name = caller_name
@@ -177,22 +203,28 @@ class SupportAgent(Agent):
         logger.info("Support transferring %s to sales", self._caller_name)
         return SalesAgent(self._caller_name)
 
-
-server = AgentServer(
-    sip_username=os.environ["SIP_USERNAME"],
-    sip_password=os.environ["SIP_PASSWORD"],
-    sip_server=os.environ.get("SIP_DOMAIN", "phone.plivo.com"),
-)
+    @function_tool
+    async def end_call(self, context: RunContext[CallData]) -> str:
+        """End the call when the issue is resolved and the user is done."""
+        logger.info("Support ending call with %s", self._caller_name)
+        context.session.shutdown()
+        return "Say goodbye to the user."
 
 
 @server.sip_session()
 async def entrypoint(ctx: CallContext):
     session = AgentSession[CallData](
-        vad=silero.VAD.load(),
+        vad=ctx.userdata["vad"],
         stt=deepgram.STT(model="nova-3"),
         llm=openai.LLM(model="gpt-4.1-mini"),
         tts=openai.TTS(voice="alloy"),
         userdata=CallData(),
+        turn_handling=TurnHandlingOptions(
+            turn_detection=ctx.userdata["turn_detector"],
+        ),
+        preemptive_generation=True,
+        aec_warmup_duration=3.0,
+        tts_text_transforms=["filter_emoji", "filter_markdown"],
     )
     await ctx.start(session, agent=GreeterAgent())
 

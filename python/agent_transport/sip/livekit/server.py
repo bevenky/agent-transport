@@ -32,11 +32,61 @@ import prometheus_client
 from aiohttp import web
 
 from agent_transport import SipEndpoint, init_logging
+from livekit.agents.inference_runner import _InferenceRunner
 from livekit.agents.utils.hw import get_cpu_monitor
 from livekit.agents.utils import MovingAverage
 from .sip_io import SipAudioInput, SipAudioOutput
 
 logger = logging.getLogger("agent_transport.server")
+
+
+def _set_inference_executor(executor) -> None:
+    """Make the inference executor available via get_job_context().inference_executor.
+
+    LiveKit's turn detection models call get_job_context().inference_executor internally.
+    We set a minimal stub on the context var so MultilingualModel() / EnglishModel()
+    work transparently without a full JobContext.
+    """
+    from livekit.agents.job import _JobContextVar
+
+    class _InferenceStub:
+        """Minimal stand-in for JobContext — only exposes inference_executor."""
+        def __init__(self, inf_executor):
+            self._inf_executor = inf_executor
+        @property
+        def inference_executor(self):
+            return self._inf_executor
+
+    _JobContextVar.set(_InferenceStub(executor))
+
+
+def _create_inference_executor(loop: asyncio.AbstractEventLoop):
+    """Create LiveKit's InferenceProcExecutor for local model inference.
+
+    Uses the same subprocess-based executor as LiveKit's AgentServer.
+    Models (e.g., turn detection ONNX) run in a separate process for isolation.
+    """
+    from livekit.agents.ipc.inference_proc_executor import InferenceProcExecutor
+    import multiprocessing as mp
+
+    runners = _InferenceRunner.registered_runners
+    if not runners:
+        return None
+
+    executor = InferenceProcExecutor(
+        runners=runners,
+        initialize_timeout=5 * 60,
+        close_timeout=5,
+        memory_warn_mb=2000,
+        memory_limit_mb=0,
+        ping_interval=5,
+        ping_timeout=60,
+        high_ping_threshold=2.5,
+        mp_ctx=mp.get_context("spawn"),
+        loop=loop,
+        http_proxy=None,
+    )
+    return executor
 
 # ─── Prometheus metrics ───────────────────────────────────────────────────────
 # Reuse LiveKit's existing gauges (already registered by telemetry/metrics.py)
@@ -107,6 +157,7 @@ class CallContext:
     remote_uri: str
     direction: str  # "inbound" or "outbound"
     endpoint: SipEndpoint
+    userdata: dict[str, Any] = field(default_factory=dict)
     extra_headers: dict[str, str] = field(default_factory=dict)
 
     _session: Any = field(default=None, repr=False)
@@ -171,11 +222,29 @@ class AgentServer:
         self._recording_dir = recording_dir
         self._recording_stereo = recording_stereo
         self._entrypoint_fnc: Callable[..., Coroutine] | None = None
+        self._setup_fnc: Callable | None = None
+        self._userdata: dict[str, Any] = {}
         self._ep: SipEndpoint | None = None
         self._active_calls: dict[int, asyncio.Task] = {}
         self._call_ended_events: dict[int, asyncio.Event] = {}
         self._pending_outbound: dict[int, asyncio.Future] = {}
         self._load_monitor = _LoadMonitor()
+
+    def setup(self) -> Callable:
+        """Decorator to register a setup function that runs once at startup.
+
+        The function should return a dict of shared resources (VAD, turn detector, etc.)
+        that will be available via ctx.userdata in each call.
+
+        Example::
+            @server.setup()
+            def prewarm():
+                return {"vad": silero.VAD.load(), "turn_detector": MultilingualModel()}
+        """
+        def decorator(fn: Callable) -> Callable:
+            self._setup_fnc = fn
+            return fn
+        return decorator
 
     def sip_session(self) -> Callable:
         """Decorator to register the call handler — equivalent of @server.rtc_session()."""
@@ -244,6 +313,24 @@ class AgentServer:
             )
             sys.exit(1)
 
+        # Initialize inference executor for local model inference (turn detection, etc.)
+        # Same subprocess approach as LiveKit's AgentServer.
+        # We set it on the job context var so MultilingualModel() works transparently —
+        # users write the same code as they would with LiveKit's WebRTC transport.
+        self._inference_executor = _create_inference_executor(loop)
+        if self._inference_executor:
+            await self._inference_executor.start()
+            await self._inference_executor.initialize()
+            _set_inference_executor(self._inference_executor)
+            logger.info("Inference executor ready (turn detection models available)")
+
+        # Run user's setup function to prewarm models
+        if self._setup_fnc:
+            result = self._setup_fnc()
+            if isinstance(result, dict):
+                self._userdata = result
+            logger.info("Setup complete: %s", list(self._userdata.keys()))
+
         self._ep = SipEndpoint(sip_server=self._sip_server)
         loop = asyncio.get_running_loop()
 
@@ -283,6 +370,8 @@ class AgentServer:
             await asyncio.gather(*self._active_calls.values(), return_exceptions=True)
 
         await runner.cleanup()
+        if self._inference_executor:
+            await self._inference_executor.aclose()
         self._ep.shutdown()
 
     def _configure_logging(self, mode: str) -> None:
@@ -476,6 +565,7 @@ class AgentServer:
             remote_uri=remote_uri,
             direction=direction,
             endpoint=self._ep,
+            userdata=self._userdata,
             _call_ended=call_ended,
         )
 

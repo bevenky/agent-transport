@@ -1,142 +1,297 @@
-# LiveKit SIP Transport Interface
+# LiveKit SIP Transport
 
-Drop-in replacement for LiveKit's `RoomAudioOutput`/`RoomAudioInput`. Connects a LiveKit `AgentSession` to a SIP call via direct RTP — no LiveKit server or WebRTC required.
+Drop-in SIP transport for LiveKit Agents. Run the same `AgentSession` pipeline (STT → LLM → TTS) over SIP/RTP instead of WebRTC — no LiveKit server needed.
 
-## Classes
-
-### SipAudioInput
-
-Implements `livekit.agents.voice.io.AudioInput`. Async iterator that yields `rtc.AudioFrame` from a SIP call.
-
-```
-SipAudioInput(endpoint, call_id, *, label="sip-audio-input", source=None)
-```
-
-| Parameter | Type | Description |
-|-----------|------|-------------|
-| `endpoint` | `SipEndpoint` | The Rust SIP endpoint instance |
-| `call_id` | `int` | Call ID returned by `endpoint.call()` or from `incoming_call` event |
-| `label` | `str` | Human-readable label for pipeline debugging |
-| `source` | `AudioInput \| None` | Optional upstream source to delegate to |
-
-#### Properties
-
-| Property | Type | Description |
-|----------|------|-------------|
-| `label` | `str` | The label passed at construction |
-| `source` | `AudioInput \| None` | The upstream source, if any |
-
-#### Methods
-
-| Method | Signature | Description |
-|--------|-----------|-------------|
-| `__aiter__` | `() → AsyncIterator[AudioFrame]` | Returns self (async iterator protocol) |
-| `__anext__` | `() → AudioFrame` | Blocks in a thread pool (20ms timeout) until an audio frame arrives from the SIP call. Returns 16kHz mono int16 PCM wrapped in `rtc.AudioFrame`. Raises `StopAsyncIteration` when detached or session removed. |
-| `on_attached` | `() → None` | Called by LiveKit when this input is connected to a session. Propagates to `source` if set. |
-| `on_detached` | `() → None` | Called by LiveKit when disconnected. Stops the audio iterator. Propagates to `source` if set. |
-
-#### Audio Format
-
-- Sample rate: 16000 Hz (Rust upsamples from 8kHz G.711)
-- Channels: 1 (mono)
-- Encoding: int16 PCM (little-endian)
-- Frame size: 20ms (320 samples)
-
-#### Threading Model
-
-`__anext__` uses `asyncio.run_in_executor` to call `recv_audio_bytes_blocking(call_id, 20)` in a thread pool. The Rust binding releases the Python GIL during the blocking wait. The asyncio event loop is never blocked.
-
----
-
-### SipAudioOutput
-
-Implements `livekit.agents.voice.io.AudioOutput`. Sends audio frames to a SIP call with segment tracking, playout detection, interruption handling, and pause/resume.
-
-```
-SipAudioOutput(endpoint, call_id, *, label="sip-audio-output",
-               capabilities=None, sample_rate=None, next_in_chain=None)
-```
-
-| Parameter | Type | Description |
-|-----------|------|-------------|
-| `endpoint` | `SipEndpoint` | The Rust SIP endpoint instance |
-| `call_id` | `int` | Call ID |
-| `label` | `str` | Human-readable label |
-| `capabilities` | `AudioOutputCapabilities \| None` | Defaults to `AudioOutputCapabilities(pause=True)` |
-| `sample_rate` | `int \| None` | Ignored — always returns the endpoint's native rate (16kHz) |
-| `next_in_chain` | `AudioOutput \| None` | Optional downstream output for chaining |
-
-#### Properties
-
-| Property | Type | Description |
-|----------|------|-------------|
-| `label` | `str` | Inherited from base class |
-| `sample_rate` | `int` | Always 16000 (from Rust endpoint) |
-| `can_pause` | `bool` | True if `capabilities.pause` and all chain members support pause |
-| `next_in_chain` | `AudioOutput \| None` | Inherited from base class |
-
-#### Methods
-
-| Method | Signature | Description |
-|--------|-----------|-------------|
-| `capture_frame` | `async (frame: AudioFrame) → None` | Sends one audio frame to the SIP call via `send_audio_bytes`. Increments segment count on first call per segment (via base class). Emits `playback_started` event after the first frame of each segment. |
-| `flush` | `() → None` | Marks the current segment as complete. Sends a flush signal to Rust. Starts an async background task that races playout completion vs interruption, then emits `playback_finished`. |
-| `clear_buffer` | `() → None` | Immediately clears all buffered audio in the Rust outgoing queue. If a flush is in progress, signals interruption (the flush task computes partial playback position and emits `playback_finished(interrupted=True)`). If no flush is in progress, emits `playback_finished` directly. |
-| `pause` | `() → None` | Pauses audio playback. Frames accumulate in the Rust buffer (up to 360 seconds). Propagates to `next_in_chain`. |
-| `resume` | `() → None` | Resumes audio playback. Buffered frames start sending. Propagates to `next_in_chain`. |
-| `wait_for_playout` | `async () → PlaybackFinishedEvent` | Inherited from base class. Awaits until all captured segments have finished playing (or been interrupted). |
-| `on_attached` | `() → None` | Propagates to `next_in_chain`. |
-| `on_detached` | `() → None` | Cancels any in-progress flush task. Propagates to `next_in_chain`. |
-
-#### Events
-
-| Event | Payload | When |
-|-------|---------|------|
-| `playback_started` | `PlaybackStartedEvent(created_at: float)` | After the first frame of a segment is sent to Rust |
-| `playback_finished` | `PlaybackFinishedEvent(playback_position: float, interrupted: bool)` | After playout completes or `clear_buffer` interrupts |
-
-#### Segment Lifecycle
-
-```
-capture_frame(f1)  → segment starts, playback_started emitted
-capture_frame(f2)
-capture_frame(f3)
-flush()            → segment ends, async playout wait starts
-                   → ...Rust plays audio over RTP...
-                   → playback_finished(playback_position=0.06, interrupted=False)
-```
-
-Interruption:
-```
-capture_frame(f1)
-capture_frame(f2)
-flush()            → async playout wait starts
-clear_buffer()     → Rust clears queue, playback_finished(interrupted=True)
-```
-
-#### Threading Model
-
-- `capture_frame`: `send_audio_bytes` is a non-blocking channel push (instant). Called from asyncio coroutine.
-- `flush`: Starts `_async_wait_for_playout` task. The task uses `run_in_executor` + `py.allow_threads` for the blocking `wait_for_playout` call.
-- `clear_buffer`, `pause`, `resume`: Instant (atomic flag operations in Rust).
-
----
-
-## Usage
+## Quick Start
 
 ```python
-from agent_transport import SipEndpoint
-from agent_transport_adapters.livekit import SipAudioInput, SipAudioOutput
-from livekit.agents.voice import AgentSession, Agent
+from agent_transport.sip.livekit import AgentServer, CallContext
+from livekit.agents import Agent, AgentSession, TurnHandlingOptions
+from livekit.plugins import deepgram, openai, silero
+from livekit.plugins.turn_detector.multilingual import MultilingualModel
 
-ep = SipEndpoint(sip_server="phone.plivo.com")
-ep.register(username, password)
-# ... wait for incoming call, get call_id ...
+server = AgentServer(
+    sip_username=os.environ["SIP_USERNAME"],
+    sip_password=os.environ["SIP_PASSWORD"],
+    sip_server=os.environ.get("SIP_DOMAIN", "phone.plivo.com"),
+)
 
-session = AgentSession(stt=..., llm=..., tts=...)
-session.input.audio = SipAudioInput(ep, call_id)
-session.output.audio = SipAudioOutput(ep, call_id)
-await session.start(agent=MyAgent())
+@server.setup()
+def prewarm():
+    return {
+        "vad": silero.VAD.load(),
+        "turn_detector": MultilingualModel(),
+    }
+
+class Assistant(Agent):
+    def __init__(self):
+        super().__init__(instructions="You are a helpful phone assistant.")
+
+    async def on_enter(self):
+        self.session.generate_reply(instructions="Greet the user.")
+
+@server.sip_session()
+async def entrypoint(ctx: CallContext):
+    session = AgentSession(
+        vad=ctx.userdata["vad"],
+        stt=deepgram.STT(model="nova-3"),
+        llm=openai.LLM(model="gpt-4.1-mini"),
+        tts=openai.TTS(voice="alloy"),
+        turn_handling=TurnHandlingOptions(
+            turn_detection=ctx.userdata["turn_detector"],
+        ),
+        preemptive_generation=True,
+        aec_warmup_duration=3.0,
+    )
+    await ctx.start(session, agent=Assistant())
+
+if __name__ == "__main__":
+    server.run()
 ```
 
-Do not pass `room=` to `session.start()` — this tells LiveKit to skip RoomIO and use the custom I/O you set.
+### Running
+
+```bash
+# Production
+python agent.py start
+
+# Development (adapter/pipeline debug logs)
+python agent.py dev
+
+# Full debug (including Rust SIP/RTP)
+python agent.py debug
+
+# Custom port
+python agent.py dev --port 9090
+```
+
+### Making Outbound Calls
+
+```bash
+curl -X POST http://localhost:8080/call \
+  -H 'Content-Type: application/json' \
+  -d '{"to": "sip:+15551234567@phone.plivo.com"}'
+```
+
+---
+
+## AgentServer
+
+Equivalent of LiveKit's `AgentServer` + `cli.run_app()`. Handles SIP registration, call routing, HTTP server, and lifecycle management.
+
+```python
+AgentServer(
+    sip_server="phone.plivo.com",   # SIP provider domain (or SIP_DOMAIN env)
+    sip_port=5060,                  # SIP port (or SIP_PORT env)
+    sip_username="user",            # SIP credentials (or SIP_USERNAME env)
+    sip_password="pass",            # (or SIP_PASSWORD env)
+    host="0.0.0.0",                 # HTTP server bind address
+    port=8080,                      # HTTP server port (or PORT env)
+    agent_name="sip-agent",         # Agent name for /worker endpoint
+    auth=None,                      # Optional auth callable (see Auth section)
+    recording=False,                # Enable call recording
+    recording_dir="recordings",     # Recording output directory
+    recording_stereo=True,          # Stereo (L=user, R=agent) or mono
+)
+```
+
+### Decorators
+
+| Decorator | Description |
+|-----------|-------------|
+| `@server.setup()` | Register a setup function that runs once at startup. Returns a dict available as `ctx.userdata` in each call. |
+| `@server.sip_session()` | Register the call entrypoint — equivalent of `@server.rtc_session()` in LiveKit. |
+
+### HTTP Endpoints
+
+| Endpoint | Description |
+|----------|-------------|
+| `GET /` | Health check — returns `200 OK` |
+| `GET /worker` | Worker status (agent_name, active_jobs, worker_load, sdk_version) |
+| `GET /metrics` | Prometheus metrics (active jobs, CPU load, call count, call duration) |
+| `POST /call` | Trigger outbound call: `{"to": "sip:+1555...@provider.com"}` |
+
+### CLI Commands
+
+| Command | Description |
+|---------|-------------|
+| `start` | Production mode — INFO logging |
+| `dev` | Development mode — DEBUG for adapters/pipeline, INFO for Rust |
+| `debug` | Full debug — DEBUG everything including Rust SIP/RTP |
+
+### Prometheus Metrics
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `lk_agents_active_job_count` | Gauge | Active calls (same as LiveKit) |
+| `lk_agents_worker_load` | Gauge | CPU load 0-1 (same as LiveKit) |
+| `lk_agents_sip_calls_total` | Counter | Total calls by direction (inbound/outbound) |
+| `lk_agents_sip_call_duration_seconds` | Histogram | Call duration distribution |
+
+---
+
+## CallContext
+
+Passed to the `@sip_session()` handler — equivalent of LiveKit's `JobContext`.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `call_id` | `int` | SIP call identifier |
+| `remote_uri` | `str` | Caller's SIP URI |
+| `direction` | `str` | `"inbound"` or `"outbound"` |
+| `userdata` | `dict` | Shared data from `@server.setup()` |
+
+### Methods
+
+| Method | Description |
+|--------|-------------|
+| `ctx.start(session, agent=)` | Wire SIP audio I/O, start the agent, and wait for call end. Equivalent of `session.start(agent=, room=ctx.room)`. |
+
+---
+
+## Call Recording
+
+Stereo WAV recording at the Rust RTP layer — zero CPU encoding overhead.
+
+```python
+server = AgentServer(
+    recording=True,                 # Enable recording
+    recording_dir="recordings",     # Output directory (default: ./recordings)
+    recording_stereo=True,          # True: L=user R=agent, False: mono mix
+)
+```
+
+Output: `recordings/call_{id}.wav` — 16kHz, 16-bit PCM.
+
+- User audio captured after G.711 decode + 8→16kHz resample
+- Agent audio captured from the AudioBuffer before 16→8kHz downsample
+- Write-through (no buffering), ~3.8 MB/minute stereo
+
+---
+
+## Authentication
+
+Optional callable for protecting `/call`, `/worker`, and `/metrics` endpoints. Health endpoint (`GET /`) is always open.
+
+```python
+# Bearer token
+server = AgentServer(
+    auth=lambda req: req.headers.get("Authorization") == "Bearer my-secret",
+)
+
+# Async database lookup
+async def check_auth(request):
+    token = request.headers.get("Authorization", "").replace("Bearer ", "")
+    return await db.validate_token(token)
+
+server = AgentServer(auth=check_auth)
+```
+
+---
+
+## Turn Detection
+
+LiveKit's `MultilingualModel` and `EnglishModel` work transparently. The `AgentServer` creates a subprocess-based inference executor (same as LiveKit's `AgentServer`) so the ONNX model runs locally without LiveKit Cloud.
+
+```bash
+# Install the turn detector plugin
+pip install livekit-plugins-turn-detector
+
+# Download model files
+python agent.py download-files
+```
+
+```python
+@server.setup()
+def prewarm():
+    return {
+        "vad": silero.VAD.load(),
+        "turn_detector": MultilingualModel(),  # or EnglishModel()
+    }
+```
+
+---
+
+## Audio Pipeline Architecture
+
+```
+Inbound (user → agent):
+  Phone → SIP INVITE → RTP recv → G.711 decode → speexdsp 8→16kHz
+    → SipAudioInput → Chan → AgentSession pipeline → VAD + STT
+
+Outbound (agent → user):
+  AgentSession → TTS → SipAudioOutput → Chan → SipAudioSource
+    → AudioBuffer (Rust, 200ms threshold) → RTP send loop (20ms pacing)
+    → speexdsp 16→8kHz → G.711 encode → RTP → Phone
+```
+
+### Backpressure
+
+Matches WebRTC C++ `InternalSource` exactly:
+- AudioBuffer threshold: 200ms (3200 samples at 16kHz), matching `_ParticipantAudioOutput` production
+- Below threshold: completion callback fires immediately
+- Above threshold: callback deferred until RTP loop drains below threshold
+- Capacity: 400ms (6400 samples) — hard reject above this
+
+### Interruption
+
+1. Pipeline detects user speech → calls `pause()` on audio output
+2. `_forward_audio` clears Rust AudioBuffer (first clear, ~15ms)
+3. Pipeline commits interrupt → calls `clear_buffer()` → `_interrupted_event` set
+4. `_wait_for_playout` detects interrupt → calls `clear_queue()` (second clear)
+5. `on_playback_finished(interrupted=True)` emitted
+
+---
+
+## SipAudioInput
+
+Implements `livekit.agents.voice.io.AudioInput`. Async iterator yielding `rtc.AudioFrame` from a SIP call.
+
+- Sample rate: 16000 Hz
+- Channels: 1 (mono)
+- Frame size: 20ms (320 samples)
+- Threading: `recv_audio_bytes_blocking` via `run_in_executor` (GIL released)
+- On stream end: pushes 0.5s silence to flush STT (matches LiveKit)
+
+## SipAudioOutput
+
+Implements `livekit.agents.voice.io.AudioOutput`. Line-for-line match of LiveKit's `_ParticipantAudioOutput`:
+
+- `SipAudioSource` replaces `rtc.AudioSource`
+- `Chan` replaces `utils.aio.Chan`
+- `cancel_and_wait` replaces `utils.aio.cancel_and_wait`
+- All methods (capture_frame, flush, clear_buffer, pause, resume, _wait_for_playout, _forward_audio) match WebRTC transport exactly
+
+---
+
+## Examples
+
+| Example | Description |
+|---------|-------------|
+| [`livekit_sip_agent.py`](../examples/livekit/livekit_sip_agent.py) | Single agent with tool calling, turn detection, preemptive generation |
+| [`livekit_sip_multi_agent.py`](../examples/livekit/livekit_sip_multi_agent.py) | Multi-agent with greeter → sales/support handoff and tool calling |
+| [`livekit_audio_stream_agent.py`](../examples/livekit/livekit_audio_stream_agent.py) | Agent over Plivo audio streaming (WebSocket) |
+
+---
+
+## Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `SIP_USERNAME` | — | SIP registration username |
+| `SIP_PASSWORD` | — | SIP registration password |
+| `SIP_DOMAIN` | `phone.plivo.com` | SIP server domain |
+| `SIP_PORT` | `5060` | SIP server port |
+| `PORT` | `8080` | HTTP server port |
+| `RUST_LOG` | `info` | Rust log level (overrides CLI mode) |
+| `DEEPGRAM_API_KEY` | — | Deepgram STT API key |
+| `OPENAI_API_KEY` | — | OpenAI LLM/TTS API key |
+
+---
+
+## Import Path
+
+```python
+from agent_transport.sip.livekit import AgentServer, CallContext, run_app
+from agent_transport.sip.livekit import SipAudioInput, SipAudioOutput  # low-level access
+```
