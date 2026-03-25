@@ -268,9 +268,9 @@ Implements `livekit.agents.voice.io.AudioOutput`. Line-for-line match of LiveKit
 
 | Example | Description |
 |---------|-------------|
-| [`livekit_sip_agent.py`](../examples/livekit/livekit_sip_agent.py) | Single agent with tool calling, turn detection, preemptive generation |
-| [`livekit_sip_multi_agent.py`](../examples/livekit/livekit_sip_multi_agent.py) | Multi-agent with greeter → sales/support handoff and tool calling |
-| [`livekit_audio_stream_agent.py`](../examples/livekit/livekit_audio_stream_agent.py) | Agent over Plivo audio streaming (WebSocket) |
+| [`sip_agent.py`](../examples/livekit/sip_agent.py) | Single agent with tool calling, turn detection, preemptive generation |
+| [`sip_multi_agent.py`](../examples/livekit/sip_multi_agent.py) | Multi-agent with greeter → sales/support handoff and tool calling |
+| [`audio_stream_agent.py`](../examples/livekit/audio_stream_agent.py) | Agent over Plivo audio streaming (WebSocket) |
 
 ---
 

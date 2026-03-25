@@ -40,24 +40,29 @@ from .sip_io import SipAudioInput, SipAudioOutput
 logger = logging.getLogger("agent_transport.server")
 
 
-def _set_inference_executor(executor) -> None:
-    """Make the inference executor available via get_job_context().inference_executor.
+_inference_ctx_token = None
 
-    LiveKit's turn detection models call get_job_context().inference_executor internally.
-    We set a minimal stub on the context var so MultilingualModel() / EnglishModel()
-    work transparently without a full JobContext.
-    """
+def _set_inference_context(executor) -> None:
+    """Temporarily make inference executor available via get_job_context().
+    Used only during @setup() so MultilingualModel() works without explicit args."""
+    global _inference_ctx_token
     from livekit.agents.job import _JobContextVar
 
-    class _InferenceStub:
-        """Minimal stand-in for JobContext — only exposes inference_executor."""
-        def __init__(self, inf_executor):
-            self._inf_executor = inf_executor
+    class _Stub:
         @property
         def inference_executor(self):
-            return self._inf_executor
+            return executor
 
-    _JobContextVar.set(_InferenceStub(executor))
+    _inference_ctx_token = _JobContextVar.set(_Stub())
+
+
+def _clear_inference_context() -> None:
+    """Remove the temporary stub so AgentSession.start() gets RuntimeError (expected)."""
+    global _inference_ctx_token
+    if _inference_ctx_token is not None:
+        from livekit.agents.job import _JobContextVar
+        _JobContextVar.reset(_inference_ctx_token)
+        _inference_ctx_token = None
 
 
 def _create_inference_executor(loop: asyncio.AbstractEventLoop):
@@ -323,12 +328,17 @@ class AgentServer:
         if self._inference_executor:
             await self._inference_executor.start()
             await self._inference_executor.initialize()
-            _set_inference_executor(self._inference_executor)
             logger.info("Inference executor ready (turn detection models available)")
 
-        # Run user's setup function to prewarm models
+        # Run user's setup function to prewarm models.
+        # Temporarily set inference executor on job context so MultilingualModel()
+        # works without explicit args — cleared before AgentSession runs.
         if self._setup_fnc:
+            if self._inference_executor:
+                _set_inference_context(self._inference_executor)
             result = self._setup_fnc()
+            if self._inference_executor:
+                _clear_inference_context()
             if isinstance(result, dict):
                 self._userdata = result
             logger.info("Setup complete: %s", list(self._userdata.keys()))

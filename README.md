@@ -32,7 +32,7 @@ async def entrypoint(ctx):                     async def entrypoint(ctx):
 cli.run_app(server)                            server.run()
 ```
 
-Full examples: [`livekit_sip_agent.py`](examples/livekit/livekit_sip_agent.py) · [`livekit_sip_multi_agent.py`](examples/livekit/livekit_sip_multi_agent.py)
+Full examples: [`sip_agent.py`](examples/livekit/sip_agent.py) · [`sip_multi_agent.py`](examples/livekit/sip_multi_agent.py)
 
 See [LiveKit SIP Transport docs](docs/livekit_interface_sip.md) for recording, Prometheus metrics, outbound API, and full reference.
 
@@ -82,58 +82,16 @@ cd crates/agent-transport-node && npm run build
 
 ## Examples
 
-### Python
-
 | Example | Description |
 |---------|-------------|
-| [`livekit_sip_agent.py`](examples/livekit/livekit_sip_agent.py) | SIP voice agent with tool calling, turn detection, preemptive generation |
-| [`livekit_sip_multi_agent.py`](examples/livekit/livekit_sip_multi_agent.py) | Multi-agent with greeter → sales/support handoff and tool calling |
-| [`livekit_audio_stream_agent.py`](examples/livekit/livekit_audio_stream_agent.py) | LiveKit agent over Plivo audio streaming |
-| [`pipecat_sip_agent.py`](examples/pipecat/pipecat_sip_agent.py) | Pipecat pipeline over SIP/RTP |
-| [`pipecat_audio_stream_agent.py`](examples/pipecat/pipecat_audio_stream_agent.py) | Pipecat pipeline over Plivo audio streaming |
-| [`cli_phone.py`](examples/cli/cli_phone.py) | Interactive CLI softphone with mic/speaker, DTMF, mute, hold/unhold |
+| [`livekit/sip_agent.py`](examples/livekit/sip_agent.py) | SIP voice agent with tool calling, turn detection, preemptive generation |
+| [`livekit/sip_multi_agent.py`](examples/livekit/sip_multi_agent.py) | Multi-agent with greeter → sales/support handoff and tool calling |
+| [`livekit/audio_stream_agent.py`](examples/livekit/audio_stream_agent.py) | LiveKit agent over Plivo audio streaming |
+| [`pipecat/sip_agent.py`](examples/pipecat/sip_agent.py) | Pipecat pipeline over SIP/RTP |
+| [`pipecat/audio_stream_agent.py`](examples/pipecat/audio_stream_agent.py) | Pipecat pipeline over Plivo audio streaming |
+| [`cli/phone.py`](examples/cli/phone.py) | Interactive CLI softphone with mic/speaker, DTMF, mute, hold/unhold |
 
-#### Running the CLI Phone (Python)
-
-```bash
-pip install sounddevice numpy
-
-# Outbound call
-SIP_USERNAME=xxx SIP_PASSWORD=yyy \
-    python examples/cli/cli_phone.py sip:+15551234567@phone.plivo.com
-
-# Inbound (wait for a call)
-SIP_USERNAME=xxx SIP_PASSWORD=yyy python examples/cli/cli_phone.py
-```
-
-### Node.js
-
-| Example | Description |
-|---------|-------------|
-| [`cli_phone.js`](examples/cli/cli_phone.js) | SIP CLI demonstrating signaling, DTMF, pause/resume, flush/clear, wait-for-playout |
-
-#### Running the CLI Phone (Node.js)
-
-```bash
-cd crates/agent-transport-node && npm run build
-
-# Outbound call
-SIP_USERNAME=xxx SIP_PASSWORD=yyy \
-    node examples/cli/cli_phone.js sip:+15551234567@phone.plivo.com
-```
-
-## Feature Flags
-
-| Feature | Description |
-|---------|-------------|
-| `audio-stream` | WebSocket audio streaming transport |
-| `jitter-buffer` | RTP jitter buffer (requires neteq) |
-| `plc` | Packet loss concealment |
-| `comfort-noise` | Comfort noise generation |
-| `audio-processing` | All three above combined |
-| `integration` | Live SIP integration tests (requires credentials) |
-
-
+See also: [Feature Flags & CLI Phone docs](docs/features.md)
 
 ## License
 
