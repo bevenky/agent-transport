@@ -48,11 +48,110 @@ transport = SipTransport(ep, call_id, params=TransportParams(...))
 transport = AudioStreamTransport(ep, session_id, params=TransportParams(...))
 ```
 
-## Installation
+## Getting Started
 
-### Rust Core
+### Prerequisites
 
-No system dependencies — pure Rust.
+- **Python 3.9+**
+- **Rust** — install via [rustup](https://rustup.rs/): `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`
+- **maturin** — Python ↔ Rust build tool: `pip install maturin`
+- A **SIP provider** account (e.g., [Plivo](https://plivo.com), [Telnyx](https://telnyx.com), [Twilio](https://twilio.com)) with SIP endpoint credentials and a phone number
+- **Deepgram** API key for speech-to-text — [deepgram.com](https://deepgram.com)
+- **OpenAI** API key for LLM and text-to-speech — [platform.openai.com](https://platform.openai.com)
+
+### Step 1: Create a Virtual Environment
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+```
+
+### Step 2: Build the Rust Python Binding
+
+```bash
+cd crates/agent-transport-python && maturin develop
+cd ../..
+```
+
+### Step 3: Install Python Adapters
+
+```bash
+cd python && pip install -e ".[all]"    # LiveKit + Pipecat adapters
+cd ..
+```
+
+Or install only the adapter you need:
+
+```bash
+pip install -e ".[livekit]"   # LiveKit adapter only
+pip install -e ".[pipecat]"   # Pipecat adapter only
+```
+
+### Step 4: Install Example Dependencies
+
+The adapters install the core frameworks but not the individual AI service plugins. Install them:
+
+**For LiveKit examples:**
+
+```bash
+pip install python-dotenv \
+    livekit-plugins-deepgram livekit-plugins-openai \
+    livekit-plugins-silero livekit-plugins-turn-detector
+```
+
+**For Pipecat examples:**
+
+```bash
+pip install python-dotenv "pipecat-ai[deepgram,openai]"
+```
+
+### Step 5: Download Model Files
+
+The turn detector plugin (used in LiveKit examples) requires an ONNX model from Hugging Face. This is a one-time download:
+
+```bash
+pip install transformers huggingface-hub
+python -c "from livekit.plugins.turn_detector.multilingual import _EUORunnerMultilingual; _EUORunnerMultilingual._download_files()"
+```
+
+### Step 6: Set Environment Variables
+
+```bash
+export SIP_USERNAME=<your SIP username>
+export SIP_PASSWORD=<your SIP password>
+export SIP_DOMAIN=phone.plivo.com
+export DEEPGRAM_API_KEY=<your Deepgram key>
+export OPENAI_API_KEY=<your OpenAI key>
+```
+
+### Step 7: Run an Example
+
+```bash
+python examples/livekit/sip_agent.py dev
+```
+
+CLI modes: `start` (production, INFO logging), `dev` (development, DEBUG for adapters), `debug` (full debug including Rust SIP/RTP).
+
+### SIP Provider Setup (Plivo)
+
+To receive inbound calls, your SIP provider must route calls to your SIP endpoint:
+
+1. Create a **SIP Endpoint** in Plivo dashboard (Voice > SIP Endpoints) — this gives you `SIP_USERNAME` and `SIP_PASSWORD`
+2. Create an **Answer URL** that returns XML routing the call to your endpoint. You can use [Beeceptor](https://beeceptor.com) or [webhook.site](https://webhook.site) to host this:
+   ```xml
+   <Response>
+     <Dial>
+       <User>sip:your_sip_username@phone.plivo.com</User>
+     </Dial>
+   </Response>
+   ```
+3. Assign the Answer URL to your Plivo phone number (Phone Numbers > your number > Application)
+
+No tunnel or port forwarding is needed — the agent registers with the SIP server and receives calls directly via NAT traversal (STUN).
+
+### Building the Rust Core (Optional)
+
+Only needed if you are developing the Rust core itself:
 
 ```bash
 cargo build                                     # Core library (SIP transport)
@@ -60,21 +159,7 @@ cargo build --features audio-stream             # + Plivo audio streaming
 cargo build --features audio-processing         # + jitter buffer, PLC, comfort noise
 ```
 
-### Python Bindings + Adapters
-
-```bash
-cd crates/agent-transport-python && maturin develop   # Native binding
-cd python && pip install -e ".[all]"                   # LiveKit + Pipecat adapters
-```
-
-Install only the adapter you need:
-
-```bash
-pip install -e ".[livekit]"   # LiveKit adapter only
-pip install -e ".[pipecat]"   # Pipecat adapter only
-```
-
-### Node.js Bindings
+### Node.js Bindings (Optional)
 
 ```bash
 cd crates/agent-transport-node && npm run build
@@ -90,52 +175,6 @@ cd crates/agent-transport-node && npm run build
 | [`pipecat/sip_agent.py`](examples/pipecat/sip_agent.py) | Pipecat pipeline over SIP/RTP |
 | [`pipecat/audio_stream_agent.py`](examples/pipecat/audio_stream_agent.py) | Pipecat pipeline over Plivo audio streaming |
 | [`cli/phone.py`](examples/cli/phone.py) | Interactive CLI softphone with mic/speaker, DTMF, mute, hold/unhold |
-
-### Running the LiveKit SIP Example
-
-The LiveKit adapter (`pip install -e ".[livekit]"`) installs `livekit-agents` but not the individual plugins the examples use. Install them separately:
-
-```bash
-pip install python-dotenv \
-    livekit-plugins-deepgram livekit-plugins-openai \
-    livekit-plugins-silero livekit-plugins-turn-detector
-```
-
-Set the required environment variables:
-
-```bash
-export SIP_USERNAME=<your SIP username>
-export SIP_PASSWORD=<your SIP password>
-export SIP_DOMAIN=phone.plivo.com
-export DEEPGRAM_API_KEY=<your Deepgram key>
-export OPENAI_API_KEY=<your OpenAI key>
-```
-
-Download model files required by the turn detector (ONNX model + tokenizer from Hugging Face, one-time download):
-
-```bash
-pip install transformers huggingface-hub
-python -c "from livekit.plugins.turn_detector.multilingual import _EUORunnerMultilingual; _EUORunnerMultilingual._download_files()"
-```
-
-Run the agent:
-
-```bash
-python examples/livekit/sip_agent.py dev
-```
-
-CLI modes: `start` (production, INFO logging), `dev` (development, DEBUG for adapters), `debug` (full debug including Rust SIP/RTP).
-
-### Running the Pipecat SIP Example
-
-```bash
-pip install python-dotenv "pipecat-ai[deepgram,openai]"
-```
-
-```bash
-SIP_USERNAME=xxx SIP_PASSWORD=yyy DEEPGRAM_API_KEY=xxx OPENAI_API_KEY=xxx \
-    python examples/pipecat/sip_agent.py
-```
 
 See also: [Feature Flags & CLI Phone docs](docs/features.md)
 
