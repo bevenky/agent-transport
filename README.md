@@ -132,23 +132,6 @@ python examples/livekit/sip_agent.py dev
 
 CLI modes: `start` (production, INFO logging), `dev` (development, DEBUG for adapters), `debug` (full debug including Rust SIP/RTP).
 
-### SIP Provider Setup (Plivo)
-
-To receive inbound calls, your SIP provider must route calls to your SIP endpoint:
-
-1. Create a **SIP Endpoint** in Plivo dashboard (Voice > SIP Endpoints) — this gives you `SIP_USERNAME` and `SIP_PASSWORD`
-2. Create an **Answer URL** that returns XML routing the call to your endpoint. You can use [Beeceptor](https://beeceptor.com) or [webhook.site](https://webhook.site) to host this:
-   ```xml
-   <Response>
-     <Dial>
-       <User>sip:your_sip_username@phone.plivo.com</User>
-     </Dial>
-   </Response>
-   ```
-3. Assign the Answer URL to your Plivo phone number (Phone Numbers > your number > Application)
-
-No tunnel or port forwarding is needed — the agent registers with the SIP server and receives calls directly via NAT traversal (STUN).
-
 ### Building the Rust Core (Optional)
 
 Only needed if you are developing the Rust core itself:
