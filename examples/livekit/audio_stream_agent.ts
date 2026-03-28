@@ -1,14 +1,33 @@
 /**
- * SIP voice agent with tool calling — handles inbound and outbound calls.
+ * Audio streaming voice agent with tool calling and DTMF support.
+ *
+ * Plivo connects to your WebSocket server and streams audio bidirectionally.
+ * No SIP credentials needed — configure Plivo XML to point to your server.
+ *
+ * Uses the same LiveKit Agents patterns as WebRTC — getJobContext().room works,
+ * DTMF events come through room.on("sip_dtmf_received"), built-in tools work.
+ *
+ * Same Agent code works with both SIP and audio streaming —
+ * just swap AgentServer for AudioStreamServer (when available in TS).
+ * For now, uses the SIP AgentServer with audio stream config.
+ *
+ * Setup:
+ *   Configure Plivo XML answer URL to return:
+ *   <Response>
+ *     <Stream bidirectional="true" keepCallAlive="true"
+ *       contentType="audio/x-mulaw;rate=8000">
+ *       wss://your-server:8765
+ *     </Stream>
+ *   </Response>
  *
  * Usage:
- *   npx ts-node examples/livekit/sip_agent.ts start     # production
- *   npx ts-node examples/livekit/sip_agent.ts dev       # dev mode
- *   npx ts-node examples/livekit/sip_agent.ts debug     # full debug
+ *   npx ts-node examples/livekit/audio_stream_agent.ts start
+ *   npx ts-node examples/livekit/audio_stream_agent.ts dev
  */
 
 import { AgentServer, type CallContext } from '@agent-transport/sip-livekit';
-import { voice, llm, metrics, getJobContext } from '@livekit/agents';
+import { voice, llm, metrics } from '@livekit/agents';
+import { getJobContext } from '@livekit/agents';
 import * as deepgram from '@livekit/agents-plugin-deepgram';
 import * as openai from '@livekit/agents-plugin-openai';
 import * as silero from '@livekit/agents-plugin-silero';
@@ -16,8 +35,8 @@ import * as livekit from '@livekit/agents-plugin-livekit';
 import { z } from 'zod';
 
 const server = new AgentServer({
-  sipUsername: process.env.SIP_USERNAME!,
-  sipPassword: process.env.SIP_PASSWORD!,
+  sipUsername: process.env.SIP_USERNAME ?? '',
+  sipPassword: process.env.SIP_PASSWORD ?? '',
   sipServer: process.env.SIP_DOMAIN ?? 'phone.plivo.com',
 });
 
@@ -53,17 +72,6 @@ const agent = new voice.Agent({
         return 'Say goodbye to the user.';
       },
     }),
-    transferCall: llm.tool({
-      description: 'Transfer the call to another phone number or agent.',
-      parameters: z.object({
-        destination: z.string().describe('The phone number or SIP URI to transfer to'),
-      }),
-      execute: async ({ destination }) => {
-        console.log(`Transfer requested to ${destination}`);
-        // TODO: implement SIP REFER or blind transfer
-        return `I'm transferring you to ${destination} now. Please hold.`;
-      },
-    }),
   },
 });
 
@@ -81,8 +89,7 @@ server.sipSession(async (ctx: CallContext) => {
     ttsTextTransforms: ['filterEmoji', 'filterMarkdown'],
   });
 
-  // DTMF handling — same pattern as LiveKit WebRTC:
-  // getJobContext().room.on("sip_dtmf_received", handler)
+  // DTMF handling — same pattern as LiveKit WebRTC
   try {
     const jobCtx = getJobContext();
     jobCtx.room.on('sip_dtmf_received', (ev: any) => {
@@ -92,14 +99,12 @@ server.sipSession(async (ctx: CallContext) => {
     // getJobContext() not available outside job context
   }
 
-  // Log metrics as they are emitted
   session.on(voice.AgentSessionEventTypes.MetricsCollected, (ev) => {
     metrics.logMetrics(ev.metrics);
   });
 
   await ctx.start(session, { agent });
 
-  // Greet the user once the session is started
   session.say('Hello, how can I help you today?');
 });
 

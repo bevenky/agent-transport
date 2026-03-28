@@ -1,14 +1,17 @@
 /**
- * SIP multi-agent with handoff and tool calling.
+ * Audio streaming multi-agent with handoff, tool calling, and DTMF support.
+ *
+ * Plivo connects to your WebSocket server and streams audio bidirectionally.
+ * Same agent code as SIP — just swap the server setup.
  *
  * Demonstrates agent handoff using class inheritance (same pattern as LiveKit TS):
- * - GreeterAgent: greets the caller, gathers intent, hands off
+ * - GreeterAgent: greets the caller, gathers intent via voice or DTMF
  * - SalesAgent: handles product inquiries with tool calling
  * - SupportAgent: handles support issues with tool calling
  *
  * Usage:
- *   npx ts-node examples/livekit/sip_multi_agent.ts start
- *   npx ts-node examples/livekit/sip_multi_agent.ts dev
+ *   npx ts-node examples/livekit/audio_stream_multi_agent.ts start
+ *   npx ts-node examples/livekit/audio_stream_multi_agent.ts dev
  */
 
 import { AgentServer, type CallContext } from '@agent-transport/sip-livekit';
