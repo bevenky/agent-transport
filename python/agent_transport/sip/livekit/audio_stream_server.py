@@ -221,6 +221,17 @@ class AudioStreamCallContext:
         session.output.audio = AudioStreamOutput(self.endpoint, self.session_id)
         self._session = session
 
+        # Listen to session close event — handles agent-initiated shutdown
+        @session.on("close")
+        def _on_session_close(ev):
+            logger.info("Session %s closed (reason=%s)", self.session_id, getattr(ev, 'reason', 'unknown'))
+            if self._call_ended is not None and not self._call_ended.is_set():
+                self._call_ended.set()
+            try:
+                self.endpoint.hangup(self.session_id)
+            except Exception:
+                pass
+
         if logging.getLogger("agent_transport.audio_stream").isEnabledFor(logging.DEBUG):
             @session.on("agent_state_changed")
             def _on_agent_state(ev):
@@ -535,6 +546,15 @@ class AudioStreamServer:
                 session_id = ev["session"].call_id
                 reason = ev.get("reason", "unknown")
                 logger.info("Session %s terminated (reason=%s)", session_id, reason)
+
+                # Emit participant_disconnected on Room facade (matches LiveKit WebRTC)
+                # RoomIO._on_participant_disconnected will call _close_soon() → session closes
+                ctx = self._session_contexts.get(session_id)
+                if ctx and ctx._room:
+                    remote = ctx._room._remote
+                    remote.disconnect_reason = 1  # CLIENT_INITIATED
+                    ctx._room.emit("participant_disconnected", remote)
+
                 if session_id in self._session_ended_events:
                     self._session_ended_events[session_id].set()
 

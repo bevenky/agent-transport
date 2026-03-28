@@ -218,6 +218,20 @@ class CallContext:
         session.output.audio = SipAudioOutput(self.endpoint, self.call_id)
         self._session = session
 
+        # Listen to session close event — handles agent-initiated shutdown
+        # (e.g., agent tool calls session.shutdown())
+        # Without this, ctx.start() blocks forever waiting for _call_ended
+        @session.on("close")
+        def _on_session_close(ev):
+            logger.info("Call %s session closed (reason=%s)", self.call_id, getattr(ev, 'reason', 'unknown'))
+            if self._call_ended is not None and not self._call_ended.is_set():
+                self._call_ended.set()
+            # Send BYE to remote if agent initiated hangup
+            try:
+                self.endpoint.hangup(self.call_id)
+            except Exception:
+                pass
+
         if logging.getLogger("agent_transport.sip").isEnabledFor(logging.DEBUG):
             @session.on("agent_state_changed")
             def _on_agent_state(ev):
@@ -602,6 +616,14 @@ class AgentServer:
                 call_id = ev["session"].call_id
                 reason = ev.get("reason", "unknown")
                 logger.info("Call %s terminated (reason=%s)", call_id, reason)
+
+                # Emit participant_disconnected on Room facade (matches LiveKit WebRTC)
+                # RoomIO._on_participant_disconnected will call _close_soon() → session closes
+                ctx = self._call_contexts.get(call_id)
+                if ctx and ctx._room:
+                    remote = ctx._room._remote
+                    remote.disconnect_reason = 1  # CLIENT_INITIATED
+                    ctx._room.emit("participant_disconnected", remote)
 
                 # Clean up pending inbound if call died before media
                 pending_inbound.pop(call_id, None)
