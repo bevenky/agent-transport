@@ -224,10 +224,10 @@ class AudioStreamCallContext:
         if logging.getLogger("agent_transport.audio_stream").isEnabledFor(logging.DEBUG):
             @session.on("agent_state_changed")
             def _on_agent_state(ev):
-                logger.info("Session %d agent: %s -> %s", self.session_id, ev.old_state, ev.new_state)
+                logger.info("Session %s agent: %s -> %s", self.session_id, ev.old_state, ev.new_state)
             @session.on("user_state_changed")
             def _on_user_state(ev):
-                logger.info("Session %d user: %s -> %s", self.session_id, ev.old_state, ev.new_state)
+                logger.info("Session %s user: %s -> %s", self.session_id, ev.old_state, ev.new_state)
 
         try:
             # Pass room=self._room so AgentSession creates RoomIO with audio disabled
@@ -522,7 +522,7 @@ class AudioStreamServer:
                 call_id = session.remote_uri  # Plivo Call UUID
                 stream_id = session.local_uri if hasattr(session, "local_uri") else ""
                 extra_headers = session.extra_headers if hasattr(session, "extra_headers") else {}
-                logger.info("Audio stream session %d started (call_id=%s, stream_id=%s)", session_id, call_id, stream_id)
+                logger.info("Audio stream session %s started (call_id=%s, stream_id=%s)", session_id, call_id, stream_id)
                 asyncio.create_task(
                     self._start_session(session_id, call_id, stream_id, extra_headers)
                 )
@@ -540,7 +540,7 @@ class AudioStreamServer:
                 # Route DTMF to both ctx listeners AND Room facade
                 session_id = ev.get("call_id", -1)
                 digit = ev.get("digit", "")
-                logger.debug("DTMF '%s' on session %d", digit, session_id)
+                logger.debug("DTMF '%s' on session %s", digit, session_id)
                 ctx = self._session_contexts.get(session_id)
                 if ctx:
                     # Emit on ctx for simple ctx.on("dtmf_received") pattern
@@ -590,7 +590,7 @@ class AudioStreamServer:
             try:
                 await self._entrypoint_fnc(ctx)
             except Exception:
-                logger.exception("Session %d handler failed", session_id)
+                logger.exception("Session %s handler failed", session_id)
             finally:
                 STREAM_SESSION_DURATION.labels(nodename=node).observe(time.monotonic() - session_start)
 
@@ -598,7 +598,7 @@ class AudioStreamServer:
                     try:
                         usage = ctx._session.usage
                         if usage and usage.model_usage:
-                            logger.info("Session %d usage: %s", session_id, usage)
+                            logger.info("Session %s usage: %s", session_id, usage)
                     except Exception:
                         pass
                     try:
@@ -619,7 +619,7 @@ class AudioStreamServer:
                 self._active_sessions.pop(session_id, None)
                 self._session_ended_events.pop(session_id, None)
                 self._session_contexts.pop(session_id, None)
-                logger.info("Session %d ended", session_id)
+                logger.info("Session %s ended", session_id)
 
         task = asyncio.create_task(_run_session())
         self._active_sessions[session_id] = task

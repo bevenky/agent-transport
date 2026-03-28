@@ -221,10 +221,10 @@ class CallContext:
         if logging.getLogger("agent_transport.sip").isEnabledFor(logging.DEBUG):
             @session.on("agent_state_changed")
             def _on_agent_state(ev):
-                logger.info("Call %d agent: %s -> %s", self.call_id, ev.old_state, ev.new_state)
+                logger.info("Call %s agent: %s -> %s", self.call_id, ev.old_state, ev.new_state)
             @session.on("user_state_changed")
             def _on_user_state(ev):
-                logger.info("Call %d user: %s -> %s", self.call_id, ev.old_state, ev.new_state)
+                logger.info("Call %s user: %s -> %s", self.call_id, ev.old_state, ev.new_state)
 
         try:
             await session.start(agent=agent, room=self._room, **kwargs)
@@ -537,7 +537,7 @@ class AgentServer:
         except Exception as e:
             return web.json_response({"error": str(e)}, status=500)
 
-        logger.info("Outbound call %d to %s", call_id, destination)
+        logger.info("Outbound call %s to %s", call_id, destination)
 
         # Register a future that the event dispatcher will resolve on call_media_active
         media_fut = asyncio.get_running_loop().create_future()
@@ -547,7 +547,7 @@ class AgentServer:
             try:
                 await asyncio.wait_for(media_fut, timeout=30)
             except asyncio.TimeoutError:
-                logger.warning("Outbound call %d to %s timed out", call_id, destination)
+                logger.warning("Outbound call %s to %s timed out", call_id, destination)
                 self._pending_outbound.pop(call_id, None)
                 return
             # Dispatcher already popped _pending_outbound
@@ -580,7 +580,7 @@ class AgentServer:
             if ev_type == "incoming_call":
                 call_id = ev["session"].call_id
                 remote_uri = ev["session"].remote_uri
-                logger.info("Incoming call %d from %s", call_id, remote_uri)
+                logger.info("Incoming call %s from %s", call_id, remote_uri)
                 await loop.run_in_executor(None, self._ep.answer, call_id)
                 pending_inbound[call_id] = remote_uri
 
@@ -617,7 +617,7 @@ class AgentServer:
             elif ev_type == "dtmf_received":
                 call_id = ev.get("call_id", -1)
                 digit = ev.get("digit", "")
-                logger.debug("DTMF '%s' on call %d", digit, call_id)
+                logger.debug("DTMF '%s' on call %s", digit, call_id)
                 ctx = self._call_contexts.get(call_id)
                 if ctx:
                     ctx._emit("dtmf_received", digit)
@@ -664,12 +664,12 @@ class AgentServer:
                     rec_path = os.path.join(self._recording_dir, f"call_{call_id}.wav")
                     self._ep.start_recording(call_id, rec_path, self._recording_stereo)
                 except Exception:
-                    logger.warning("Failed to start recording for call %d", call_id, exc_info=True)
+                    logger.warning("Failed to start recording for call %s", call_id, exc_info=True)
 
             try:
                 await self._entrypoint_fnc(ctx)
             except Exception:
-                logger.exception("Call %d handler failed", call_id)
+                logger.exception("Call %s handler failed", call_id)
             finally:
                 SIP_CALL_DURATION.labels(nodename=node).observe(time.monotonic() - call_start)
 
@@ -684,7 +684,7 @@ class AgentServer:
                     try:
                         usage = ctx._session.usage
                         if usage and usage.model_usage:
-                            logger.info("Call %d usage: %s", call_id, usage)
+                            logger.info("Call %s usage: %s", call_id, usage)
                     except Exception:
                         pass
                     try:
@@ -705,7 +705,7 @@ class AgentServer:
                 self._active_calls.pop(call_id, None)
                 self._call_ended_events.pop(call_id, None)
                 self._call_contexts.pop(call_id, None)
-                logger.info("Call %d ended (%s)", call_id, direction)
+                logger.info("Call %s ended (%s)", call_id, direction)
 
         task = asyncio.create_task(_run_call())
         self._active_calls[call_id] = task
