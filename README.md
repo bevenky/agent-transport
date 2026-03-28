@@ -26,7 +26,8 @@ server = AgentServer()                         server = AgentServer(sip_username
 @server.rtc_session()                          @server.sip_session()
 async def entrypoint(ctx):                     async def entrypoint(ctx):
     session = AgentSession(...)                    session = AgentSession(...)
-    await session.start(                           await ctx.start(session, agent=Assistant())
+    await session.start(                           ctx.session = session
+    await session.start(agent=Assistant(), room=ctx.room)
         agent=Assistant(), room=ctx.room)
 
 cli.run_app(server)                            server.run()

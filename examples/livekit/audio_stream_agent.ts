@@ -7,9 +7,9 @@
  * Uses the same LiveKit Agents patterns as WebRTC — getJobContext().room works,
  * DTMF events come through room.on("sip_dtmf_received"), built-in tools work.
  *
- * Same Agent code works with both SIP and audio streaming —
- * just swap AgentServer for AudioStreamServer (when available in TS).
- * For now, uses the SIP AgentServer with audio stream config.
+ * Same Agent code works with both SIP and audio streaming.
+ * TS uses AgentServer for both transports; Python has separate
+ * AgentServer (SIP) and AudioStreamServer (Plivo WebSocket).
  *
  * Setup:
  *   Configure Plivo XML answer URL to return:

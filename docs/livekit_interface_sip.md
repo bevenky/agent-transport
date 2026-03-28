@@ -5,7 +5,7 @@ Drop-in SIP transport for LiveKit Agents. Run the same `AgentSession` pipeline (
 ## Quick Start
 
 ```python
-from agent_transport.sip.livekit import AgentServer, CallContext
+from agent_transport.sip.livekit import AgentServer, JobContext
 from livekit.agents import Agent, AgentSession, TurnHandlingOptions
 from livekit.plugins import deepgram, openai, silero
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
@@ -31,7 +31,7 @@ class Assistant(Agent):
         self.session.generate_reply(instructions="Greet the user.")
 
 @server.sip_session()
-async def entrypoint(ctx: CallContext):
+async def entrypoint(ctx: JobContext):
     session = AgentSession(
         vad=ctx.userdata["vad"],
         stt=deepgram.STT(model="nova-3"),
@@ -43,7 +43,8 @@ async def entrypoint(ctx: CallContext):
         preemptive_generation=True,
         aec_warmup_duration=3.0,
     )
-    await ctx.start(session, agent=Assistant())
+    ctx.session = session
+    await session.start(agent=Assistant(), room=ctx.room)
 
 if __name__ == "__main__":
     server.run()
@@ -130,7 +131,7 @@ AgentServer(
 
 ---
 
-## CallContext
+## JobContext
 
 Passed to the `@sip_session()` handler — equivalent of LiveKit's `JobContext`.
 
@@ -294,14 +295,14 @@ Implements `livekit.agents.voice.io.AudioOutput`. Line-for-line match of LiveKit
 ### Python
 
 ```python
-from agent_transport.sip.livekit import AgentServer, CallContext, run_app
+from agent_transport.sip.livekit import AgentServer, JobContext, run_app
 from agent_transport.sip.livekit import SipAudioInput, SipAudioOutput  # low-level access
 ```
 
 ### TypeScript
 
 ```typescript
-import { AgentServer, CallContext } from '@agent-transport/sip-livekit';
+import { AgentServer, JobContext } from '@agent-transport/sip-livekit';
 import { SipAudioInput, SipAudioOutput } from '@agent-transport/sip-livekit'; // low-level
 ```
 
@@ -310,7 +311,7 @@ import { SipAudioInput, SipAudioOutput } from '@agent-transport/sip-livekit'; //
 ## TypeScript Quick Start
 
 ```typescript
-import { AgentServer, type CallContext } from '@agent-transport/sip-livekit';
+import { AgentServer, type JobContext } from '@agent-transport/sip-livekit';
 import { voice, llm, metrics } from '@livekit/agents';
 import * as deepgram from '@livekit/agents-plugin-deepgram';
 import * as openai from '@livekit/agents-plugin-openai';
@@ -339,7 +340,7 @@ const agent = new voice.Agent({
   },
 });
 
-server.sipSession(async (ctx: CallContext) => {
+server.sipSession(async (ctx: JobContext) => {
   const session = new voice.AgentSession({
     vad: ctx.userdata.vad as silero.VAD,
     stt: new deepgram.STT({ model: 'nova-3' }),
@@ -356,7 +357,8 @@ server.sipSession(async (ctx: CallContext) => {
     metrics.logMetrics(ev.metrics);
   });
 
-  await ctx.start(session, { agent });
+  ctx.session = session;
+  await session.start({ agent, room: ctx.room });
   session.say('Hello, how can I help you today?');
 });
 
