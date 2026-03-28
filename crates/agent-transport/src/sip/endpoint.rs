@@ -39,9 +39,10 @@ fn err(e: impl Display) -> EndpointError { EndpointError::Other(e.to_string()) }
 struct CallContext {
     session: CallSession,
     rtp: Option<Arc<RtpTransport>>,
-    /// Shared audio buffer — replaces crossbeam channel.
-    /// Matches WebRTC C++ InternalSource's buffer_ (one buffer, one mutex).
+    /// Shared audio buffer — agent voice with backpressure.
     audio_buf: Arc<AudioBuffer>,
+    /// Background audio buffer (hold music, ambient) — mixed in send loop.
+    bg_audio_buf: Arc<AudioBuffer>,
     incoming_rx: Receiver<AudioFrame>,
     muted: Arc<AtomicBool>,
     paused: Arc<AtomicBool>,
@@ -95,7 +96,7 @@ async fn setup_rtp(
     let rtp = Arc::new(RtpTransport::new(Arc::new(rtp_sock), remote_rtp, answer.codec, ctx.cancel.clone(), dtmf_pt, answer.ptime_ms));
 
     let (itx, irx) = crossbeam_channel::unbounded();
-    rtp.start_send_loop(ctx.audio_buf.clone(), ctx.muted.clone(), ctx.paused.clone(), ctx.playout_notify.clone(), ctx.recorder.clone());
+    rtp.start_send_loop(ctx.audio_buf.clone(), ctx.bg_audio_buf.clone(), ctx.muted.clone(), ctx.paused.clone(), ctx.playout_notify.clone(), ctx.recorder.clone());
     rtp.start_recv_loop(itx, etx.clone(), call_id, ctx.beep_detector.clone(), ctx.held.clone(), ctx.recorder.clone());
 
     ctx.rtp = Some(rtp);
@@ -165,6 +166,7 @@ fn new_call_context(call_id: i32, direction: CallDirection, cc: CancellationToke
     let ctx = CallContext {
         session: session.clone(), rtp: None,
         audio_buf: Arc::new(AudioBuffer::new()),
+        bg_audio_buf: Arc::new(AudioBuffer::new()),
         incoming_rx: irx,
         muted: Arc::new(AtomicBool::new(false)), paused: Arc::new(AtomicBool::new(false)),
         held: Arc::new(AtomicBool::new(false)),
@@ -591,9 +593,16 @@ impl SipEndpoint {
     }
 
     /// Simple send_audio without callback — for backward compatibility.
-    /// Uses a no-op callback (always immediate, no backpressure wait).
     pub fn send_audio(&self, call_id: i32, frame: &AudioFrame) -> Result<()> {
         self.send_audio_with_callback(call_id, frame, Box::new(|| {}))
+    }
+
+    /// Send background audio to be mixed with agent voice in the RTP send loop.
+    /// Used by publish_track (background audio, hold music, etc.).
+    pub fn send_background_audio(&self, call_id: i32, frame: &AudioFrame) -> Result<()> {
+        let bg_buf = self.with_call(call_id, |c| c.bg_audio_buf.clone())?;
+        bg_buf.push(&frame.data, Box::new(|| {}))
+            .map_err(|e| EndpointError::Other(e.into()))
     }
 
     pub fn recv_audio(&self, call_id: i32) -> Result<Option<AudioFrame>> {

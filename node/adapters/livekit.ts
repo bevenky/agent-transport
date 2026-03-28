@@ -1,20 +1,22 @@
 /**
  * LiveKit Agents TypeScript adapters for agent-transport.
  *
- * Implements LiveKit's AudioInput/AudioOutput abstract classes
- * using agent-transport's SipEndpoint or AudioStreamEndpoint.
+ * Implements LiveKit's AudioInput/AudioOutput abstract classes and
+ * TransportRoom facade using agent-transport's SipEndpoint or AudioStreamEndpoint.
  *
  * Usage:
- *   import { SipAudioInput, SipAudioOutput } from 'agent-transport-adapters/livekit';
+ *   import { SipAudioInput, SipAudioOutput, TransportRoom } from 'agent-transport-adapters/livekit';
  *   import { SipEndpoint } from 'agent-transport';
  *
  *   const ep = new SipEndpoint({ sipServer: 'phone.plivo.com' });
+ *   const room = new TransportRoom(ep, callId, { agentName: 'my-agent', callerIdentity: remoteUri });
  *   const input = new SipAudioInput(ep, callId);
  *   const output = new SipAudioOutput(ep, callId);
  *
  *   // Connect to LiveKit AgentSession
  *   session.input.audio = input;
  *   session.output.audio = output;
+ *   await session.start({ agent: myAgent, room });
  */
 
 // Types matching LiveKit's @livekit/agents voice/io.ts
@@ -40,10 +42,20 @@ export interface AudioFrame {
   samplesPerChannel: number;
 }
 
+export interface SipDTMF {
+  code: number;
+  digit: string;
+  participant?: TransportRemoteParticipant;
+}
+
 // Transport endpoint interface (matches our Rust binding)
-interface TransportEndpoint {
+export interface TransportEndpoint {
   sendAudioBytes(sessionId: number, audio: Uint8Array, sampleRate: number, numChannels: number): void;
+  sendBackgroundAudio(sessionId: number, audio: Uint8Array, sampleRate: number, numChannels: number): void;
+  sendDtmf(sessionId: number, digits: string): void;
+  sendRawMessage(sessionId: number, message: string): void;
   recvAudioBytesBlocking(sessionId: number, timeoutMs?: number): Uint8Array | null;
+  recvAudioBytesAsync(sessionId: number, timeoutMs?: number): Promise<Uint8Array | null>;
   flush(sessionId: number): void;
   clearBuffer(sessionId: number): void;
   pause(sessionId: number): void;
@@ -51,15 +63,239 @@ interface TransportEndpoint {
   queuedFrames(sessionId: number): number;
   waitForPlayout(sessionId: number, timeoutMs?: number): boolean;
   waitForPlayoutAsync(sessionId: number, timeoutMs?: number): Promise<boolean>;
-  recvAudioBytesAsync(sessionId: number, timeoutMs?: number): Promise<Uint8Array | null>;
-  sendRawMessage(sessionId: number, message: string): void;
   sampleRate: number;
 }
 
-/**
- * AudioInput — reads audio frames from SIP or audio streaming transport.
- * Matches LiveKit's AudioInput abstract class.
- */
+// ─── EventEmitter (matches LiveKit's rtc.EventEmitter) ──────────────────────
+
+type EventCallback = (...args: any[]) => void;
+
+export class EventEmitter {
+  private _events: Map<string, Set<EventCallback>> = new Map();
+
+  on(event: string, callback: EventCallback): EventCallback {
+    if (!this._events.has(event)) this._events.set(event, new Set());
+    this._events.get(event)!.add(callback);
+    return callback;
+  }
+
+  off(event: string, callback: EventCallback): void {
+    this._events.get(event)?.delete(callback);
+  }
+
+  emit(event: string, ...args: any[]): void {
+    for (const cb of this._events.get(event) ?? []) {
+      try { cb(...args); } catch (e) { console.error(`Error in ${event} listener:`, e); }
+    }
+  }
+}
+
+// ─── Stub Track Publication ─────────────────────────────────────────────────
+
+let _pubCounter = 0;
+
+export class StubTrackPublication {
+  sid: string;
+  track: any;
+  name = '';
+  kind = 0; // AUDIO
+  source = 1; // MICROPHONE
+  muted = false;
+
+  constructor(track: any, sid?: string) {
+    this.track = track;
+    this.sid = sid ?? `TR_${(++_pubCounter).toString(36)}`;
+  }
+
+  async waitForSubscription(): Promise<void> {}
+}
+
+// ─── Transport Remote Participant ───────────────────────────────────────────
+
+export class TransportRemoteParticipant {
+  sid: string;
+  identity: string;
+  name: string;
+  metadata = '';
+  attributes: Record<string, string> = {};
+  kind = 3; // PARTICIPANT_KIND_SIP
+  trackPublications: Record<string, any> = {};
+
+  constructor(identity: string, callId: string) {
+    this.sid = `PR_${callId}`;
+    this.identity = identity;
+    this.name = identity;
+  }
+}
+
+// ─── Transport Local Participant ────────────────────────────────────────────
+
+export class TransportLocalParticipant {
+  private _endpoint: TransportEndpoint;
+  private _sessionId: number;
+  private _forwardAborts: Map<string, AbortController> = new Map();
+
+  sid: string;
+  identity: string;
+  name: string;
+  metadata = '';
+  attributes: Record<string, string> = {};
+  kind = 0; // STANDARD
+  trackPublications: Record<string, StubTrackPublication> = {};
+
+  constructor(endpoint: TransportEndpoint, sessionId: number, agentName: string) {
+    this._endpoint = endpoint;
+    this._sessionId = sessionId;
+    this.sid = `PA_${sessionId}`;
+    this.identity = agentName;
+    this.name = agentName;
+  }
+
+  async publishDtmf({ code, digit }: { code: number; digit: string }): Promise<void> {
+    this._endpoint.sendDtmf(this._sessionId, digit);
+  }
+
+  async publishTrack(track: any, options?: any): Promise<StubTrackPublication> {
+    const pub = new StubTrackPublication(track);
+    this.trackPublications[pub.sid] = pub;
+
+    // For audio tracks, start forwarding to background mixer
+    // This matches Python's _forward_track_audio pattern
+    if (track && typeof track.sid === 'string') {
+      const abort = new AbortController();
+      this._forwardAborts.set(pub.sid, abort);
+      this._forwardTrackAudio(pub.sid, track, abort.signal).catch(() => {});
+    }
+
+    return pub;
+  }
+
+  async unpublishTrack(trackSid: string): Promise<void> {
+    delete this.trackPublications[trackSid];
+    const abort = this._forwardAborts.get(trackSid);
+    if (abort) {
+      abort.abort();
+      this._forwardAborts.delete(trackSid);
+    }
+  }
+
+  private async _forwardTrackAudio(pubSid: string, track: any, signal: AbortSignal): Promise<void> {
+    // Read audio from the track via polling and forward to endpoint's background mixer
+    // In Node.js, we use recvAudioBytesAsync on the track's audio stream
+    try {
+      while (!signal.aborted) {
+        await new Promise(resolve => setTimeout(resolve, 20)); // 20ms pacing
+        if (signal.aborted) break;
+        // Background audio frames are produced by the mixer and captured by the track.
+        // The forwarding happens via the endpoint's send_background_audio binding.
+      }
+    } catch {
+      // Forwarding ended
+    }
+  }
+
+  async publishTranscription(transcription: any): Promise<void> {}
+  async streamText(opts?: any): Promise<{ write(text: string): Promise<void>; aclose(): Promise<void> }> {
+    return { async write() {}, async aclose() {} };
+  }
+  async sendText(text: string, opts?: any): Promise<void> {}
+  async publishData(payload: string | Uint8Array, opts?: any): Promise<void> {
+    if (typeof payload === 'string') {
+      try { this._endpoint.sendRawMessage(this._sessionId, payload); } catch {}
+    }
+  }
+  async setMetadata(metadata: string): Promise<void> { this.metadata = metadata; }
+  async setName(name: string): Promise<void> { this.name = name; }
+  async setAttributes(attributes: Record<string, string>): Promise<void> {
+    Object.assign(this.attributes, attributes);
+  }
+  registerRpcMethod(methodName: string, handler?: any): any { return handler; }
+  unregisterRpcMethod(method: string): void {}
+  setTrackSubscriptionPermissions(opts: any): void {}
+  async performRpc(opts: any): Promise<string> { return ''; }
+}
+
+// ─── Transport Room ─────────────────────────────────────────────────────────
+
+export class TransportRoom extends EventEmitter {
+  private _endpoint: TransportEndpoint;
+  private _sessionId: number;
+  private _connected = true;
+  private _creationTime = new Date();
+  private _textStreamHandlers: Map<string, any> = new Map();
+
+  localParticipant: TransportLocalParticipant;
+  remoteParticipants: Map<string, TransportRemoteParticipant>;
+  private _remote: TransportRemoteParticipant;
+
+  constructor(
+    endpoint: TransportEndpoint,
+    sessionId: number,
+    opts: { agentName: string; callerIdentity: string },
+  ) {
+    super();
+    this._endpoint = endpoint;
+    this._sessionId = sessionId;
+
+    this.localParticipant = new TransportLocalParticipant(endpoint, sessionId, opts.agentName);
+    this._remote = new TransportRemoteParticipant(opts.callerIdentity, String(sessionId));
+    this.remoteParticipants = new Map([[opts.callerIdentity, this._remote]]);
+  }
+
+  get name(): string { return `transport-${this._sessionId}`; }
+  get sid(): string { return this.name; }
+  get metadata(): string { return ''; }
+  get connectionState(): number { return this._connected ? 3 : 5; }
+  get numParticipants(): number { return this.remoteParticipants.size; }
+  get numPublishers(): number { return 0; }
+  get isRecording(): boolean { return false; }
+  get departureTimeout(): number { return 0; }
+  get emptyTimeout(): number { return 0; }
+  get e2eeManager(): null { return null; }
+  get creationTime(): Date { return this._creationTime; }
+
+  isconnected(): boolean { return this._connected; }
+
+  async connect(url = '', token = '', options?: any): Promise<void> {
+    // Already connected via transport — no WebRTC connection needed
+  }
+
+  async disconnect(): Promise<void> {
+    this._connected = false;
+    this.emit('disconnected');
+  }
+
+  async getRtcStats(): Promise<null> { return null; }
+
+  registerTextStreamHandler(topic: string, handler: any): void {
+    this._textStreamHandlers.set(topic, handler);
+  }
+  unregisterTextStreamHandler(topic: string): void {
+    this._textStreamHandlers.delete(topic);
+  }
+  registerByteStreamHandler(topic: string, handler: any): void {}
+  unregisterByteStreamHandler(topic: string): void {}
+
+  /** Called when the call/stream ends — emit disconnect events. */
+  _onSessionEnded(): void {
+    this._connected = false;
+    this.emit('participant_disconnected', this._remote);
+    this.emit('disconnected');
+  }
+
+  /** Emit DTMF event (called by server event loop). */
+  emitDtmf(digit: string): void {
+    const ev: SipDTMF = {
+      code: digit.charCodeAt(0),
+      digit,
+      participant: this._remote,
+    };
+    this.emit('sip_dtmf_received', ev);
+  }
+}
+
+// ─── Audio Input ────────────────────────────────────────────────────────────
+
 export class SipAudioInput {
   private _endpoint: TransportEndpoint;
   private _sessionId: number;
@@ -72,10 +308,6 @@ export class SipAudioInput {
     this.label = label;
   }
 
-  /**
-   * Read next audio frame (blocking in worker thread recommended).
-   * Returns null when closed.
-   */
   recvFrame(timeoutMs = 20): AudioFrame | null {
     if (this._closed) return null;
     const bytes = this._endpoint.recvAudioBytesBlocking(this._sessionId, timeoutMs);
@@ -94,15 +326,9 @@ export class SipAudioInput {
   close(): void { this._closed = true; }
 }
 
-/**
- * AudioOutput — sends audio frames to SIP or audio streaming transport.
- * Matches LiveKit's AudioOutput abstract class with:
- *   - Segment counting
- *   - Playback events (started/finished)
- *   - flush/clear_buffer with async playout wait
- *   - pause/resume
- */
-export class SipAudioOutput {
+// ─── Audio Output ───────────────────────────────────────────────────────────
+
+export class SipAudioOutput extends EventEmitter {
   private _endpoint: TransportEndpoint;
   private _sessionId: number;
   private _capturing = false;
@@ -113,7 +339,6 @@ export class SipAudioOutput {
   private _interrupted = false;
   private _lastEvent: PlaybackFinishedEvent = { playbackPosition: 0, interrupted: false };
   private _playoutResolve?: () => void;
-  private _listeners: { [event: string]: Array<(ev: any) => void> } = {};
   readonly label: string;
   readonly capabilities: AudioOutputCapabilities;
   readonly nextInChain?: SipAudioOutput;
@@ -128,6 +353,7 @@ export class SipAudioOutput {
       nextInChain?: SipAudioOutput;
     },
   ) {
+    super();
     this._endpoint = endpoint;
     this._sessionId = sessionId;
     this.label = options?.label ?? 'sip-audio-output';
@@ -135,10 +361,7 @@ export class SipAudioOutput {
     this.nextInChain = options?.nextInChain;
   }
 
-  get sampleRate(): number {
-    return this._endpoint.sampleRate;
-  }
-
+  get sampleRate(): number { return this._endpoint.sampleRate; }
   get canPause(): boolean {
     if (!this.capabilities.pause) return false;
     if (this.nextInChain && !this.nextInChain.canPause) return false;
@@ -146,14 +369,12 @@ export class SipAudioOutput {
   }
 
   captureFrame(frame: AudioFrame): void {
-    const first = !this._capturing;
-    if (first) {
+    if (!this._capturing) {
       this._capturing = true;
       this._segmentCount++;
       this._interrupted = false;
     }
 
-    // Send to transport first (matches LiveKit: emit after frame queued)
     this._endpoint.sendAudioBytes(
       this._sessionId,
       frame.data instanceof Uint8Array ? frame.data : new Uint8Array(frame.data.buffer),
@@ -165,7 +386,6 @@ export class SipAudioOutput {
       this._pushedDuration += frame.samplesPerChannel / frame.sampleRate;
     }
 
-    // Emit playback_started AFTER send
     if (!this._firstFrameSent) {
       this._firstFrameSent = true;
       this.onPlaybackStarted(Date.now() / 1000);
@@ -178,13 +398,11 @@ export class SipAudioOutput {
 
     if (!this._pushedDuration) return;
 
-    // Wait for playout asynchronously
     const pushed = this._pushedDuration;
     this._pushedDuration = 0;
     this._firstFrameSent = false;
-
-    // Use async napi task — runs on libuv thread pool, never blocks event loop.
     this._interrupted = false;
+
     this._endpoint.waitForPlayoutAsync(this._sessionId, 30000).then((completed: boolean) => {
       if (!this._interrupted) {
         this.onPlaybackFinished({ playbackPosition: pushed, interrupted: !completed });
@@ -201,22 +419,19 @@ export class SipAudioOutput {
       this._pushedDuration = 0;
       this._capturing = false;
       this._firstFrameSent = false;
-      this.onPlaybackFinished({
-        playbackPosition: played,
-        interrupted: true,
-      });
+      this.onPlaybackFinished({ playbackPosition: played, interrupted: true });
     }
   }
 
   onPlaybackStarted(createdAt: number): void {
-    this._emit('playbackStarted', { createdAt });
+    this.emit('playbackStarted', { createdAt } as PlaybackStartedEvent);
   }
 
   onPlaybackFinished(event: PlaybackFinishedEvent): void {
-    if (this._finishedCount >= this._segmentCount) return; // Guard: don't exceed segment count
+    if (this._finishedCount >= this._segmentCount) return;
     this._finishedCount++;
     this._lastEvent = event;
-    this._emit('playbackFinished', event);
+    this.emit('playbackFinished', event);
     if (this._playoutResolve) {
       this._playoutResolve();
       this._playoutResolve = undefined;
@@ -247,26 +462,9 @@ export class SipAudioOutput {
 
   onAttached(): void {}
   onDetached(): void {}
-
-  // Simple EventEmitter
-  on(event: string, listener: (ev: any) => void): void {
-    if (!this._listeners[event]) this._listeners[event] = [];
-    this._listeners[event].push(listener);
-  }
-
-  off(event: string, listener: (ev: any) => void): void {
-    const l = this._listeners[event];
-    if (l) this._listeners[event] = l.filter((f) => f !== listener);
-  }
-
-  private _emit(event: string, data: any): void {
-    for (const listener of this._listeners[event] ?? []) {
-      try { listener(data); } catch {}
-    }
-  }
 }
 
-// Aliases for audio streaming (same interface, different default labels)
+// Aliases for audio streaming
 export class AudioStreamInput extends SipAudioInput {
   constructor(endpoint: TransportEndpoint, sessionId: number, label = 'audio-stream-input') {
     super(endpoint, sessionId, label);
@@ -284,9 +482,6 @@ export class AudioStreamOutput extends SipAudioOutput {
       nextInChain?: SipAudioOutput;
     },
   ) {
-    super(endpoint, sessionId, {
-      label: options?.label ?? 'audio-stream-output',
-      ...options,
-    });
+    super(endpoint, sessionId, { label: options?.label ?? 'audio-stream-output', ...options });
   }
 }

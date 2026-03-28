@@ -19,6 +19,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Coroutine
 
+from livekit import rtc
 from livekit.rtc.event_emitter import EventEmitter
 from livekit.rtc.room import SipDTMF
 
@@ -74,6 +75,7 @@ class _TransportLocalParticipant:
         self.permissions = None
         self.disconnect_reason = None
         self.track_publications: dict[str, _StubTrackPublication] = {}
+        self._track_forward_tasks: dict[str, asyncio.Task] = {}
 
     # ─── Real implementations (mapped to endpoint) ───────────────────────
 
@@ -81,15 +83,65 @@ class _TransportLocalParticipant:
         """Send DTMF — maps to ep.send_dtmf()."""
         self._ep.send_dtmf(self._sid, digit)
 
-    # ─── Stubs (audio path handled by AudioOutput, not publish_track) ────
-
     async def publish_track(self, track, options=None):
+        """Publish a track — reads audio from it and mixes into our transport.
+
+        For audio tracks (e.g., BackgroundAudioPlayer), creates an AudioStream
+        to read frames from the track and forwards them to the Rust endpoint's
+        background mixer. This is transparent — same API as LiveKit WebRTC.
+        """
         pub = _StubTrackPublication(track)
         self.track_publications[pub.sid] = pub
+
+        # For audio tracks, start forwarding frames to our endpoint's mixer
+        if track is not None and isinstance(track, rtc.LocalAudioTrack):
+            task = asyncio.create_task(
+                self._forward_track_audio(pub.sid, track))
+            self._track_forward_tasks[pub.sid] = task
+
         return pub
 
     async def unpublish_track(self, track_sid: str) -> None:
+        """Stop publishing a track — cancels the forwarding task."""
         self.track_publications.pop(track_sid, None)
+        task = self._track_forward_tasks.pop(track_sid, None)
+        if task and not task.done():
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+
+    async def _forward_track_audio(self, pub_sid: str, track: rtc.LocalAudioTrack) -> None:
+        """Read frames from a published audio track and send to endpoint's background mixer.
+
+        Creates an rtc.AudioStream from the local track (loopback read),
+        resamples to 16kHz, and forwards to ep.send_background_audio().
+        Rust send loop mixes this with agent voice before encoding.
+        """
+        try:
+            stream = rtc.AudioStream.from_track(
+                track=track, sample_rate=16000, num_channels=1)
+            logger.debug("Forwarding published track %s to background mixer", pub_sid)
+
+            async for event in stream:
+                frame = event.frame
+                if frame.samples_per_channel > 0 and self._ep is not None:
+                    try:
+                        self._ep.send_background_audio(
+                            self._sid,
+                            bytes(frame.data),
+                            frame.sample_rate,
+                            frame.num_channels,
+                        )
+                    except Exception:
+                        break  # Session gone
+
+            await stream.aclose()
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            logger.debug("Track forwarding ended for %s", pub_sid)
 
     async def publish_transcription(self, transcription) -> None:
         pass  # Transcription goes through AudioOutput text chain

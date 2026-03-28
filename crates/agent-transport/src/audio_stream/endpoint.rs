@@ -101,7 +101,8 @@ struct StreamSession {
     ws_tx: tokio::sync::mpsc::UnboundedSender<Message>,
     incoming_tx: Sender<AudioFrame>,
     incoming_rx: Receiver<AudioFrame>,
-    audio_buf: Arc<AudioBuffer>,  // Shared audio buffer with backpressure (same as SIP)
+    audio_buf: Arc<AudioBuffer>,  // Agent voice audio with backpressure
+    bg_audio_buf: Arc<AudioBuffer>,  // Background audio (mixed in send loop)
     extra_headers: HashMap<String, String>,
     encoding: AudioEncoding,
     // Audio control flags (same as SIP RTP transport)
@@ -160,6 +161,19 @@ impl AudioStreamEndpoint {
     /// Send audio frame — simple, no backpressure callback.
     pub fn send_audio(&self, session_id: i32, frame: &AudioFrame) -> Result<()> {
         self.send_audio_with_callback(session_id, frame, Box::new(|| {}))
+    }
+
+    /// Send background audio to be mixed with agent voice in the send loop.
+    /// Used by publish_track (background audio, hold music, etc.).
+    /// No backpressure — background audio is best-effort.
+    pub fn send_background_audio(&self, session_id: i32, frame: &AudioFrame) -> Result<()> {
+        let bg_buf = {
+            let s = self.sessions.lock().unwrap();
+            let sess = s.get(&session_id).ok_or(EndpointError::CallNotActive(session_id))?;
+            sess.bg_audio_buf.clone()
+        };
+        bg_buf.push(&frame.data, Box::new(|| {}))
+            .map_err(|e| EndpointError::Other(e.into()))
     }
 
     /// Mute outgoing audio (send silence, preserve queue).
@@ -385,8 +399,9 @@ async fn handle_ws(ws: tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>
                                 }
                             }
 
-                            // Create AudioBuffer + control flags (same pattern as SIP)
+                            // Create AudioBuffers + control flags (same pattern as SIP)
                             let audio_buf = Arc::new(AudioBuffer::new());
+                            let bg_audio_buf = Arc::new(AudioBuffer::new()); // Background audio (hold music, ambient)
                             let muted = Arc::new(AtomicBool::new(false));
                             let paused = Arc::new(AtomicBool::new(false));
                             let playout_notify = Arc::new((Mutex::new(false), Condvar::new()));
@@ -394,10 +409,11 @@ async fn handle_ws(ws: tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>
                             let session_cancel = CancellationToken::new();
 
                             // Spawn send loop — paces outgoing audio at 20ms intervals
-                            // Uses AudioBuffer.drain() matching SIP's RTP send loop pattern
+                            // Mixes agent voice + background audio before encoding
                             let enc = encoding;
                             let wstx = ws_tx.clone();
                             let ab = audio_buf.clone();
+                            let bg = bg_audio_buf.clone();
                             let (m, p, pn) = (muted.clone(), paused.clone(), playout_notify.clone());
                             let sc = session_cancel.clone();
                             let input_spf: usize = 320; // 16kHz × 20ms = 320 samples per frame
@@ -411,14 +427,33 @@ async fn handle_ws(ws: tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>
                                     tokio::select! { _ = sc.cancelled() => break, _ = iv.tick() => {} }
                                     if p.load(Ordering::Relaxed) { continue; }
 
-                                    // Drain exactly input_spf samples from AudioBuffer.
-                                    // This also fires any deferred completion callbacks if buffer
-                                    // dropped below threshold (matching SIP's RTP send loop).
-                                    let samples = ab.drain(input_spf);
+                                    // Drain agent voice + background audio
+                                    let voice = ab.drain(input_spf);
+                                    let bg_samples = bg.drain(input_spf);
 
-                                    if !samples.is_empty() {
+                                    // Mix: add samples, clamp to i16 range
+                                    let has_voice = !voice.is_empty();
+                                    let has_bg = !bg_samples.is_empty();
+
+                                    if has_voice || has_bg {
+                                        let mixed = if has_voice && has_bg {
+                                            // Mix voice + background
+                                            let len = voice.len().max(bg_samples.len());
+                                            let mut out = Vec::with_capacity(len);
+                                            for i in 0..len {
+                                                let v = if i < voice.len() { voice[i] as i32 } else { 0 };
+                                                let b = if i < bg_samples.len() { bg_samples[i] as i32 } else { 0 };
+                                                out.push((v + b).clamp(-32768, 32767) as i16);
+                                            }
+                                            out
+                                        } else if has_voice {
+                                            voice
+                                        } else {
+                                            bg_samples
+                                        };
+
                                         if !m.load(Ordering::Relaxed) {
-                                            let payload = encode_for_plivo(&samples, enc, &mut downsampler);
+                                            let payload = encode_for_plivo(&mixed, enc, &mut downsampler);
                                             let b64 = base64::engine::general_purpose::STANDARD.encode(&payload);
                                             let json = serde_json::to_string(&serde_json::json!({
                                                 "event": "playAudio",
@@ -426,7 +461,6 @@ async fn handle_ws(ws: tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>
                                             })).unwrap_or_default();
                                             let _ = wstx.send(Message::Text(json));
                                         }
-                                        // Muted — frame consumed by drain but not sent
                                     } else {
                                         // No audio — notify playout completion
                                         if ab.is_empty() {
@@ -439,7 +473,7 @@ async fn handle_ws(ws: tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>
                             sessions.lock().unwrap().insert(sid, StreamSession {
                                 call_id: start.call_id.clone(), stream_id: start.stream_id.clone(),
                                 ws_tx: ws_tx.clone(), incoming_tx: itx.clone(), incoming_rx: irx.clone(),
-                                audio_buf, extra_headers: headers.clone(), encoding,
+                                audio_buf, bg_audio_buf, extra_headers: headers.clone(), encoding,
                                 muted, paused, playout_notify,
                                 checkpoint_counter: AtomicU64::new(0), checkpoint_notify: cp_notify,
                                 cancel: session_cancel,

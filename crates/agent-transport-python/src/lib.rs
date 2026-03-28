@@ -481,6 +481,12 @@ impl SipEndpoint {
         py.allow_threads(move || inner.send_audio(call_id, &frame)).map_err(py_err)
     }
 
+    /// Send background audio to be mixed with agent voice in the RTP send loop.
+    fn send_background_audio(&self, call_id: i32, audio: &[u8], sample_rate: u32, num_channels: u32) -> PyResult<()> {
+        let frame = RustAudioFrame::from_bytes(audio, sample_rate, num_channels);
+        self.inner.send_background_audio(call_id, &frame).map_err(py_err)
+    }
+
     /// Receive an audio frame (non-blocking, returns None if no frame ready).
     fn recv_audio(&self, call_id: i32) -> PyResult<Option<AudioFrame>> {
         self.inner
@@ -728,6 +734,13 @@ impl AudioStreamEndpoint {
         let inner = &self.inner;
         py.allow_threads(move || inner.send_audio_with_callback(session_id, &frame, callback))
             .map_err(py_err)
+    }
+
+    /// Send background audio to be mixed with agent voice in the send loop.
+    /// Used internally by publish_track (background audio, hold music).
+    fn send_background_audio(&self, session_id: i32, audio: &[u8], sample_rate: u32, num_channels: u32) -> PyResult<()> {
+        let frame = RustAudioFrame::from_bytes(audio, sample_rate, num_channels);
+        self.inner.send_background_audio(session_id, &frame).map_err(py_err)
     }
 
     fn recv_audio(&self, session_id: i32) -> PyResult<Option<AudioFrame>> {

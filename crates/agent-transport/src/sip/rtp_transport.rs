@@ -71,7 +71,7 @@ impl RtpTransport {
 
     /// Start the RTP send loop. Drains from the shared AudioBuffer every ptime_ms.
     /// Matches WebRTC C++ InternalSource::audio_task_ (10ms repeating task).
-    pub fn start_send_loop(self: &Arc<Self>, audio_buf: Arc<AudioBuffer>, muted: Arc<AtomicBool>, paused: Arc<AtomicBool>, playout: Arc<(Mutex<bool>, Condvar)>, recorder: Option<Arc<CallRecorder>>) -> tokio::task::JoinHandle<()> {
+    pub fn start_send_loop(self: &Arc<Self>, audio_buf: Arc<AudioBuffer>, bg_audio_buf: Arc<AudioBuffer>, muted: Arc<AtomicBool>, paused: Arc<AtomicBool>, playout: Arc<(Mutex<bool>, Condvar)>, recorder: Option<Arc<CallRecorder>>) -> tokio::task::JoinHandle<()> {
         let t = Arc::clone(self);
         tokio::spawn(async move {
             let mut iv = tokio::time::interval(Duration::from_millis(t.ptime_ms as u64));
@@ -105,10 +105,26 @@ impl RtpTransport {
                     continue;
                 }
 
-                // Drain exactly input_spf samples from the shared AudioBuffer.
-                // This also fires any deferred completion callbacks if buffer
-                // dropped below threshold (matching WebRTC's audio_task_).
-                let samples = audio_buf.drain(input_spf);
+                // Drain agent voice + background audio and mix
+                let voice = audio_buf.drain(input_spf);
+                let bg_samples = bg_audio_buf.drain(input_spf);
+
+                let has_voice = !voice.is_empty();
+                let has_bg = !bg_samples.is_empty();
+                let samples = if has_voice && has_bg {
+                    let len = voice.len().max(bg_samples.len());
+                    let mut out = Vec::with_capacity(len);
+                    for i in 0..len {
+                        let v = if i < voice.len() { voice[i] as i32 } else { 0 };
+                        let b = if i < bg_samples.len() { bg_samples[i] as i32 } else { 0 };
+                        out.push((v + b).clamp(-32768, 32767) as i16);
+                    }
+                    out
+                } else if has_voice {
+                    voice
+                } else {
+                    bg_samples
+                };
 
                 if !samples.is_empty() {
                     // Record agent audio (16kHz, before downsample)

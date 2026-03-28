@@ -503,6 +503,13 @@ impl SipEndpoint {
         self.inner.send_audio(call_id, &frame).map_err(napi_err)
     }
 
+    /// Send background audio to be mixed with agent voice in the RTP send loop.
+    #[napi]
+    pub fn send_background_audio(&self, call_id: i32, audio: Vec<u8>, sample_rate: u32, num_channels: u32) -> Result<()> {
+        let f = RustAudioFrame::from_bytes(&audio, sample_rate, num_channels);
+        self.inner.send_background_audio(call_id, &f).map_err(napi_err)
+    }
+
     /// Send raw PCM bytes with async completion notification (backpressure).
     /// The callback fires when the buffer drains below threshold.
     /// Matches Python's send_audio_notify pattern.
@@ -741,6 +748,13 @@ impl AudioStreamEndpoint {
     pub fn send_audio_bytes(&self, session_id: i32, audio: Vec<u8>, sample_rate: u32, num_channels: u32) -> Result<()> {
         let f = RustAudioFrame::from_bytes(&audio, sample_rate, num_channels);
         self.inner.send_audio(session_id, &f).map_err(napi_err)
+    }
+
+    /// Send background audio to be mixed with agent voice in the send loop.
+    #[napi]
+    pub fn send_background_audio(&self, session_id: i32, audio: Vec<u8>, sample_rate: u32, num_channels: u32) -> Result<()> {
+        let f = RustAudioFrame::from_bytes(&audio, sample_rate, num_channels);
+        self.inner.send_background_audio(session_id, &f).map_err(napi_err)
     }
 
     /// Send raw PCM bytes with async completion notification (backpressure).
