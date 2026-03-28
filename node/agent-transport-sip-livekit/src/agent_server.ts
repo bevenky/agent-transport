@@ -20,7 +20,7 @@ import { cpus } from 'node:os';
 import { hostname } from 'node:os';
 import { mkdirSync } from 'node:fs';
 import { SipEndpoint } from 'agent-transport';
-import { CallContext } from './call_context.js';
+import { JobContext } from './call_context.js';
 
 export interface AgentServerOptions {
   sipServer?: string;
@@ -36,7 +36,7 @@ export interface AgentServerOptions {
   auth?: (req: IncomingMessage) => boolean | Promise<boolean>;
 }
 
-type EntrypointFn = (ctx: CallContext) => Promise<void>;
+type EntrypointFn = (ctx: JobContext) => Promise<void>;
 type SetupFn = () => Record<string, unknown>;
 
 /**
@@ -322,7 +322,7 @@ export class AgentServer {
     const callEntry: { promise: Promise<void>; resolveEnded: () => void; room?: any } = { promise: Promise.resolve(), resolveEnded };
     this.activeCalls.set(callId, callEntry);
 
-    const ctx = new CallContext({
+    const ctx = new JobContext({
       callId,
       remoteUri,
       direction,

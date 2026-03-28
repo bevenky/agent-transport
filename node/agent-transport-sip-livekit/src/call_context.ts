@@ -1,5 +1,5 @@
 /**
- * CallContext — equivalent of LiveKit's JobContext for SIP/AudioStream calls.
+ * JobContext — equivalent of LiveKit's JobContext for SIP/AudioStream calls.
  *
  * Matches LiveKit's standard pattern exactly:
  *   server.sipSession(async (ctx) => {
@@ -18,7 +18,7 @@ import { SipAudioInput } from './sip_audio_input.js';
 import { SipAudioOutput } from './sip_audio_output.js';
 import { TransportRoom } from '../../adapters/livekit.js';
 
-export interface CallContextOptions {
+export interface JobContextOptions {
   callId: string;
   remoteUri: string;
   direction: 'inbound' | 'outbound';
@@ -29,7 +29,7 @@ export interface CallContextOptions {
   resolveCallEnded: () => void;
 }
 
-export class CallContext {
+export class JobContext {
   readonly callId: string;
   readonly remoteUri: string;
   readonly direction: 'inbound' | 'outbound';
@@ -41,7 +41,7 @@ export class CallContext {
   private _callEnded: Promise<void>;
   private _resolveCallEnded: () => void;
 
-  constructor(opts: CallContextOptions) {
+  constructor(opts: JobContextOptions) {
     this.callId = opts.callId;
     this.remoteUri = opts.remoteUri;
     this.direction = opts.direction;

@@ -25,7 +25,7 @@
  *   npx ts-node examples/livekit/audio_stream_agent.ts dev
  */
 
-import { AgentServer, type CallContext } from '@agent-transport/sip-livekit';
+import { AgentServer, type JobContext } from '@agent-transport/sip-livekit';
 import { voice, llm, metrics } from '@livekit/agents';
 import { getJobContext } from '@livekit/agents';
 import * as deepgram from '@livekit/agents-plugin-deepgram';
@@ -75,7 +75,7 @@ const agent = new voice.Agent({
   },
 });
 
-server.sipSession(async (ctx: CallContext) => {
+server.sipSession(async (ctx: JobContext) => {
   const session = new voice.AgentSession({
     vad: ctx.userdata.vad as silero.VAD,
     stt: new deepgram.STT({ model: 'nova-3' }),

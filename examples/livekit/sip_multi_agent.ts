@@ -11,7 +11,7 @@
  *   npx ts-node examples/livekit/sip_multi_agent.ts dev
  */
 
-import { AgentServer, type CallContext } from '@agent-transport/sip-livekit';
+import { AgentServer, type JobContext } from '@agent-transport/sip-livekit';
 import { voice, llm, metrics, getJobContext } from '@livekit/agents';
 import * as deepgram from '@livekit/agents-plugin-deepgram';
 import * as openai from '@livekit/agents-plugin-openai';
@@ -212,7 +212,7 @@ class SupportAgent extends voice.Agent<CallData> {
 
 // ─── Server ──────────────────────────────────────────────────────
 
-server.sipSession(async (ctx: CallContext) => {
+server.sipSession(async (ctx: JobContext) => {
   const session = new voice.AgentSession<CallData>({
     vad: ctx.userdata.vad as silero.VAD,
     stt: new deepgram.STT({ model: 'nova-3' }),
