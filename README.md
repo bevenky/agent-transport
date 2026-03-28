@@ -16,24 +16,24 @@ Both transports produce and consume the same `AudioFrame` format (int16 PCM, 16k
 
 ### LiveKit Agents
 
-Same `AgentSession` pipeline — replace `AgentServer` + `room=ctx.room` with `AgentServer` + `ctx.start()`:
+Same `AgentSession` pipeline — add `ctx.session = session` to wire SIP/audio stream transport:
 
 ```python
-# LiveKit WebRTC                              # Agent Transport SIP/RTP
-from livekit.agents import AgentServer        from agent_transport.sip.livekit import AgentServer
-server = AgentServer()                         server = AgentServer(sip_username=..., sip_password=...)
+# LiveKit WebRTC                                # Agent Transport SIP/RTP
+from livekit.agents import AgentServer          from agent_transport.sip.livekit import AgentServer
+server = AgentServer()                          server = AgentServer(sip_username=..., sip_password=...)
 
-@server.rtc_session()                          @server.sip_session()
-async def entrypoint(ctx):                     async def entrypoint(ctx):
-    session = AgentSession(...)                    session = AgentSession(...)
-    await session.start(                           ctx.session = session
-    await session.start(agent=Assistant(), room=ctx.room)
-        agent=Assistant(), room=ctx.room)
-
-cli.run_app(server)                            server.run()
+@server.rtc_session()                           @server.sip_session()
+async def entrypoint(ctx):                      async def entrypoint(ctx):
+    session = AgentSession(...)                     session = AgentSession(...)
+    await session.start(                            ctx.session = session  # wires SIP audio I/O
+        agent=Assistant(),                          await session.start(
+        room=ctx.room)                                  agent=Assistant(),
+                                                        room=ctx.room)
+cli.run_app(server)                             server.run()
 ```
 
-Full examples: [`sip_agent.py`](examples/livekit/sip_agent.py) · [`sip_multi_agent.py`](examples/livekit/sip_multi_agent.py)
+Full examples: [`sip_agent.py`](examples/livekit/sip_agent.py) · [`sip_multi_agent.py`](examples/livekit/sip_multi_agent.py) · [`audio_stream_agent.py`](examples/livekit/audio_stream_agent.py)
 
 See [LiveKit SIP Transport docs](docs/livekit_interface_sip.md) for recording, Prometheus metrics, outbound API, and full reference.
 
