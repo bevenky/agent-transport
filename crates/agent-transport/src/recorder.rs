@@ -332,3 +332,102 @@ impl RecordingManager {
 impl Drop for RecordingManager {
     fn drop(&mut self) { self.shutdown(); }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn test_ogg_opus_recording() {
+        let path = "/tmp/agent_transport_test_recording.ogg";
+
+        // Clean up from previous run
+        let _ = std::fs::remove_file(path);
+
+        let mgr = RecordingManager::new();
+        let rec = mgr.start("test-call", path, RecordingMode::Stereo, 16000);
+
+        // Generate 3 seconds of test audio (440Hz user, 880Hz agent)
+        let sr = 16000.0_f64;
+        let chunk_size = 320; // 20ms at 16kHz
+        let total_chunks = 150; // 3 seconds
+
+        for chunk_idx in 0..total_chunks {
+            let mut user = Vec::with_capacity(chunk_size);
+            let mut agent = Vec::with_capacity(chunk_size);
+            for i in 0..chunk_size {
+                let t = (chunk_idx * chunk_size + i) as f64 / sr;
+                user.push(((2.0 * std::f64::consts::PI * 440.0 * t).sin() * 16000.0) as i16);
+                agent.push(((2.0 * std::f64::consts::PI * 880.0 * t).sin() * 16000.0) as i16);
+            }
+            rec.write_user_samples(&user);
+            rec.write_agent_samples(&agent);
+        }
+
+        // Wait for encoder batch (2.5s interval)
+        std::thread::sleep(Duration::from_millis(3000));
+
+        // Stop recording — triggers final flush
+        mgr.stop("test-call");
+
+        // Wait for final batch
+        std::thread::sleep(Duration::from_millis(3000));
+
+        // Shutdown encoder thread
+        mgr.shutdown();
+        std::thread::sleep(Duration::from_millis(500));
+
+        // Verify output
+        let p = Path::new(path);
+        assert!(p.exists(), "OGG file should exist");
+
+        let data = std::fs::read(p).unwrap();
+        assert!(data.len() > 100, "OGG file should have content (got {} bytes)", data.len());
+        assert_eq!(&data[0..4], b"OggS", "Should have OGG magic header");
+
+        // Check for Opus headers
+        let content = String::from_utf8_lossy(&data);
+        assert!(content.contains("OpusHead"), "Should contain OpusHead");
+        assert!(content.contains("OpusTags"), "Should contain OpusTags");
+        assert!(content.contains("agent-transport"), "Should contain vendor string");
+
+        println!("OGG file: {} bytes ({:.1} KB)", data.len(), data.len() as f64 / 1024.0);
+
+        // Clean up
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_late_binding_recorder() {
+        // Verify the Arc<Mutex<Option>> pattern works
+        let recorder: Arc<Mutex<Option<Arc<CallRecorder>>>> = Arc::new(Mutex::new(None));
+
+        // Clone for "send loop"
+        let rec_ref = recorder.clone();
+
+        // Initially empty
+        assert!(rec_ref.lock().unwrap().is_none());
+
+        // "start_recording" sets it later
+        let mgr = RecordingManager::new();
+        let call_rec = mgr.start("late-test", "/tmp/late_test.ogg", RecordingMode::Mono, 16000);
+        *recorder.lock().unwrap() = Some(call_rec);
+
+        // Now the "send loop" can see it
+        assert!(rec_ref.lock().unwrap().is_some());
+
+        // Write some samples through the shared reference
+        if let Some(ref rec) = *rec_ref.lock().unwrap() {
+            rec.write_agent_samples(&[100, 200, 300]);
+            rec.write_user_samples(&[400, 500, 600]);
+        }
+
+        // Cleanup
+        mgr.stop("late-test");
+        mgr.shutdown();
+        std::thread::sleep(Duration::from_millis(3500));
+        let _ = std::fs::remove_file("/tmp/late_test.ogg");
+    }
+}
+
