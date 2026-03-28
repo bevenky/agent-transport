@@ -1,8 +1,14 @@
 /**
- * SipAudioInput — drop-in replacement for LiveKit's ParticipantAudioInputStream.
+ * SipAudioInput — implements LiveKit's AudioInput interface for SIP/AudioStream.
  *
- * Implements the AudioInput interface (duck-typed — base class is not publicly exported).
- * Creates a ReadableStream of AudioFrame from SIP/RTP that AgentSession reads from.
+ * Duck-types LiveKit's AudioInput (not publicly exported from @livekit/agents).
+ * Provides the same interface:
+ * - stream: ReadableStream<AudioFrame> (consumed by AgentSession pipeline)
+ * - close(): Promise<void>
+ * - onAttached() / onDetached()
+ *
+ * Creates a ReadableStream from the Rust endpoint's recv_audio_bytes_async.
+ * On stream end, pushes 0.5s silence to flush STT (matches LiveKit pattern).
  */
 
 import { AudioFrame } from '@livekit/rtc-node';
@@ -20,29 +26,36 @@ export class SipAudioInput {
     this.endpoint = endpoint;
     this.callId = callId;
 
+    // Create ReadableStream that AgentSession will consume
+    const self = this;
     this._stream = new ReadableStream<AudioFrame>({
-      pull: async (controller) => {
-        if (this.closed) {
-          this.pushSilenceAndClose(controller);
+      async pull(controller) {
+        if (self.closed) {
+          self.pushSilenceAndClose(controller);
           return;
         }
 
         try {
-          const bytes: Buffer | null = await this.endpoint.recvAudioBytesAsync(this.callId, 20);
-          if (bytes && this.attached) {
+          const bytes: Buffer | null = await self.endpoint.recvAudioBytesAsync(self.callId, 20);
+          if (!bytes || self.closed) {
+            self.pushSilenceAndClose(controller);
+            return;
+          }
+
+          if (self.attached) {
             const samplesPerChannel = bytes.length / 2;
             const data = new Int16Array(bytes.buffer, bytes.byteOffset, samplesPerChannel);
             controller.enqueue(new AudioFrame(data, 16000, 1, samplesPerChannel));
 
-            this.frameCount++;
-            if (this.frameCount === 1) {
+            self.frameCount++;
+            if (self.frameCount === 1) {
               console.log(`SipAudioInput: first frame received sr=16000 samples=${samplesPerChannel}`);
-            } else if (this.frameCount % 250 === 0) {
-              console.log(`SipAudioInput: ${this.frameCount} frames forwarded (${(this.frameCount * 0.02).toFixed(1)}s)`);
+            } else if (self.frameCount % 250 === 0) {
+              console.log(`SipAudioInput: ${self.frameCount} frames forwarded (${(self.frameCount * 0.02).toFixed(1)}s)`);
             }
           }
         } catch {
-          this.pushSilenceAndClose(controller);
+          self.pushSilenceAndClose(controller);
         }
       },
     });
@@ -50,13 +63,14 @@ export class SipAudioInput {
 
   private pushSilenceAndClose(controller: ReadableStreamDefaultController<AudioFrame>) {
     try {
-      const silentSamples = 8000; // 0.5s at 16kHz — flushes STT
+      // Push 0.5s silence to flush STT (matches LiveKit _ParticipantAudioInputStream)
+      const silentSamples = 8000; // 0.5s at 16kHz
       controller.enqueue(new AudioFrame(new Int16Array(silentSamples), 16000, 1, silentSamples));
     } catch { /* stream already closed */ }
     try { controller.close(); } catch { /* already closed */ }
   }
 
-  /** ReadableStream consumed by AgentSession pipeline. */
+  /** ReadableStream consumed by AgentSession pipeline. Matches AudioInput.stream */
   get stream(): ReadableStream<AudioFrame> {
     return this._stream;
   }

@@ -1,11 +1,17 @@
 /**
- * SipAudioOutput — drop-in replacement for LiveKit's ParticipantAudioOutput.
+ * SipAudioOutput — implements LiveKit's AudioOutput interface for SIP/AudioStream.
  *
- * Implements the AudioOutput interface (duck-typed — base class is not publicly exported).
- * Matches ParticipantAudioOutput's behavior exactly:
- * - captureFrame() with segment tracking and backpressure
- * - flush() creates waitForPlayout task that races completion vs interruption
- * - clearBuffer() resolves interruptedFuture
+ * Duck-types LiveKit's AudioOutput (not publicly exported from @livekit/agents).
+ * Implements the exact same interface including:
+ * - Segment counting (playbackSegmentsCount / playbackFinishedCount)
+ * - captureFrame() with backpressure via sendAudioNotify
+ * - flush() → waitForPlayout task racing completion vs interruption
+ * - clearBuffer() → interrupt + onPlaybackFinished
+ * - onPlaybackStarted / onPlaybackFinished events
+ * - pause() / resume() / onAttached() / onDetached()
+ * - nextInChain support for middleware stacking
+ *
+ * Playout timing replaces rtc.AudioSource (tracks queue depth for position).
  */
 
 import { EventEmitter } from 'node:events';
@@ -19,6 +25,7 @@ export interface PlaybackStartedEvent {
 export interface PlaybackFinishedEvent {
   playbackPosition: number;
   interrupted: boolean;
+  synchronizedTranscript?: string;
 }
 
 class Future<T = void> {
@@ -49,35 +56,45 @@ export class SipAudioOutput extends EventEmitter {
   private callId: string;
   readonly sampleRate: number;
   readonly capabilities = { pause: true };
+  readonly nextInChain?: SipAudioOutput;
 
-  // Matches ParticipantAudioOutput fields
+  // Playout state (matches ParticipantAudioOutput)
   private pushedDuration = 0;
   private interruptedFuture = new Future();
   private firstFrameEmitted = false;
   private flushAbortController: AbortController | null = null;
 
-  // Playout timing (replaces audioSource internal tracking)
+  // Playout timing (replaces rtc.AudioSource internal tracking)
   private lastCapture = 0;
   private qSize = 0;
   private playoutTimer: ReturnType<typeof setTimeout> | null = null;
   private playoutFuture: Future | null = null;
 
-  // Segment tracking (reimplements AudioOutput base class)
+  // Segment tracking (matches AudioOutput base class exactly)
   private _capturing = false;
   private playbackFinishedFuture = new Future();
   private playbackFinishedCount = 0;
   private playbackSegmentsCount = 0;
   private lastPlaybackEvent: PlaybackFinishedEvent = { playbackPosition: 0, interrupted: false };
 
-  constructor(endpoint: SipEndpoint, callId: string, sampleRate?: number) {
+  constructor(endpoint: SipEndpoint, callId: string, sampleRate?: number, nextInChain?: SipAudioOutput) {
     super();
     this.endpoint = endpoint;
     this.callId = callId;
     this.sampleRate = sampleRate ?? endpoint.sampleRate;
+    this.nextInChain = nextInChain;
+
+    // Chain event forwarding (matches AudioOutput base class)
+    if (this.nextInChain) {
+      this.nextInChain.on(SipAudioOutput.EVENT_PLAYBACK_STARTED, (ev: PlaybackStartedEvent) =>
+        this.onPlaybackStarted(ev.createdAt));
+      this.nextInChain.on(SipAudioOutput.EVENT_PLAYBACK_FINISHED, (ev: PlaybackFinishedEvent) =>
+        this.onPlaybackFinished(ev));
+    }
   }
 
   get canPause(): boolean {
-    return true;
+    return this.capabilities.pause && (this.nextInChain?.canPause ?? true);
   }
 
   get queuedDuration(): number {
@@ -85,16 +102,16 @@ export class SipAudioOutput extends EventEmitter {
   }
 
   /**
-   * Capture an audio frame — matches ParticipantAudioOutput.captureFrame.
+   * captureFrame — matches AudioOutput.captureFrame + ParticipantAudioOutput pattern.
    */
   async captureFrame(frame: AudioFrame): Promise<void> {
-    // Segment tracking (same as base class)
+    // Segment tracking (same as AudioOutput base class)
     if (!this._capturing) {
       this._capturing = true;
       this.playbackSegmentsCount++;
     }
 
-    // Timing math (replaces audioSource internal tracking)
+    // Timing math (replaces rtc.AudioSource internal tracking)
     const now = performance.now() / 1000;
     const elapsed = this.lastCapture === 0 ? 0 : now - this.lastCapture;
     this.qSize += frame.samplesPerChannel / this.sampleRate - elapsed;
@@ -131,7 +148,7 @@ export class SipAudioOutput extends EventEmitter {
   }
 
   /**
-   * Flush — matches ParticipantAudioOutput.flush.
+   * flush — matches AudioOutput.flush + ParticipantAudioOutput._waitForPlayout.
    */
   flush(): void {
     this._capturing = false;
@@ -147,13 +164,17 @@ export class SipAudioOutput extends EventEmitter {
   }
 
   /**
-   * waitForPlayoutTask — matches ParticipantAudioOutput.waitForPlayoutTask.
+   * clearBuffer — matches AudioOutput.clearBuffer. Triggers interruption.
    */
-  private async waitForPlayoutTask(abortController: AbortController): Promise<void> {
-    const abortFuture = new Future<boolean>();
-    const resolveAbort = () => { if (!abortFuture.done) abortFuture.resolve(true); };
-    abortController.signal.addEventListener('abort', resolveAbort);
+  clearBuffer(): void {
+    if (!this.pushedDuration) return;
+    this.interruptedFuture.resolve();
+  }
 
+  /**
+   * waitForPlayoutTask — races playout completion vs interruption.
+   */
+  private async waitForPlayoutTask(_abortController: AbortController): Promise<void> {
     const waitPlayout = async (): Promise<boolean> => {
       if (this.playoutFuture) await this.playoutFuture.await;
       return false;
@@ -163,8 +184,6 @@ export class SipAudioOutput extends EventEmitter {
       waitPlayout(),
       this.interruptedFuture.await.then(() => true),
     ]);
-
-    abortController.signal.removeEventListener('abort', resolveAbort);
 
     let pushedDuration = this.pushedDuration;
     if (interrupted) {
@@ -180,14 +199,6 @@ export class SipAudioOutput extends EventEmitter {
     this.onPlaybackFinished({ playbackPosition: pushedDuration, interrupted });
   }
 
-  /**
-   * clearBuffer — matches ParticipantAudioOutput.clearBuffer.
-   */
-  clearBuffer(): void {
-    if (!this.pushedDuration) return;
-    this.interruptedFuture.resolve();
-  }
-
   private releaseWaiter(): void {
     if (!this.playoutFuture) return;
     this.playoutFuture.resolve();
@@ -196,14 +207,17 @@ export class SipAudioOutput extends EventEmitter {
     this.playoutFuture = null;
   }
 
-  // ─── Base class methods (reimplemented since AudioOutput is not exported) ──
+  // ─── AudioOutput base class interface (segment tracking + events) ──────
 
   onPlaybackStarted(createdAt: number): void {
     this.emit(SipAudioOutput.EVENT_PLAYBACK_STARTED, { createdAt } satisfies PlaybackStartedEvent);
   }
 
   onPlaybackFinished(ev: PlaybackFinishedEvent): void {
-    if (this.playbackFinishedCount >= this.playbackSegmentsCount) return;
+    if (this.playbackFinishedCount >= this.playbackSegmentsCount) {
+      console.warn('playback_finished called more times than playback segments were captured');
+      return;
+    }
     this.lastPlaybackEvent = ev;
     this.playbackFinishedCount++;
     this.playbackFinishedFuture.resolve();
@@ -221,16 +235,24 @@ export class SipAudioOutput extends EventEmitter {
 
   pause(): void {
     this.endpoint.pause(this.callId);
+    this.nextInChain?.pause();
   }
 
   resume(): void {
     this.endpoint.resume(this.callId);
+    this.nextInChain?.resume();
   }
 
-  onAttached(): void {}
-  onDetached(): void {}
+  onAttached(): void {
+    this.nextInChain?.onAttached();
+  }
+
+  onDetached(): void {
+    this.nextInChain?.onDetached();
+  }
 
   async close(): Promise<void> {
     if (this.flushAbortController) this.flushAbortController.abort();
+    if (this.playoutTimer) clearTimeout(this.playoutTimer);
   }
 }
