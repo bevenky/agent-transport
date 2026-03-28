@@ -600,6 +600,8 @@ class AgentServer:
 
             elif ev_type == "call_terminated":
                 call_id = ev["session"].call_id
+                reason = ev.get("reason", "unknown")
+                logger.info("Call %s terminated (reason=%s)", call_id, reason)
 
                 # Clean up pending inbound if call died before media
                 pending_inbound.pop(call_id, None)

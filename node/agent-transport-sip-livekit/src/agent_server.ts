@@ -282,6 +282,8 @@ export class AgentServer {
 
       } else if (ev.eventType === 'call_terminated' && ev.session) {
         const callId = ev.session.callId;
+        const reason = ev.reason ?? 'unknown';
+        console.log(`Call ${callId} terminated (reason=${reason})`);
 
         // Clean up pending
         this.pendingInbound.delete(callId);

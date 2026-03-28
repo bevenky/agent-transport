@@ -533,6 +533,8 @@ class AudioStreamServer:
 
             elif ev_type == "call_terminated":
                 session_id = ev["session"].call_id
+                reason = ev.get("reason", "unknown")
+                logger.info("Session %s terminated (reason=%s)", session_id, reason)
                 if session_id in self._session_ended_events:
                     self._session_ended_events[session_id].set()
 
