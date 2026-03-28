@@ -327,9 +327,13 @@ class TransportRoom(EventEmitter):
     # ─── Session lifecycle ───────────────────────────────────────────────
 
     def _on_session_ended(self):
-        """Called when the call/stream ends — emit disconnect events."""
+        """Called when the call/stream ends — emit disconnected event.
+
+        participant_disconnected is emitted separately by the server event loop
+        when call_terminated arrives (matching LiveKit's RoomIO pattern where
+        the room fires participant_disconnected and RoomIO handles it).
+        """
         self._connected = False
-        self.emit("participant_disconnected", self._remote)
         self.emit("disconnected")
 
 

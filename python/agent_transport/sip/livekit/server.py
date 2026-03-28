@@ -246,8 +246,9 @@ class CallContext:
             if self._call_ended is not None:
                 await self._call_ended.wait()
         finally:
+            # Don't emit participant_disconnected here — already emitted by event loop
+            # on call_terminated. RoomIO.aclose() runs inside session._aclose_impl().
             from livekit.agents.job import _JobContextVar
-            self._room._on_session_ended()
             try:
                 _JobContextVar.reset(self._job_ctx_token)
             except ValueError:

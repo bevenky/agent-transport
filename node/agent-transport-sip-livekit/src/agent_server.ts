@@ -99,7 +99,7 @@ export class AgentServer {
   private setupFn?: SetupFn;
   private userdata: Record<string, unknown> = {};
   private ep?: SipEndpoint;
-  private activeCalls = new Map<number, { promise: Promise<void>; resolveEnded: () => void }>();
+  private activeCalls = new Map<string, { promise: Promise<void>; resolveEnded: () => void; room?: any }>();
   private httpServer?: Server;
   private loadMonitor = new LoadMonitor();
   private inferenceExecutor: any = null;
@@ -285,6 +285,13 @@ export class AgentServer {
         const reason = ev.reason ?? 'unknown';
         console.log(`Call ${callId} terminated (reason=${reason})`);
 
+        // Emit participant_disconnected on Room facade (matches LiveKit WebRTC)
+        // RoomIO._on_participant_disconnected will call _close_soon() → session closes
+        const active = this.activeCalls.get(callId);
+        if (active?.room) {
+          active.room.emitParticipantDisconnected();
+        }
+
         // Clean up pending
         this.pendingInbound.delete(callId);
         if (this.pendingOutbound.has(callId)) {
@@ -294,7 +301,6 @@ export class AgentServer {
         }
 
         // Signal active call to end
-        const active = this.activeCalls.get(callId);
         if (active) {
           active.resolveEnded();
         }
@@ -306,7 +312,7 @@ export class AgentServer {
     let resolveEnded!: () => void;
     const callEnded = new Promise<void>((r) => { resolveEnded = r; });
 
-    const callEntry = { promise: Promise.resolve(), resolveEnded };
+    const callEntry: { promise: Promise<void>; resolveEnded: () => void; room?: any } = { promise: Promise.resolve(), resolveEnded };
     this.activeCalls.set(callId, callEntry);
 
     const ctx = new CallContext({

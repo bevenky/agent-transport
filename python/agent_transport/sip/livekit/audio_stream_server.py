@@ -249,8 +249,10 @@ class AudioStreamCallContext:
                 await self._call_ended.wait()
         finally:
             from livekit.agents.job import _JobContextVar
-            self._room._on_session_ended()
-            _JobContextVar.reset(self._job_ctx_token)
+            try:
+                _JobContextVar.reset(self._job_ctx_token)
+            except ValueError:
+                pass
 
 
 # ─── AudioStreamServer ───────────────────────────────────────────────────────

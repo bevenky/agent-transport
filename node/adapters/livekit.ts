@@ -119,6 +119,7 @@ export class TransportRemoteParticipant {
   metadata = '';
   attributes: Record<string, string> = {};
   kind = 3; // PARTICIPANT_KIND_SIP
+  disconnect_reason: number | null = null;
   trackPublications: Record<string, any> = {};
 
   constructor(identity: string, callId: string) {
@@ -276,11 +277,18 @@ export class TransportRoom extends EventEmitter {
   registerByteStreamHandler(topic: string, handler: any): void {}
   unregisterByteStreamHandler(topic: string): void {}
 
-  /** Called when the call/stream ends — emit disconnect events. */
+  /** Called when the call/stream ends — emit disconnected event.
+   * participant_disconnected is emitted separately by the server event loop
+   * when call_terminated arrives (matching LiveKit WebRTC pattern). */
   _onSessionEnded(): void {
     this._connected = false;
-    this.emit('participant_disconnected', this._remote);
     this.emit('disconnected');
+  }
+
+  /** Emit participant_disconnected (called by server on call_terminated). */
+  emitParticipantDisconnected(): void {
+    this._remote.disconnect_reason = 1; // CLIENT_INITIATED
+    this.emit('participant_disconnected', this._remote);
   }
 
   /** Emit DTMF event (called by server event loop). */
