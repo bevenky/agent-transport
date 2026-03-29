@@ -39,32 +39,30 @@ See [LiveKit SIP Transport docs](docs/livekit_interface_sip.md) for recording, P
 
 ### Pipecat
 
-Replaces `FastAPIWebsocketTransport` + `PlivoFrameSerializer` with a Rust-backed transport. Same `Pipeline` and `BaseTransport` interface — Pipecat's `FastAPIWebsocketTransport` does audio pacing in Python; `AudioStreamTransport` moves WebSocket handling, codec negotiation, and 20ms audio pacing into Rust for lower jitter at high concurrency.
+Same `Pipeline` — swap transport, everything else stays identical. Audio pacing moves from Python to Rust:
 
 ```python
-from agent_transport.audio_stream.pipecat import AudioStreamServer, AudioStreamTransport
+# Pipecat + Plivo                                # Agent Transport (Rust audio pacing)
+from pipecat.serializers.plivo import             from agent_transport.audio_stream.pipecat import
+    PlivoFrameSerializer                              AudioStreamServer
+from pipecat.transports.websocket.fastapi import  server = AudioStreamServer()
+    FastAPIWebsocketTransport
+                                                  @server.handler()
+serializer = PlivoFrameSerializer(                async def run_bot(transport):
+    stream_id=..., call_id=...)                       pipeline = Pipeline([
+transport = FastAPIWebsocketTransport(                    transport.input(), stt, llm, tts,
+    websocket=ws, params=Params(                          transport.output()])
+        serializer=serializer))                       task = PipelineTask(pipeline)
+pipeline = Pipeline([
+    transport.input(), stt, llm, tts,                 @transport.event_handler("on_client_connected")
+    transport.output()])                              async def on_connected(transport):
+task = PipelineTask(pipeline)                             await task.queue_frames([LLMRunFrame()])
 
-server = AudioStreamServer()
+@transport.event_handler("on_client_connected")       await PipelineRunner().run(task)
+async def on_connected(transport, client):
+    await task.queue_frames([LLMRunFrame()])       server.run()
 
-@server.handler()
-async def run_bot(transport: AudioStreamTransport):
-    pipeline = Pipeline([
-        transport.input(), stt, user_aggregator, llm, tts,
-        transport.output(), assistant_aggregator,
-    ])
-    task = PipelineTask(pipeline, params=PipelineParams(allow_interruptions=True))
-
-    @transport.event_handler("on_client_connected")
-    async def on_client_connected(transport):
-        await task.queue_frames([LLMRunFrame()])
-
-    @transport.event_handler("on_client_disconnected")
-    async def on_client_disconnected(transport):
-        await task.cancel()
-
-    await PipelineRunner().run(task)
-
-server.run()
+await PipelineRunner().run(task)
 ```
 
 Also available for SIP/RTP: `from agent_transport.sip.pipecat import SipTransport`
