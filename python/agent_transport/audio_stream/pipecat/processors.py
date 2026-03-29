@@ -1,7 +1,7 @@
 """Rust-backed pipeline processors for Pipecat.
 
-Drop-in alternatives to Pipecat's AudioBufferProcessor that delegate
-recording to Rust for zero-copy, low-overhead call recording.
+AudioRecorder hooks Rust's transport-level recording into the Pipecat pipeline.
+For per-turn audio events, use Pipecat's AudioBufferProcessor (works alongside).
 
 Usage:
     from agent_transport.audio_stream.pipecat.processors import AudioRecorder
@@ -27,15 +27,19 @@ except ImportError:
 class AudioRecorder(FrameProcessor):
     """Rust-backed call recorder as a Pipecat FrameProcessor.
 
-    Drop-in pipeline processor that records the call using Rust's transport-level
-    recording. Records directly in the 20ms send loop — zero Python audio
-    buffering, zero GIL overhead.
+    Records the entire call using Rust's transport-level recording — directly
+    in the 20ms send loop, zero Python audio buffering, zero GIL overhead.
+    Output: OGG/Opus. Stereo: L=user, R=agent.
 
-    Place after transport.output() in the pipeline (same position as
-    AudioBufferProcessor). Recording starts on StartFrame and stops on
-    EndFrame/CancelFrame.
+    NOT a drop-in for AudioBufferProcessor (different API):
+    - AudioBufferProcessor: per-turn events, raw byte callbacks, Python-level
+    - AudioRecorder: whole-call file recording, Rust-level, on_recording_stopped event
 
-    Output format: OGG/Opus. Stereo mode: L=user audio, R=agent audio.
+    Both can coexist in the same pipeline if you need per-turn events AND
+    file recording.
+
+    Place after transport.output() in the pipeline. Recording auto-starts
+    on StartFrame, auto-stops on EndFrame/CancelFrame.
 
     Usage:
         recorder = AudioRecorder(transport, "/tmp/call.ogg")
@@ -44,7 +48,6 @@ class AudioRecorder(FrameProcessor):
             transport.output(), recorder,
         ])
 
-        # Optional: get notified when recording stops
         @recorder.event_handler("on_recording_stopped")
         async def on_stopped(recorder, path):
             logger.info("Recording saved to %s", path)
@@ -78,15 +81,18 @@ class AudioRecorder(FrameProcessor):
     async def stop_recording(self):
         """Stop recording. Called automatically on EndFrame/CancelFrame."""
         if self._recording:
-            self._transport.stop_recording()
             self._recording = False
+            self._transport.stop_recording()
             logger.info("Recording stopped: %s", self._path)
             await self._call_event_handler("on_recording_stopped", self, self._path)
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
+        # Stop recording BEFORE pushing EndFrame/CancelFrame downstream,
+        # so recording is finalized while session still exists
+        if isinstance(frame, (EndFrame, CancelFrame)) and self._recording:
+            await self.stop_recording()
+
         if isinstance(frame, StartFrame) and self._auto_start:
             await self.start_recording()
-        elif isinstance(frame, (EndFrame, CancelFrame)):
-            await self.stop_recording()
 
         await self.push_frame(frame, direction)
