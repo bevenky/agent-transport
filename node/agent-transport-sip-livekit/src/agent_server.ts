@@ -512,7 +512,11 @@ export class AgentServer {
 
       } else if (url.pathname === '/call' && req.method === 'POST') {
         let body = '';
-        req.on('data', (chunk: Buffer) => { body += chunk; });
+        const MAX_BODY = 64 * 1024; // 64KB limit
+        req.on('data', (chunk: Buffer) => {
+          body += chunk;
+          if (body.length > MAX_BODY) { req.destroy(); }
+        });
         req.on('end', async () => {
           try {
             const data = JSON.parse(body);

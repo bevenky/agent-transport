@@ -105,14 +105,14 @@ class SoundfileMixer(BaseAudioMixer):
             except asyncio.CancelledError:
                 break
 
-            if not self._mixing:
-                continue
-
-            sound = self._sounds.get(self._current_sound)
-            if sound is None or len(sound) == 0:
-                continue
-
             async with self._lock:
+                if not self._mixing:
+                    continue
+
+                sound = self._sounds.get(self._current_sound)
+                if sound is None or len(sound) == 0:
+                    continue
+
                 if self._sound_pos + chunk_samples > len(sound):
                     if self._loop:
                         self._sound_pos = 0
@@ -127,7 +127,8 @@ class SoundfileMixer(BaseAudioMixer):
                 self._transport.send_background_audio(
                     scaled.tobytes(), self._sample_rate, 1,
                 )
-            except Exception:
+            except Exception as e:
+                logger.warning("Background audio feed stopped: %s", e)
                 break
 
     def _load_sound_file(self, name: str, path: str):

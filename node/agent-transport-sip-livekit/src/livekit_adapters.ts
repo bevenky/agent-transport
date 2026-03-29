@@ -183,18 +183,14 @@ export class TransportLocalParticipant {
     }
   }
 
-  private async _forwardTrackAudio(pubSid: string, track: any, signal: AbortSignal): Promise<void> {
-    // Read audio from the track via polling and forward to endpoint's background mixer
-    // In Node.js, we use recvAudioBytesAsync on the track's audio stream
-    try {
-      while (!signal.aborted) {
-        await new Promise(resolve => setTimeout(resolve, 20)); // 20ms pacing
-        if (signal.aborted) break;
-        // Background audio frames are produced by the mixer and captured by the track.
-        // The forwarding happens via the endpoint's send_background_audio binding.
-      }
-    } catch {
-      // Forwarding ended
+  private async _forwardTrackAudio(_pubSid: string, _track: any, signal: AbortSignal): Promise<void> {
+    // TODO: Not yet implemented for Node.js.
+    // Python version reads frames from rtc.AudioStream.from_track() and forwards
+    // to endpoint.send_background_audio(). Node equivalent needs @livekit/rtc-node
+    // AudioStream API to read from the published track.
+    // For now, background audio mixing is not supported in the Node adapter.
+    while (!signal.aborted) {
+      await new Promise(resolve => setTimeout(resolve, 1000));
     }
   }
 

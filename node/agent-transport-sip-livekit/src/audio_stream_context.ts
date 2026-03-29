@@ -78,8 +78,11 @@ export class AudioStreamJobContext {
     session.input.audio = new SipAudioInput(this.endpoint as any, this.sessionId);
     session.output.audio = new SipAudioOutput(this.endpoint as any, this.sessionId);
 
-    session.on('close', () => {
+    session.on('close', async () => {
       console.log(`Session ${this.sessionId} closed`);
+      for (const cb of this._shutdownCallbacks) {
+        try { await cb(); } catch {}
+      }
       this._resolveCallEnded();
       try { (this.endpoint as any).hangup(this.sessionId); } catch {}
     });
