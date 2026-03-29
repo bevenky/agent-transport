@@ -39,15 +39,30 @@ See [LiveKit SIP Transport docs](docs/livekit_interface_sip.md) for recording, P
 
 ### Pipecat
 
-Drop-in replacements for `WebsocketServerTransport`:
+Same `Pipeline` — swap `FastAPIWebsocketTransport` + serializer for a single transport:
 
 ```python
-# SIP/RTP
-transport = SipTransport(ep, call_id, params=TransportParams(...))
+# Pipecat + FastAPI + PlivoSerializer            # Agent Transport Audio Streaming
+from pipecat.transports.websocket.fastapi import  from agent_transport.audio_stream.pipecat import
+    FastAPIWebsocketTransport, ...                    AudioStreamServer, AudioStreamTransport
+from pipecat.serializers.plivo import              server = AudioStreamServer()
+    PlivoFrameSerializer
+                                                   @server.handler()
+serializer = PlivoFrameSerializer(                 async def run_bot(transport: AudioStreamTransport):
+    stream_id=..., call_id=...)                        pipeline = Pipeline([
+transport = FastAPIWebsocketTransport(                     transport.input(), stt, llm, tts,
+    websocket=ws,                                          transport.output(), assistant_aggregator,
+    params=FastAPIWebsocketParams(                     ])
+        serializer=serializer))                        await PipelineRunner().run(PipelineTask(pipeline))
 
-# Plivo Audio Streaming
-transport = AudioStreamTransport(ep, session_id, params=TransportParams(...))
+pipeline = Pipeline([                              server.run()
+    transport.input(), stt, llm, tts,
+    transport.output(), ...])
 ```
+
+Also available for SIP/RTP: `from agent_transport.sip.pipecat import SipTransport`
+
+Full examples: [`audio_stream_agent.py`](examples/pipecat/audio_stream_agent.py) · [`sip_agent.py`](examples/pipecat/sip_agent.py)
 
 ## Installation
 
