@@ -22,7 +22,7 @@ from dotenv import load_dotenv
 from agent_transport.sip.livekit import AgentServer, JobContext, JobProcess
 
 from livekit.agents import Agent, AgentSession, RunContext, TurnHandlingOptions, metrics
-from livekit.agents.voice import MetricsCollectedEvent
+
 from livekit.agents.llm import function_tool
 from livekit.agents.job import get_job_context
 from livekit.plugins import deepgram, openai, silero
@@ -249,9 +249,6 @@ async def entrypoint(ctx: JobContext):
     )
     ctx.session = session
 
-    @session.on("metrics_collected")
-    def _on_metrics_collected(ev: MetricsCollectedEvent):
-        metrics.log_metrics(ev.metrics)
 
     await session.start(agent=GreeterAgent(), room=ctx.room)
 

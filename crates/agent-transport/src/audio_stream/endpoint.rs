@@ -289,6 +289,7 @@ impl AudioStreamEndpoint {
     pub fn events(&self) -> Receiver<EndpointEvent> { self.event_rx.clone() }
 
     pub fn shutdown(&self) -> Result<()> {
+        if self.cancel.is_cancelled() { return Ok(()); }
         self.cancel.cancel();
         if self.config.auto_hangup {
             let ids: Vec<String> = self.sessions.lock().unwrap().keys().cloned().collect();

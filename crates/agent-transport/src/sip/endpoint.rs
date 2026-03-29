@@ -250,13 +250,21 @@ impl SipEndpoint {
             let cc2 = cc.clone();
             tokio::spawn(async move { tokio::select! { _ = ep.serve() => {}, _ = cc2.cancelled() => {} } });
 
-            // Incoming transaction handler
+            // Incoming transaction handler — routes INVITEs to handle_incoming,
+            // and in-dialog requests (BYE, INFO, etc.) to the existing dialog.
             let (dl2, st2, etx3) = (dl.clone(), st.clone(), etx2.clone());
             let mut rx = rx;
             tokio::spawn(async move {
-                while let Some(tx) = rx.recv().await {
+                while let Some(mut tx) = rx.recv().await {
                     if tx.original.method == rsip::Method::Invite {
                         handle_incoming(&dl2, &st2, &etx3, tx, sr).await;
+                    } else if let Some(dialog) = dl2.match_dialog(&tx) {
+                        // Route in-dialog requests (BYE, INFO, REFER, etc.) to the dialog
+                        match dialog {
+                            rsipstack::dialog::dialog::Dialog::ServerInvite(mut d) => { let _ = d.handle(&mut tx).await; }
+                            rsipstack::dialog::dialog::Dialog::ClientInvite(mut d) => { let _ = d.handle(&mut tx).await; }
+                            _ => {}
+                        }
                     }
                 }
             });
@@ -701,6 +709,7 @@ impl SipEndpoint {
     pub fn events(&self) -> Receiver<EndpointEvent> { self.event_rx.clone() }
 
     pub fn shutdown(&self) -> Result<()> {
+        if self.cancel.is_cancelled() { return Ok(()); }
         self.cancel.cancel();
         let ids: Vec<String> = self.state.lock().unwrap().calls.keys().cloned().collect();
         for id in ids { let _ = self.hangup(&id); }
