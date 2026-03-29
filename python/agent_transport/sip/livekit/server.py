@@ -685,6 +685,8 @@ class AgentServer:
                 ctx = self._call_contexts.get(call_id)
                 if ctx:
                     ctx._emit("beep_detected", freq, dur)
+                    if ctx._room:
+                        ctx._room.emit("beep_detected", {"frequency_hz": freq, "duration_ms": dur})
 
             elif ev_type == "beep_timeout":
                 call_id = ev.get("call_id", "")
@@ -692,6 +694,8 @@ class AgentServer:
                 ctx = self._call_contexts.get(call_id)
                 if ctx:
                     ctx._emit("beep_timeout")
+                    if ctx._room:
+                        ctx._room.emit("beep_timeout", {})
 
     async def _start_call(self, call_id: str, remote_uri: str, direction: str) -> None:
         call_ended = asyncio.Event()

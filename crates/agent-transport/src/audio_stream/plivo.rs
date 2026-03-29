@@ -142,25 +142,25 @@ impl StreamProtocol for PlivoProtocol {
                 "sampleRate": encoding.sample_rate(),
                 "payload": b64
             }
-        })).unwrap_or_default()
+        })).unwrap_or_else(|e| { warn!("JSON serialize error: {}", e); String::new() })
     }
 
     fn build_checkpoint(&self, stream_id: &str, name: &str) -> String {
         serde_json::to_string(&serde_json::json!({
             "event": "checkpoint", "streamId": stream_id, "name": name
-        })).unwrap_or_default()
+        })).unwrap_or_else(|e| { warn!("JSON serialize error: {}", e); String::new() })
     }
 
     fn build_clear_audio(&self, stream_id: &str) -> String {
         serde_json::to_string(&serde_json::json!({
             "event": "clearAudio", "streamId": stream_id
-        })).unwrap_or_default()
+        })).unwrap_or_else(|e| { warn!("JSON serialize error: {}", e); String::new() })
     }
 
     fn build_send_dtmf(&self, digits: &str) -> String {
         serde_json::to_string(&serde_json::json!({
             "event": "sendDTMF", "dtmf": digits
-        })).unwrap_or_default()
+        })).unwrap_or_else(|e| { warn!("JSON serialize error: {}", e); String::new() })
     }
 
     fn hangup(&self, call_id: &str, rt: &tokio::runtime::Runtime) {

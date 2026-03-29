@@ -58,7 +58,14 @@ class SipAudioSource:
 
     @property
     def queued_duration(self) -> float:
-        """Current duration (in seconds) of audio data queued for playback."""
+        """Current duration (in seconds) of audio data queued for playback.
+
+        Formula: _q_size is the accumulated buffered duration.
+        (time.monotonic() - _last_capture) is elapsed time since last capture,
+        i.e. how much audio has been played out. So:
+            remaining = _q_size - elapsed = _q_size - (now - _last_capture)
+        This is the standard pattern from LiveKit's rtc.AudioSource.
+        """
         return max(self._q_size - time.monotonic() + self._last_capture, 0.0)
 
     def clear_queue(self) -> None:
@@ -110,7 +117,13 @@ class SipAudioSource:
             try:
                 self._loop.call_soon_threadsafe(_resolve)
             except RuntimeError:
-                pass  # event loop closed
+                # Event loop closed — resolve directly to unblock await.
+                # This is safe: the Future is only awaited in capture_frame
+                # which won't run again if the loop is closed.
+                try:
+                    capture_fut.set_result(None)
+                except Exception:
+                    pass
 
         # Push audio to Rust — Rust fires _on_complete immediately if below
         # threshold, or defers it until RTP loop drains

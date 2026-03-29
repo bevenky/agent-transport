@@ -341,6 +341,8 @@ class SipServerTransport:
                 q = self._session_event_queues.get(call_id)
                 if q:
                     await q.put(event)
+                else:
+                    logger.warning("No session queue for %s event on call %s (session not yet started?)", ev_type, call_id)
 
     def _start_session(self, call_id: str, session_data: dict) -> None:
         """Create transport and spawn session handler task."""

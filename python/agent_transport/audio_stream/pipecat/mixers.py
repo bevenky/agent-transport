@@ -69,6 +69,7 @@ class SoundfileMixer(BaseAudioMixer):
         self._sample_rate = 0
         self._feed_task: Optional[asyncio.Task] = None
         self._sound_pos = 0
+        self._lock = asyncio.Lock()
 
     async def start(self, sample_rate: int):
         self._sample_rate = sample_rate
@@ -90,7 +91,8 @@ class SoundfileMixer(BaseAudioMixer):
             for setting, value in frame.settings.items():
                 if setting == "sound" and value in self._sounds:
                     self._current_sound = value
-                    self._sound_pos = 0
+                    async with self._lock:
+                        self._sound_pos = 0
                 elif setting == "volume":
                     self._volume = float(value)
                 elif setting == "loop":
@@ -118,14 +120,15 @@ class SoundfileMixer(BaseAudioMixer):
             if sound is None or len(sound) == 0:
                 continue
 
-            if self._sound_pos + chunk_samples > len(sound):
-                if self._loop:
-                    self._sound_pos = 0
-                else:
-                    continue
+            async with self._lock:
+                if self._sound_pos + chunk_samples > len(sound):
+                    if self._loop:
+                        self._sound_pos = 0
+                    else:
+                        continue
 
-            chunk = sound[self._sound_pos:self._sound_pos + chunk_samples]
-            self._sound_pos += chunk_samples
+                chunk = sound[self._sound_pos:self._sound_pos + chunk_samples]
+                self._sound_pos += chunk_samples
 
             # Apply volume and convert to bytes
             scaled = np.clip(chunk * self._volume, -32768, 32767).astype(np.int16)
@@ -140,7 +143,12 @@ class SoundfileMixer(BaseAudioMixer):
         try:
             sound, sr = sf.read(path, dtype="int16")
             if sr != self._sample_rate:
-                logger.warning("Sound %s has sample rate %d (expected %d)", path, sr, self._sample_rate)
+                logger.info("Resampling sound %s from %dHz to %dHz", path, sr, self._sample_rate)
+                sound = np.interp(
+                    np.linspace(0, len(sound), int(len(sound) * self._sample_rate / sr)),
+                    np.arange(len(sound)),
+                    sound,
+                ).astype(np.int16)
             self._sounds[name] = np.asarray(sound, dtype=np.int16)
             logger.debug("Loaded mixer sound %s from %s", name, path)
         except Exception as e:

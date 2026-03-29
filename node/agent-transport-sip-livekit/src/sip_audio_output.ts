@@ -129,7 +129,7 @@ export class SipAudioOutput extends EventEmitter {
           this.callId,
           frameData,
           frame.sampleRate,
-          1, // mono
+          frame.numChannels,
           () => resolve(),
         );
       } catch (e) {
@@ -167,6 +167,10 @@ export class SipAudioOutput extends EventEmitter {
    * clearBuffer — matches AudioOutput.clearBuffer. Triggers interruption.
    */
   clearBuffer(): void {
+    if (this.playoutTimer) {
+      clearTimeout(this.playoutTimer);
+      this.playoutTimer = null;
+    }
     if (!this.pushedDuration) return;
     this.interruptedFuture.resolve();
   }
