@@ -450,10 +450,14 @@ async fn handle_ws(ws: tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>
                             let sln = send_loop_notify.clone();
                             let sc = session_cancel.clone();
                             let stream_id_for_loop = start.stream_id.clone();
-                            // 40ms chunks at 16kHz = 640 samples
-                            // Plivo needs only 20ms (320 bytes) to start playback.
-                            // 40ms balances low latency vs checkpoint RTT overhead (~30-50ms).
-                            let chunk_spf: usize = 640;
+                            // Chunk size for checkpoint pacing (at 16kHz):
+                            // - Must be >= network RTT (~50ms) so Plivo plays long enough
+                            //   for playedStream to return before audio runs out
+                            // - Plivo recommends 100-200ms for checkpoint pacing
+                            // - 100ms = 1600 samples at 16kHz
+                            // First chunk sends whatever is available (as small as 20ms)
+                            // for fast time-to-first-audio
+                            let chunk_spf: usize = 1600;
                             let cp_counter = Arc::new(AtomicU64::new(0));
                             tokio::spawn(async move {
                                 // speexdsp resampler for 16kHz→8kHz (if needed for this encoding)
