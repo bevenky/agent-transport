@@ -23,6 +23,7 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
+use beep_detector::{BeepDetector, BeepDetectorConfig, BeepDetectorResult};
 use crate::audio::AudioFrame;
 use crate::error::{EndpointError, Result};
 use crate::events::EndpointEvent;
@@ -117,6 +118,7 @@ struct StreamSession {
     /// Notifies send loop when Plivo confirms playedStream (checkpoint pacing)
     send_loop_notify: Arc<tokio::sync::Notify>,
     recorder: Arc<Mutex<Option<Arc<crate::recorder::CallRecorder>>>>,
+    beep_detector: Arc<Mutex<Option<BeepDetector>>>,
     cancel: CancellationToken,
 }
 
@@ -308,6 +310,23 @@ impl AudioStreamEndpoint {
         Ok(())
     }
 
+    /// Start beep detection on incoming audio for an audio stream session.
+    /// Emits BeepDetected or BeepTimeout event when done.
+    pub fn detect_beep(&self, session_id: &str, config: BeepDetectorConfig) -> Result<()> {
+        let s = self.sessions.lock().unwrap();
+        let sess = s.get(session_id).ok_or_else(|| EndpointError::CallNotActive(session_id.to_string()))?;
+        *sess.beep_detector.lock().unwrap() = Some(BeepDetector::new(config));
+        Ok(())
+    }
+
+    /// Cancel beep detection for an audio stream session.
+    pub fn cancel_beep_detection(&self, session_id: &str) -> Result<()> {
+        let s = self.sessions.lock().unwrap();
+        let sess = s.get(session_id).ok_or_else(|| EndpointError::CallNotActive(session_id.to_string()))?;
+        *sess.beep_detector.lock().unwrap() = None;
+        Ok(())
+    }
+
     /// Hangup via Plivo REST API. Idempotent.
     pub fn hangup(&self, session_id: &str) -> Result<()> {
         let plivo_call_id = {
@@ -400,8 +419,9 @@ async fn handle_ws(ws: tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>
 
     let mut encoding = AudioEncoding::MulawRate8k; // default, updated on start
     let mut upsampler: Option<crate::sip::resampler::Resampler> = None;
-    // Shared recorder reference — set by start_recording(), used by media handler
+    // Shared refs — set on "start" event, used by "media" handler
     let mut media_recorder: Option<Arc<Mutex<Option<Arc<crate::recorder::CallRecorder>>>>> = None;
+    let mut media_beep_det: Option<Arc<Mutex<Option<BeepDetector>>>> = None;
 
     loop {
         tokio::select! {
@@ -436,6 +456,7 @@ async fn handle_ws(ws: tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>
                             let cp_notify = Arc::new((Mutex::new(None), Condvar::new()));
                             let send_loop_notify = Arc::new(tokio::sync::Notify::new());
                             let session_recorder: Arc<Mutex<Option<Arc<crate::recorder::CallRecorder>>>> = Arc::new(Mutex::new(None));
+                            let session_beep_detector: Arc<Mutex<Option<BeepDetector>>> = Arc::new(Mutex::new(None));
                             let session_cancel = CancellationToken::new();
 
                             // Spawn checkpoint-paced send loop
@@ -536,8 +557,9 @@ async fn handle_ws(ws: tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>
                                 }
                             });
 
-                            // Store shared recorder ref for media handler
+                            // Store shared refs for media handler
                             media_recorder = Some(session_recorder.clone());
+                            media_beep_det = Some(session_beep_detector.clone());
 
                             sessions.lock().unwrap().insert(sid.clone(), StreamSession {
                                 call_id: start.call_id.clone(), stream_id: start.stream_id.clone(),
@@ -547,6 +569,7 @@ async fn handle_ws(ws: tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>
                                 checkpoint_counter: AtomicU64::new(0), checkpoint_notify: cp_notify,
                                 send_loop_notify,
                                 recorder: session_recorder,
+                                beep_detector: session_beep_detector,
                                 cancel: session_cancel,
                             });
 
@@ -581,6 +604,16 @@ async fn handle_ws(ws: tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>
                                 // Record user audio
                                 if let Some(ref rec_ref) = media_recorder {
                                     if let Ok(guard) = rec_ref.lock() { if let Some(ref rec) = *guard { rec.write_user_samples(&pcm_16k); } }
+                                }
+                                // Beep detection on incoming audio (same pattern as SIP RTP recv loop)
+                                if let Some(ref bd_ref) = media_beep_det {
+                                    if let Ok(mut g) = bd_ref.lock() { if let Some(ref mut det) = *g {
+                                        match det.process_frame(&pcm_16k) {
+                                            BeepDetectorResult::Detected(e) => { let _ = etx.try_send(EndpointEvent::BeepDetected { call_id: sid.clone(), frequency_hz: e.frequency_hz, duration_ms: e.duration_ms }); *g = None; }
+                                            BeepDetectorResult::Timeout => { let _ = etx.try_send(EndpointEvent::BeepTimeout { call_id: sid.clone() }); *g = None; }
+                                            _ => {}
+                                        }
+                                    }}
                                 }
                                 let n = pcm_16k.len() as u32;
                                 let _ = itx.try_send(AudioFrame { data: pcm_16k, sample_rate: 16000, num_channels: 1, samples_per_channel: n });

@@ -813,6 +813,33 @@ impl AudioStreamEndpoint {
         self.inner.send_dtmf(session_id, digits).map_err(py_err)
     }
 
+    /// Start async beep detection on incoming audio for an audio stream session.
+    #[pyo3(signature = (session_id, timeout_ms=30000, min_duration_ms=80, max_duration_ms=5000))]
+    fn detect_beep(
+        &self,
+        session_id: String,
+        timeout_ms: u32,
+        min_duration_ms: u32,
+        max_duration_ms: u32,
+    ) -> PyResult<()> {
+        let config = RustBeepConfig {
+            timeout_ms,
+            min_duration_ms,
+            max_duration_ms,
+            ..Default::default()
+        };
+        self.inner
+            .detect_beep(&session_id, config)
+            .map_err(py_err)
+    }
+
+    /// Cancel beep detection on an audio stream session.
+    fn cancel_beep_detection(&self, session_id: &str) -> PyResult<()> {
+        self.inner
+            .cancel_beep_detection(session_id)
+            .map_err(py_err)
+    }
+
     /// Hang up via Plivo REST API. Releases GIL (blocks on HTTP request).
     fn hangup(&self, py: Python, session_id: &str) -> PyResult<()> {
         let inner = &self.inner;

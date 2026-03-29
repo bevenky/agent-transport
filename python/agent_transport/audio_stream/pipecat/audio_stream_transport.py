@@ -471,6 +471,20 @@ class AudioStreamTransport(BaseTransport):
         """
         self._ep.send_dtmf(self._sid, digits)
 
+    # ── Beep detection ───────────────────────────────────────────────────
+
+    def detect_beep(self, timeout_ms: int = 30000, min_duration_ms: int = 80,
+                    max_duration_ms: int = 5000) -> None:
+        """Start voicemail beep detection on incoming audio.
+
+        Fires on_beep_detected or on_beep_timeout event when done.
+        """
+        self._ep.detect_beep(self._sid, timeout_ms, min_duration_ms, max_duration_ms)
+
+    def cancel_beep_detection(self) -> None:
+        """Cancel ongoing beep detection."""
+        self._ep.cancel_beep_detection(self._sid)
+
     # ── Raw WebSocket access ─────────────────────────────────────────────
 
     def send_raw_message(self, message: str) -> None:
