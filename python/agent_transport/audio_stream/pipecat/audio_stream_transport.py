@@ -232,28 +232,14 @@ class AudioStreamOutputTransport(BaseOutputTransport):
         await loop.run_in_executor(None, lambda: self._ep.send_dtmf(self._sid, digit))
 
     async def write_audio_frame(self, frame: OutputAudioRawFrame) -> bool:
-        """Send audio frame via Rust endpoint with backpressure.
+        """Send audio frame to audio stream.
 
-        Uses send_audio_notify with async callback to apply backpressure
-        when the AudioBuffer is above threshold, preventing frame drops.
+        Audio is pushed to the Rust AudioBuffer which handles pacing
+        (20ms intervals via tokio::time::interval). No Python-side
+        backpressure needed — matches Pipecat's WebSocket transport pattern.
         """
-        loop = asyncio.get_running_loop()
-        fut = loop.create_future()
-
-        def _on_complete():
-            try:
-                loop.call_soon_threadsafe(lambda: fut.done() or fut.set_result(None))
-            except RuntimeError:
-                try:
-                    fut.set_result(None)
-                except Exception:
-                    pass
-
         try:
-            self._ep.send_audio_notify(
-                self._sid, frame.audio, frame.sample_rate, frame.num_channels, _on_complete
-            )
-            await fut
+            self._ep.send_audio_bytes(self._sid, frame.audio, frame.sample_rate, frame.num_channels)
             return True
         except Exception:
             return False
