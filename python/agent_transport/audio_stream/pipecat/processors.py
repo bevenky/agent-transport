@@ -108,8 +108,8 @@ class AudioRecorder(AudioBufferProcessor):
         if isinstance(frame, (EndFrame, CancelFrame)) and self._rust_recording:
             try:
                 self._transport.stop_recording()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("AudioRecorder stop_recording error: %s", e)
             self._rust_recording = False
 
         await super().process_frame(frame, direction)

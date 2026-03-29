@@ -197,3 +197,12 @@ impl AudioBuffer {
         if let Some(cb) = cb { cb(); }
     }
 }
+
+impl Drop for AudioBuffer {
+    fn drop(&mut self) {
+        // Fire any pending completion callback to unblock callers waiting on capture_frame.
+        if let Ok(mut inner) = self.inner.lock() {
+            if let Some(cb) = inner.pending_complete.take() { cb(); }
+        }
+    }
+}

@@ -229,7 +229,7 @@ class WebsocketServerTransport:
                 except (asyncio.CancelledError, Exception):
                     pass
             if self._ep:
-                self._ep.shutdown()
+                await loop.run_in_executor(None, self._ep.shutdown)
             logger.info("Server shut down")
 
     async def _event_loop(self) -> None:
@@ -244,7 +244,7 @@ class WebsocketServerTransport:
 
         while True:
             event = await loop.run_in_executor(
-                None, lambda: self._ep.wait_for_event(timeout_ms=0)
+                None, lambda: self._ep.wait_for_event(timeout_ms=1000)
             )
             if not event:
                 continue

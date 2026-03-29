@@ -80,8 +80,11 @@ export class JobContext {
     session.output.audio = new SipAudioOutput(this.endpoint, this.callId);
 
     // Listen to session close event — handles agent-initiated shutdown
-    session.on('close', () => {
+    session.on('close', async () => {
       console.log(`Call ${this.callId} session closed`);
+      for (const cb of this._shutdownCallbacks) {
+        try { await cb(); } catch {}
+      }
       this._resolveCallEnded();
       try { this.endpoint.hangup(this.callId); } catch {}
     });

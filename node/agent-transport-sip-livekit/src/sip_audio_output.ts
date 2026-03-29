@@ -76,6 +76,8 @@ export class SipAudioOutput extends EventEmitter {
   private playbackFinishedCount = 0;
   private playbackSegmentsCount = 0;
   private lastPlaybackEvent: PlaybackFinishedEvent = { playbackPosition: 0, interrupted: false };
+  private _chainStartedCb: ((ev: PlaybackStartedEvent) => void) | null = null;
+  private _chainFinishedCb: ((ev: PlaybackFinishedEvent) => void) | null = null;
 
   constructor(endpoint: SipEndpoint, callId: string, sampleRate?: number, nextInChain?: SipAudioOutput) {
     super();
@@ -86,10 +88,10 @@ export class SipAudioOutput extends EventEmitter {
 
     // Chain event forwarding (matches AudioOutput base class)
     if (this.nextInChain) {
-      this.nextInChain.on(SipAudioOutput.EVENT_PLAYBACK_STARTED, (ev: PlaybackStartedEvent) =>
-        this.onPlaybackStarted(ev.createdAt));
-      this.nextInChain.on(SipAudioOutput.EVENT_PLAYBACK_FINISHED, (ev: PlaybackFinishedEvent) =>
-        this.onPlaybackFinished(ev));
+      this._chainStartedCb = (ev: PlaybackStartedEvent) => this.onPlaybackStarted(ev.createdAt);
+      this._chainFinishedCb = (ev: PlaybackFinishedEvent) => this.onPlaybackFinished(ev);
+      this.nextInChain.on(SipAudioOutput.EVENT_PLAYBACK_STARTED, this._chainStartedCb);
+      this.nextInChain.on(SipAudioOutput.EVENT_PLAYBACK_FINISHED, this._chainFinishedCb);
     }
   }
 
@@ -258,5 +260,9 @@ export class SipAudioOutput extends EventEmitter {
   async close(): Promise<void> {
     if (this.flushAbortController) this.flushAbortController.abort();
     if (this.playoutTimer) clearTimeout(this.playoutTimer);
+    if (this.nextInChain) {
+      if (this._chainStartedCb) this.nextInChain.off(SipAudioOutput.EVENT_PLAYBACK_STARTED, this._chainStartedCb);
+      if (this._chainFinishedCb) this.nextInChain.off(SipAudioOutput.EVENT_PLAYBACK_FINISHED, this._chainFinishedCb);
+    }
   }
 }
