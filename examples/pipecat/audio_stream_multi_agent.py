@@ -15,9 +15,9 @@ from typing import Optional
 from dotenv import load_dotenv
 from loguru import logger
 
-from agent_transport.audio_stream.pipecat.serializers.plivo import PlivoFrameSerializer
-from agent_transport.audio_stream.pipecat.transports.websocket import WebsocketServerTransport
-from agent_transport.audio_stream.pipecat.processors import AudioRecorder
+from agent_transport.audio_stream.pipecat import (
+    PlivoFrameSerializer, WebsocketServerTransport, AudioRecorder,
+)
 
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.frames.frames import LLMRunFrame
