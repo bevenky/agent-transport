@@ -154,6 +154,8 @@ impl AudioStreamEndpoint {
 
     // ─── Buffer / checkpoint / flush ─────────────────────────────────────
 
+    /// Clear buffered audio — drains local AudioBuffer AND sends clear command to provider.
+    /// Any audio already in the WS send queue will be overridden by the provider's clear.
     pub fn clear_buffer(&self, session_id: &str) -> Result<()> {
         let s = self.sessions.lock().unwrap();
         let sess = s.get(session_id).ok_or_else(|| EndpointError::CallNotActive(session_id.to_string()))?;
@@ -175,9 +177,11 @@ impl AudioStreamEndpoint {
         Ok(cp_name)
     }
 
+    /// Send a checkpoint marker. Does NOT block — use wait_for_playout() after
+    /// to block until the provider confirms the checkpoint was played.
     pub fn flush(&self, session_id: &str) -> Result<()> {
         let cp_name = self.checkpoint(session_id, None)?;
-        debug!("Flush: waiting for checkpoint '{}' on session {}", cp_name, session_id);
+        debug!("Flush: checkpoint '{}' sent on session {}", cp_name, session_id);
         Ok(())
     }
 
@@ -374,6 +378,7 @@ async fn handle_ws(
                 match event {
                     StreamEvent::Start { call_id, stream_id, encoding: enc, headers } => {
                         encoding = enc;
+                        upsampler = None; // Reset for new encoding
 
                         let audio_buf = Arc::new(AudioBuffer::with_queue_size(200, pipeline_rate));
                         let bg_audio_buf = Arc::new(AudioBuffer::with_queue_size(200, pipeline_rate));

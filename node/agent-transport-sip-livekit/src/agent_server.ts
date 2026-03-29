@@ -246,10 +246,16 @@ export class AgentServer {
 
     console.log('Shutting down...');
 
-    // Drain active calls
+    // Drain active calls with 10-second timeout
     if (this.activeCalls.size > 0) {
       console.log(`Draining ${this.activeCalls.size} active call(s)...`);
-      await Promise.allSettled([...this.activeCalls.values()].map((c) => c.promise));
+      await Promise.race([
+        Promise.allSettled([...this.activeCalls.values()].map((c) => c.promise)),
+        new Promise<void>((resolve) => setTimeout(() => {
+          console.warn('Shutdown timeout reached (10s), forcing exit');
+          resolve();
+        }, 10000)),
+      ]);
     }
 
     this.loadMonitor.stop();

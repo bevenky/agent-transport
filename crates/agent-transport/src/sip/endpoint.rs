@@ -51,6 +51,7 @@ struct CallContext {
     beep_detector: Arc<Mutex<Option<BeepDetector>>>,
     recorder: Arc<Mutex<Option<Arc<CallRecorder>>>>,
     cancel: CancellationToken,
+    rtp_tasks: Vec<tokio::task::JoinHandle<()>>,
     client_dialog: Option<rsipstack::dialog::client_dialog::ClientInviteDialog>,
     server_dialog: Option<rsipstack::dialog::server_dialog::ServerInviteDialog>,
     local_sdp: Option<String>,
@@ -96,8 +97,9 @@ async fn setup_rtp(
     let rtp = Arc::new(RtpTransport::new(Arc::new(rtp_sock), remote_rtp, answer.codec, ctx.cancel.clone(), dtmf_pt, answer.ptime_ms, pipeline_rate));
 
     let (itx, irx) = crossbeam_channel::unbounded();
-    rtp.start_send_loop(ctx.audio_buf.clone(), ctx.bg_audio_buf.clone(), ctx.muted.clone(), ctx.paused.clone(), ctx.playout_notify.clone(), ctx.recorder.clone());
-    rtp.start_recv_loop(itx, etx.clone(), call_id.to_string(), ctx.beep_detector.clone(), ctx.held.clone(), ctx.recorder.clone());
+    let send_handle = rtp.start_send_loop(ctx.audio_buf.clone(), ctx.bg_audio_buf.clone(), ctx.muted.clone(), ctx.paused.clone(), ctx.playout_notify.clone(), ctx.recorder.clone());
+    let recv_handle = rtp.start_recv_loop(itx, etx.clone(), call_id.to_string(), ctx.beep_detector.clone(), ctx.held.clone(), ctx.recorder.clone());
+    ctx.rtp_tasks = vec![send_handle, recv_handle];
 
     ctx.rtp = Some(rtp);
     ctx.incoming_rx = irx;
@@ -144,17 +146,23 @@ fn start_session_timer(
         loop {
             std::thread::sleep(std::time::Duration::from_secs(refresh));
             if cc.is_cancelled() { break; }
-            let s = st.lock().unwrap();
-            let Some(ctx) = s.calls.get(&call_id) else { break; };
-            let Some(ref sdp) = ctx.local_sdp else { break; };
+            // Extract data and dialog refs from lock, then drop before blocking
+            // on reinvite to avoid holding the mutex across an async operation.
+            let reinvite_info = {
+                let s = st.lock().unwrap();
+                let Some(ctx) = s.calls.get(&call_id) else { break; };
+                let Some(ref sdp) = ctx.local_sdp else { break; };
+                let body = sdp.clone().into_bytes();
+                let cd = ctx.client_dialog.clone();
+                let sd = ctx.server_dialog.clone();
+                (body, cd, sd)
+            };
             let hdrs = vec![rsip::Header::Other("Content-Type".into(), "application/sdp".into())];
-            let body = sdp.clone().into_bytes();
-            if let Some(ref d) = ctx.client_dialog {
-                let _ = handle.block_on(d.reinvite(Some(hdrs), Some(body)));
-            } else if let Some(ref d) = ctx.server_dialog {
-                let _ = handle.block_on(d.reinvite(Some(hdrs), Some(body)));
+            if let Some(ref d) = reinvite_info.1 {
+                let _ = handle.block_on(d.reinvite(Some(hdrs), Some(reinvite_info.0)));
+            } else if let Some(ref d) = reinvite_info.2 {
+                let _ = handle.block_on(d.reinvite(Some(hdrs), Some(reinvite_info.0)));
             }
-            drop(s);
             debug!("Session timer refresh for call {}", call_id);
         }
     });
@@ -172,6 +180,7 @@ fn new_call_context(call_id: &str, direction: CallDirection, cc: CancellationTok
         held: Arc::new(AtomicBool::new(false)),
         playout_notify: Arc::new((Mutex::new(false), Condvar::new())),
         beep_detector: Arc::new(Mutex::new(None)), recorder: Arc::new(Mutex::new(None)), cancel: cc,
+        rtp_tasks: Vec::new(),
         client_dialog: None, server_dialog: None, local_sdp: None,
     };
     (ctx, session)
@@ -425,6 +434,7 @@ impl SipEndpoint {
                     None
                 } else if code >= 200 && code < 300 {
                     let remote_sdp = ctx.server_dialog.as_ref().unwrap().initial_request().body().to_vec();
+                    // Note: setup_rtp awaits UdpSocket::bind (microseconds). Lock held briefly.
                     let (local_sdp, remote_rtp) = setup_rtp(ctx, &remote_sdp, &cfg.codecs, pa, &la_str, &etx, &call_id, cfg.sample_rate).await?;
                     ctx.server_dialog.as_ref().unwrap().accept(None, Some(local_sdp.into_bytes())).map_err(err)?;
                     info!("Inbound call {} connected to {}", call_id, remote_rtp);
@@ -573,6 +583,9 @@ impl SipEndpoint {
     pub fn unmute(&self, call_id: &str) -> Result<()> { self.with_call(call_id, |c| c.muted.store(false, Ordering::Relaxed)) }
     pub fn pause(&self, call_id: &str) -> Result<()> { self.with_call(call_id, |c| c.paused.store(true, Ordering::Relaxed)) }
     pub fn resume(&self, call_id: &str) -> Result<()> { self.with_call(call_id, |c| c.paused.store(false, Ordering::Relaxed)) }
+    /// Reset playout flag so next wait_for_playout blocks until audio buffer drains.
+    /// Call this before wait_for_playout to ensure accurate playout tracking.
+    /// Does NOT clear buffered audio — use clear_buffer for that.
     pub fn flush(&self, call_id: &str) -> Result<()> { self.with_call(call_id, |c| { if let Ok(mut d) = c.playout_notify.0.lock() { *d = false; } }) }
     pub fn clear_buffer(&self, call_id: &str) -> Result<()> {
         info!("clear_buffer: call={} clearing audio buffer", call_id);

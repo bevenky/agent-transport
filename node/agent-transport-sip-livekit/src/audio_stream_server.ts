@@ -184,10 +184,18 @@ export class AudioStreamServer {
 
     // Wait for shutdown signal
     await new Promise<void>((resolve) => {
-      const shutdown = () => {
+      const shutdown = async () => {
         console.log('Shutting down...');
+        // Drain active sessions with 10-second timeout
         if (this.activeSessions.size > 0) {
           console.log(`Draining ${this.activeSessions.size} active session(s)...`);
+          await Promise.race([
+            Promise.allSettled([...this.activeSessions.values()].map((s) => s.promise)),
+            new Promise<void>((r) => setTimeout(() => {
+              console.warn('Shutdown timeout reached (10s), forcing exit');
+              r();
+            }, 10000)),
+          ]);
         }
         this.loadMonitor.stop();
         if (this.httpServer) this.httpServer.close();

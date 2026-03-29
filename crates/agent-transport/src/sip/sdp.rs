@@ -70,7 +70,9 @@ pub(crate) fn parse_answer(sdp_bytes: &[u8], offered_codecs: &[Codec]) -> Result
             if rest.contains("telephone-event") { dtmf_pt = rest.split_whitespace().next().and_then(|s| s.parse().ok()); }
         } else if let Some(rest) = line.strip_prefix("a=ptime:") {
             // #10: Parse ptime from remote SDP
-            ptime_ms = rest.trim().parse().unwrap_or(20);
+            // #23: Reject invalid ptime (0 or unparseable) — use default 20ms
+            let parsed: u32 = rest.trim().parse().unwrap_or(20);
+            ptime_ms = if parsed == 0 { 20 } else { parsed };
         }
     }
 
