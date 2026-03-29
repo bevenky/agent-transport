@@ -598,6 +598,8 @@ class AudioStreamServer:
                 ctx = self._session_contexts.get(session_id)
                 if ctx:
                     ctx._emit("beep_detected", freq, dur)
+                    if ctx._room:
+                        ctx._room.emit("beep_detected", {"frequency_hz": freq, "duration_ms": dur})
 
             elif ev_type == "beep_timeout":
                 session_id = ev.get("call_id", "")
@@ -605,6 +607,8 @@ class AudioStreamServer:
                 ctx = self._session_contexts.get(session_id)
                 if ctx:
                     ctx._emit("beep_timeout")
+                    if ctx._room:
+                        ctx._room.emit("beep_timeout", {})
 
     async def _start_session(self, session_id: str, call_id: str, stream_id: str, extra_headers: dict) -> None:
         session_ended = asyncio.Event()

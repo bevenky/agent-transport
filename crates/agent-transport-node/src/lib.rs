@@ -84,7 +84,9 @@ impl Task for SipWaitForPlayoutTask {
 /// AudioFrame compatible with LiveKit's format.
 #[napi(object)]
 pub struct AudioFrame {
-    pub data: Vec<i32>, // napi doesn't support i16 directly; use i32
+    /// PCM samples as i32 (napi-rs limitation -- i16 not supported).
+    /// Converted to/from i16 at the FFI boundary.
+    pub data: Vec<i32>,
     pub sample_rate: u32,
     pub num_channels: u32,
     pub samples_per_channel: u32,

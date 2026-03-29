@@ -253,7 +253,11 @@ impl RecordingManager {
         let mgr_ref = mgr.clone();
         std::thread::Builder::new()
             .name("recording-encoder".into())
-            .spawn(move || mgr_ref.encoder_loop())
+            .spawn(move || {
+                if let Err(e) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| mgr_ref.encoder_loop())) {
+                    tracing::error!("Recording encoder thread panicked: {:?}", e);
+                }
+            })
             .expect("spawn recording encoder");
 
         mgr

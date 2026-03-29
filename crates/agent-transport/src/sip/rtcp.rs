@@ -10,6 +10,7 @@ const RTCP_SR: u8 = 200;
 const RTCP_RR: u8 = 201;
 
 /// NTP timestamp: seconds since 1900-01-01
+// Note: NTP seconds wrap to 0 in year 2036 (u32 overflow). Acceptable for RTCP SR.
 fn ntp_timestamp() -> (u32, u32) {
     let since_epoch = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
     // NTP epoch is 70 years before Unix epoch

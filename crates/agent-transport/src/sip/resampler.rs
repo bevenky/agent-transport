@@ -162,7 +162,7 @@ impl Drop for Resampler {
 /// Calculate output buffer size for given rates and input length.
 /// Matches FreeSWITCH's `switch_resample_calc_buffer_size` macro.
 fn calc_output_size(to_rate: u32, from_rate: u32, input_len: usize) -> usize {
-    ((to_rate as f32 / from_rate as f32) * input_len as f32) as usize + 16
+    (input_len * to_rate as usize + from_rate as usize - 1) / from_rate as usize + 16
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────

@@ -223,14 +223,22 @@ class AudioStreamOutput(AudioOutput):
             await self._flush_task
 
         for f in self._audio_bstream.push(frame.data):
-            self._audio_buf.send_nowait(f)
+            try:
+                self._audio_buf.send_nowait(f)
+            except Exception:
+                logger.warning("AudioStreamOutput: send_nowait failed in capture_frame, dropping frame")
+                continue
             self._pushed_duration += f.duration
 
     def flush(self) -> None:
         super().flush()
 
         for f in self._audio_bstream.flush():
-            self._audio_buf.send_nowait(f)
+            try:
+                self._audio_buf.send_nowait(f)
+            except Exception:
+                logger.warning("AudioStreamOutput: send_nowait failed in flush, dropping frame")
+                continue
             self._pushed_duration += f.duration
 
         if not self._pushed_duration:

@@ -45,7 +45,7 @@ export class SipAudioInput {
           if (self.attached) {
             const sr = self.endpoint.sampleRate;
             const samplesPerChannel = bytes.length / 2;
-            const data = new Int16Array(bytes.buffer, bytes.byteOffset, samplesPerChannel);
+            const data = Int16Array.from(new Int16Array(bytes.buffer, bytes.byteOffset, samplesPerChannel));
             controller.enqueue(new AudioFrame(data, sr, 1, samplesPerChannel));
 
             self.frameCount++;

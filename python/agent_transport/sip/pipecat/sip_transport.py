@@ -119,7 +119,8 @@ class SipInputTransport(BaseInputTransport):
                 result = await loop.run_in_executor(
                     None, lambda: self._ep.recv_audio_bytes_blocking(self._cid, 20)
                 )
-            except Exception:
+            except Exception as e:
+                logger.debug("SipInputTransport recv_audio error: %s", e)
                 break
             if result is not None:
                 audio_bytes, sample_rate, num_channels = result
@@ -145,7 +146,8 @@ class SipInputTransport(BaseInputTransport):
                 event = await asyncio.wait_for(self._event_queue.get(), timeout=0.5)
             except asyncio.TimeoutError:
                 continue
-            except Exception:
+            except Exception as e:
+                logger.debug("SipInputTransport event_loop error: %s", e)
                 break
             await self._handle_event(event)
 
@@ -157,7 +159,8 @@ class SipInputTransport(BaseInputTransport):
                 event = await loop.run_in_executor(
                     None, lambda: self._ep.wait_for_event(timeout_ms=100)
                 )
-            except Exception:
+            except Exception as e:
+                logger.debug("SipInputTransport endpoint event_loop error: %s", e)
                 break
             if event is None:
                 continue

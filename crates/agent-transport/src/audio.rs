@@ -67,6 +67,9 @@ impl AudioFrame {
     }
 
     /// Create from raw bytes (little-endian i16).
+    ///
+    /// Note: `chunks_exact(2)` silently drops a trailing odd byte if the input
+    /// length is not even. This is safe — a single byte cannot form a valid i16 sample.
     pub fn from_bytes(bytes: &[u8], sample_rate: u32, num_channels: u32) -> Self {
         let data: Vec<i16> = bytes
             .chunks_exact(2)

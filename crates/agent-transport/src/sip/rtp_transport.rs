@@ -43,7 +43,7 @@ impl RtpTransport {
         Self { socket, remote_addr: Mutex::new(remote), ssrc: rand::random(), codec, seq: AtomicU16::new(0), timestamp: AtomicU32::new(0), dtmf_pt, ptime_ms, cancel, pipeline_rate }
     }
 
-    fn remote(&self) -> SocketAddr { *self.remote_addr.lock().unwrap() }
+    fn remote(&self) -> SocketAddr { *self.remote_addr.lock().unwrap_or_else(|e| e.into_inner()) }
     fn spf(&self) -> u32 { self.codec.sample_rate() * self.ptime_ms / 1000 }
 
     async fn send(&self, pt: u8, ts: u32, marker: bool, payload: Vec<u8>) -> std::io::Result<()> {
@@ -55,13 +55,14 @@ impl RtpTransport {
     pub async fn send_dtmf_event(&self, digit: char, duration_ms: u32) -> std::io::Result<()> {
         let ev = dtmf::digit_to_event(digit).unwrap_or(0);
         let ts = self.timestamp.load(Ordering::Relaxed);
-        let dur = (8 * duration_ms) as u16;
+        let dur = (8u32.saturating_mul(duration_ms)).min(u16::MAX as u32) as u16;
         let pt = self.ptime_ms as u64;
         self.send(self.dtmf_pt, ts, true, dtmf::encode_rfc4733(ev, false, 10, 0).to_vec()).await?;
         tokio::time::sleep(Duration::from_millis(pt)).await;
         let steps = (duration_ms / self.ptime_ms).max(1);
         for i in 1..=steps {
-            self.send(self.dtmf_pt, ts, false, dtmf::encode_rfc4733(ev, false, 10, ((8 * self.ptime_ms * i) as u16).min(dur)).to_vec()).await?;
+            let step_dur = (8u32.saturating_mul(self.ptime_ms).saturating_mul(i)).min(dur as u32) as u16;
+            self.send(self.dtmf_pt, ts, false, dtmf::encode_rfc4733(ev, false, 10, step_dur).to_vec()).await?;
             tokio::time::sleep(Duration::from_millis(pt)).await;
         }
         for _ in 0..3 {
