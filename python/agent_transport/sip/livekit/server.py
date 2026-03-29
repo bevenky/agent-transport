@@ -648,6 +648,13 @@ class AgentServer:
                 reason = ev.get("reason", "unknown")
                 logger.info("Call %s terminated (reason=%s)", call_id, reason)
 
+                # Clear audio buffer immediately to abort any pending playout
+                # (prevents 5s "speech not done in time" timeout)
+                try:
+                    self._ep.clear_buffer(call_id)
+                except Exception:
+                    pass
+
                 # Emit participant_disconnected on Room facade (matches LiveKit WebRTC)
                 # RoomIO._on_participant_disconnected will call _close_soon() → session closes
                 ctx = self._call_contexts.get(call_id)

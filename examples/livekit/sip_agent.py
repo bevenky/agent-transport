@@ -73,8 +73,8 @@ class Assistant(Agent):
         )
 
     async def on_exit(self) -> None:
-        job_ctx = get_job_context()
-        job_ctx.room.off("sip_dtmf_received", self._on_dtmf)
+        # DTMF handler is cleaned up when the room is destroyed
+        pass
 
     def _on_dtmf(self, ev) -> None:
         logger.info("DTMF received: digit=%s code=%d", ev.digit, ev.code)
