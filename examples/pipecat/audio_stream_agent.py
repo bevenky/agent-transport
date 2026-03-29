@@ -69,9 +69,17 @@ async def run_bot(transport):
     #     volume=0.3,
     # )
 
-    # Rust-backed call recorder (optional)
-    # Records directly in Rust's 20ms send loop — OGG/Opus, stereo (L=user, R=agent)
-    recorder = AudioRecorder(transport, f"/tmp/call-{transport.session_id}.ogg")
+    # AudioRecorder = AudioBufferProcessor + Rust file recording
+    # Same callbacks (on_audio_data, on_track_audio_data, per-turn events)
+    # Plus OGG/Opus file via Rust's send loop (zero Python overhead)
+    recorder = AudioRecorder(transport,
+        path=f"/tmp/call-{transport.session_id}.ogg",
+        num_channels=2,
+    )
+
+    @recorder.event_handler("on_audio_data")
+    async def on_audio_data(audio, sample_rate, num_channels):
+        logger.info(f"Audio buffer: {len(audio)} bytes, {sample_rate}Hz, {num_channels}ch")
 
     @recorder.event_handler("on_recording_stopped")
     async def on_recording_stopped(recorder, path):
