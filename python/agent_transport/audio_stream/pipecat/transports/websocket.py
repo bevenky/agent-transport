@@ -1,74 +1,76 @@
-"""AudioStreamServer — server wrapper for Pipecat audio streaming.
+"""Rust-backed WebSocket server transport for Plivo audio streaming.
 
-Same decorator pattern as the LiveKit AudioStreamServer but for Pipecat pipelines:
+Drop-in replacement for pipecat.transports.websocket.server.WebsocketServerTransport.
+Audio pacing, codec negotiation, and Plivo protocol handling are done in Rust.
 
-    from agent_transport.audio_stream.pipecat import AudioStreamServer, AudioStreamTransport
+Usage:
+    from agent_transport.audio_stream.pipecat.serializers.plivo import PlivoFrameSerializer
+    from agent_transport.audio_stream.pipecat.transports.websocket import WebsocketServerTransport
 
-    server = AudioStreamServer()
+    serializer = PlivoFrameSerializer(auth_id="...", auth_token="...")
+    server = WebsocketServerTransport(serializer=serializer)
 
     @server.handler()
-    async def run_bot(transport: AudioStreamTransport):
+    async def run_bot(transport):
         pipeline = Pipeline([transport.input(), stt, llm, tts, transport.output()])
-        task = PipelineTask(pipeline, params=PipelineParams(...))
+        ...
 
-        @transport.event_handler("on_client_connected")
-        async def on_connected(transport):
-            await task.queue_frames([LLMRunFrame()])
-
-        @transport.event_handler("on_client_disconnected")
-        async def on_disconnected(transport):
-            await task.cancel()
-
-        await PipelineRunner().run(task)
-
-    if __name__ == "__main__":
-        server.run()
-
-Manages AudioStreamEndpoint lifecycle, session acceptance, transport creation,
-and concurrent session handling. Keeps bot code minimal and transport-agnostic.
+    server.run()
 """
 
 import asyncio
 import logging
-import os
+from dataclasses import dataclass, field
 from typing import Callable, Coroutine, Optional
 
 from agent_transport import AudioStreamEndpoint
 
-logger = logging.getLogger("agent_transport.audio_stream_server")
+logger = logging.getLogger("agent_transport.websocket_server")
 
 try:
     from pipecat.transports.base_transport import TransportParams
 except ImportError:
     TransportParams = None
 
-from .audio_stream_transport import AudioStreamTransport
+from ..audio_stream_transport import AudioStreamTransport
+from ..serializers.plivo import PlivoFrameSerializer
 
 
-class AudioStreamServer:
-    """Plivo audio streaming server for Pipecat pipelines.
+@dataclass
+class WebsocketServerParams:
+    """Parameters for WebsocketServerTransport.
 
-    Wraps AudioStreamEndpoint (Rust) and handles:
-    - Endpoint lifecycle (create, shutdown)
-    - Session acceptance loop
-    - AudioStreamTransport creation per session
-    - Concurrent session management
+    Matches pipecat.transports.websocket.server.WebsocketServerParams structure.
+    """
+    serializer: Optional[PlivoFrameSerializer] = None
+    transport_params: Optional["TransportParams"] = None
+
+
+class WebsocketServerTransport:
+    """Rust-backed WebSocket server transport for Plivo audio streaming.
+
+    Matches pipecat.transports.websocket.server.WebsocketServerTransport interface.
+    Wraps AudioStreamEndpoint (Rust) for WebSocket handling, codec negotiation,
+    and 20ms audio pacing. Manages session lifecycle and creates per-session
+    AudioStreamTransport instances.
+
+    Can be configured via PlivoFrameSerializer or direct keyword arguments.
     """
 
     def __init__(
         self,
         *,
-        listen_addr: Optional[str] = None,
-        plivo_auth_id: Optional[str] = None,
-        plivo_auth_token: Optional[str] = None,
-        sample_rate: int = 16000,
-        params: Optional["TransportParams"] = None,
+        serializer: Optional[PlivoFrameSerializer] = None,
+        params: Optional[WebsocketServerParams] = None,
+        transport_params: Optional["TransportParams"] = None,
     ) -> None:
-        self._listen_addr = listen_addr or os.environ.get("AUDIO_STREAM_ADDR", "0.0.0.0:8080")
-        self._plivo_auth_id = plivo_auth_id or os.environ.get("PLIVO_AUTH_ID", "")
-        self._plivo_auth_token = plivo_auth_token or os.environ.get("PLIVO_AUTH_TOKEN", "")
-        self._sample_rate = sample_rate
-        self._params = params
+        # Accept config from serializer, params, or defaults
+        s = serializer or (params.serializer if params else None) or PlivoFrameSerializer()
+        self._listen_addr = s.listen_addr
+        self._plivo_auth_id = s.auth_id
+        self._plivo_auth_token = s.auth_token
+        self._sample_rate = s.sample_rate
+        self._transport_params = transport_params or (params.transport_params if params else None)
         self._handler_fnc: Optional[Callable[..., Coroutine]] = None
         self._ep: Optional[AudioStreamEndpoint] = None
         self._active_sessions: dict[str, asyncio.Task] = {}
@@ -79,13 +81,14 @@ class AudioStreamServer:
         return self._ep
 
     def handler(self) -> Callable:
-        """Decorator to register the bot handler function.
+        """Decorator to register the bot handler.
 
-        The handler receives an AudioStreamTransport and should build + run the pipeline::
+        The handler receives an AudioStreamTransport per session::
 
             @server.handler()
             async def run_bot(transport: AudioStreamTransport):
-                ...
+                pipeline = Pipeline([transport.input(), ...])
+                await PipelineRunner().run(PipelineTask(pipeline))
         """
         def decorator(fn: Callable[..., Coroutine]) -> Callable:
             self._handler_fnc = fn
@@ -112,7 +115,7 @@ class AudioStreamServer:
             plivo_auth_token=self._plivo_auth_token,
             sample_rate=self._sample_rate,
         )
-        logger.info("AudioStream server listening on %s", self._listen_addr)
+        logger.info("WebSocket server listening on %s", self._listen_addr)
 
         try:
             await self._session_loop()
@@ -153,7 +156,7 @@ class AudioStreamServer:
             transport = AudioStreamTransport(
                 self._ep, session_id,
                 session_data=session,
-                params=self._params or TransportParams(
+                params=self._transport_params or TransportParams(
                     audio_in_enabled=True,
                     audio_out_enabled=True,
                 ),

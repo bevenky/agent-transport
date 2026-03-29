@@ -42,27 +42,31 @@ See [LiveKit SIP Transport docs](docs/livekit_interface_sip.md) for recording, P
 Same `Pipeline` — swap transport, everything else stays identical. Audio pacing moves from Python to Rust:
 
 ```python
-# Pipecat + Plivo                                # Agent Transport (Rust audio pacing)
-from pipecat.serializers.plivo import             from agent_transport.audio_stream.pipecat import
-    PlivoFrameSerializer                              AudioStreamServer
-from pipecat.transports.websocket.fastapi import  server = AudioStreamServer()
-    FastAPIWebsocketTransport
-                                                  @server.handler()
-serializer = PlivoFrameSerializer(                async def run_bot(transport):
-    stream_id=..., call_id=...)                       pipeline = Pipeline([
-transport = FastAPIWebsocketTransport(                    transport.input(), stt, llm, tts,
-    websocket=ws, params=Params(                          transport.output()])
-        serializer=serializer))                       task = PipelineTask(pipeline)
-pipeline = Pipeline([
-    transport.input(), stt, llm, tts,                 @transport.event_handler("on_client_connected")
-    transport.output()])                              async def on_connected(transport):
-task = PipelineTask(pipeline)                             await task.queue_frames([LLMRunFrame()])
+# Pipecat + Plivo (Python audio pacing)          # Agent Transport (Rust audio pacing)
+from pipecat.serializers.plivo import             from agent_transport.audio_stream.pipecat \
+    PlivoFrameSerializer                              .serializers.plivo import PlivoFrameSerializer
+from pipecat.transports.websocket.fastapi import  from agent_transport.audio_stream.pipecat \
+    FastAPIWebsocketTransport                         .transports.websocket import WebsocketServerTransport
 
-@transport.event_handler("on_client_connected")       await PipelineRunner().run(task)
-async def on_connected(transport, client):
-    await task.queue_frames([LLMRunFrame()])       server.run()
+serializer = PlivoFrameSerializer(                serializer = PlivoFrameSerializer(
+    stream_id=..., call_id=...,                       auth_id=..., auth_token=...)
+    auth_id=..., auth_token=...)                  server = WebsocketServerTransport(
+transport = FastAPIWebsocketTransport(                serializer=serializer)
+    websocket=ws, params=Params(
+        serializer=serializer))                   @server.handler()
+                                                  async def run_bot(transport):
+pipeline = Pipeline([                                 pipeline = Pipeline([
+    transport.input(), stt, llm, tts,                     transport.input(), stt, llm, tts,
+    transport.output()])                                   transport.output()])
+task = PipelineTask(pipeline)                         task = PipelineTask(pipeline)
 
-await PipelineRunner().run(task)
+@transport.event_handler("on_client_connected")       @transport.event_handler("on_client_connected")
+async def on_connected(transport, client):            async def on_connected(transport):
+    await task.queue_frames([LLMRunFrame()])               await task.queue_frames([LLMRunFrame()])
+
+await PipelineRunner().run(task)                      await PipelineRunner().run(task)
+
+                                                  server.run()
 ```
 
 Also available for SIP/RTP: `from agent_transport.sip.pipecat import SipTransport`

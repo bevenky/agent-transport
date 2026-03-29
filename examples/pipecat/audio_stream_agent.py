@@ -10,7 +10,8 @@ import os
 from dotenv import load_dotenv
 from loguru import logger
 
-from agent_transport.audio_stream.pipecat import AudioStreamServer, AudioStreamTransport
+from agent_transport.audio_stream.pipecat.serializers.plivo import PlivoFrameSerializer
+from agent_transport.audio_stream.pipecat.transports.websocket import WebsocketServerTransport
 
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.frames.frames import LLMRunFrame
@@ -28,11 +29,12 @@ from pipecat.services.openai.tts import OpenAITTSService
 
 load_dotenv()
 
-server = AudioStreamServer()
+serializer = PlivoFrameSerializer()
+server = WebsocketServerTransport(serializer=serializer)
 
 
 @server.handler()
-async def run_bot(transport: AudioStreamTransport):
+async def run_bot(transport):
     llm = OpenAILLMService(
         api_key=os.getenv("OPENAI_API_KEY"),
         settings=OpenAILLMService.Settings(

@@ -1,15 +1,23 @@
-"""Pipecat adapters for audio stream transport."""
+"""Pipecat adapters for Plivo audio stream transport (Rust-backed).
 
+Module structure mirrors pipecat's layout:
+    agent_transport.audio_stream.pipecat.serializers.plivo  → PlivoFrameSerializer
+    agent_transport.audio_stream.pipecat.transports.websocket → WebsocketServerTransport
+"""
+
+from .serializers.plivo import PlivoFrameSerializer
+from .transports.websocket import WebsocketServerTransport, WebsocketServerParams
 from .audio_stream_transport import (
     AudioStreamTransport,
     AudioStreamInputTransport,
     AudioStreamOutputTransport,
 )
-from .audio_stream_server import AudioStreamServer
 
 __all__ = [
+    "PlivoFrameSerializer",
+    "WebsocketServerTransport",
+    "WebsocketServerParams",
     "AudioStreamTransport",
     "AudioStreamInputTransport",
     "AudioStreamOutputTransport",
-    "AudioStreamServer",
 ]
