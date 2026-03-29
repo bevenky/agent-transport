@@ -318,8 +318,7 @@ impl SipEndpoint {
                 .map_err(|e| err(format!("DNS resolve failed for {}:{}: {}", srv, port, e)))?
                 .next().ok_or_else(|| err(format!("DNS returned no results for {}", srv)))?;
             info!("SIP server {} resolved to {}", srv, resolved_addr);
-            reg.outbound_proxy = Some(resolved_addr);
-            let server_uri: rsip::Uri = format!("sip:{}", srv).try_into().map_err(|e| err(format!("{:?}", e)))?;
+            let server_uri: rsip::Uri = format!("sip:{}:{}", resolved_addr.ip(), resolved_addr.port()).try_into().map_err(|e| err(format!("{:?}", e)))?;
             // AOR (Address of Record) — sip:user@domain — used as From in outbound calls
             let aor: rsip::Uri = format!("sip:{}@{}", user, srv).try_into().map_err(|e| err(format!("{:?}", e)))?;
             let resp = reg.register(server_uri.clone(), Some(exp)).await.map_err(err)?;
