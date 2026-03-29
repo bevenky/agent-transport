@@ -117,6 +117,10 @@ pub struct Registration {
     /// Public address detected by the server (IP and port)
     pub public_address: Option<rsip::HostWithPort>,
     pub call_id: rsip::headers::CallId,
+    /// Outbound proxy — override transport destination while keeping the
+    /// domain in SIP headers. Used for NAT traversal with load-balanced
+    /// proxy clusters where DNS may resolve to different IPs.
+    pub outbound_proxy: Option<std::net::SocketAddr>,
 }
 
 impl Registration {
@@ -165,6 +169,7 @@ impl Registration {
             allow: Default::default(),
             public_address: None,
             call_id,
+            outbound_proxy: None,
         }
     }
 
@@ -417,6 +422,13 @@ impl Registration {
 
         let key = TransactionKey::from_request(&request, TransactionRole::Client)?;
         let mut tx = Transaction::new_client(key, request, self.endpoint.clone(), None);
+
+        // Override transport destination if outbound proxy is configured.
+        // This keeps the domain in SIP headers (Request-URI, From, To) while
+        // sending all packets to the pinned proxy IP for NAT consistency.
+        if let Some(proxy) = &self.outbound_proxy {
+            tx.destination = Some(SipAddr::from(*proxy));
+        }
 
         tx.send().await?;
         let mut auth_sent = false;

@@ -307,6 +307,18 @@ impl SipEndpoint {
             let stun_hp: rsip::HostWithPort = format!("{}:{}", ch, cp).try_into().map_err(|e| err(format!("{:?}", e)))?;
             reg.public_address = Some(stun_hp);
 
+            // Pin outbound proxy to resolved IP for NAT consistency.
+            // Resolve SIP server DNS once and pin the IP for NAT consistency.
+            // SIP domains may resolve to different proxy cluster IPs each time.
+            // Behind NAT, the UDP mapping is per-destination-IP — if we send to
+            // different IPs, the NAT mapping breaks and incoming INVITEs get dropped.
+            // We set outbound_proxy on the Registration to pin all SIP signaling
+            // to one proxy node while keeping the domain in SIP headers.
+            let resolved_addr = tokio::net::lookup_host(format!("{}:{}", srv, port)).await
+                .map_err(|e| err(format!("DNS resolve failed for {}:{}: {}", srv, port, e)))?
+                .next().ok_or_else(|| err(format!("DNS returned no results for {}", srv)))?;
+            info!("SIP server {} resolved to {}", srv, resolved_addr);
+            reg.outbound_proxy = Some(resolved_addr);
             let server_uri: rsip::Uri = format!("sip:{}", srv).try_into().map_err(|e| err(format!("{:?}", e)))?;
             // AOR (Address of Record) — sip:user@domain — used as From in outbound calls
             let aor: rsip::Uri = format!("sip:{}@{}", user, srv).try_into().map_err(|e| err(format!("{:?}", e)))?;
@@ -349,8 +361,8 @@ impl SipEndpoint {
                 // before the next re-registration, causing incoming INVITEs to be lost.
                 let udp_ka = st.lock().unwrap().udp_conn.clone();
                 if let Some(udp_ka) = udp_ka {
-                    let hp: rsip::HostWithPort = format!("{}:{}", srv, port).try_into().unwrap();
-                    let sip_dest = SipAddr::new(rsip::Transport::Udp, hp);
+                    // Keepalive to the same resolved proxy IP as registration
+                    let sip_dest = SipAddr::from(resolved_addr);
                     tokio::spawn(async move {
                         let mut iv = tokio::time::interval(std::time::Duration::from_secs(15));
                         loop {
