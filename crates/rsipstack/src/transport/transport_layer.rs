@@ -482,9 +482,12 @@ impl TransportLayerInner {
     pub fn serve_connection(&self, transport: SipConnection) {
         let sub_token = self.cancel_token.child_token();
         let sender_clone = self.transport_tx.clone();
+        info!(addr=%transport.get_addr(), "serve_connection: starting serve_loop");
         tokio::spawn(async move {
             match sender_clone.send(TransportEvent::New(transport.clone())) {
-                Ok(()) => {}
+                Ok(()) => {
+                    info!(addr=%transport.get_addr(), "serve_connection: New event sent");
+                }
                 Err(e) => {
                     warn!(addr=%transport.get_addr(), error = ?e, "Error sending new connection event");
                     return;

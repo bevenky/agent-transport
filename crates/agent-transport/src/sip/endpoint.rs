@@ -69,6 +69,8 @@ struct EndpointState {
     aor: Option<rsip::Uri>,
     local_addr: Option<SipAddr>,
     public_addr: Option<SocketAddr>,
+    /// Resolved SIP server address (pinned for TCP connection reuse).
+    sip_server_addr: Option<SocketAddr>,
 }
 
 // ─── Shared helpers ──────────────────────────────────────────────────────────
@@ -231,7 +233,7 @@ impl SipEndpoint {
         let state = Arc::new(Mutex::new(EndpointState {
             registered: false, calls: HashMap::new(),
             dialog_layer: None, credential: None, contact_uri: None, aor: None,
-            local_addr: None, public_addr: None,
+            local_addr: None, public_addr: None, sip_server_addr: None,
         }));
 
         let (st, cc, etx2, ua, isr, osr) = (state.clone(), cancel.clone(), etx.clone(), config.user_agent.clone(), config.input_sample_rate, config.output_sample_rate);
@@ -286,6 +288,7 @@ impl SipEndpoint {
             let mut s = st.lock().unwrap();
             s.dialog_layer = Some(dl);
             s.local_addr = Some(la);
+            s.sip_server_addr = Some(remote_addr);
             Ok::<_, EndpointError>(())
         })?;
 
@@ -321,6 +324,13 @@ impl SipEndpoint {
 
             // server_uri with transport=tcp so rsipstack routes via TCP
             let server_uri: rsip::Uri = format!("sip:{};transport=tcp", srv).try_into().map_err(|e| err(format!("{:?}", e)))?;
+            // Pin re-registration to the resolved IP so it reuses the existing TCP connection.
+            // Without this, DNS re-resolution may return a different IP, causing lookup() to
+            // open a new TCP connection and breaking the Via alias mapping.
+            let sip_addr = st.lock().unwrap().sip_server_addr;
+            if let Some(addr) = sip_addr {
+                reg.outbound_proxy = Some(addr);
+            }
             let aor: rsip::Uri = format!("sip:{}@{}", user, srv).try_into().map_err(|e| err(format!("{:?}", e)))?;
             let resp = reg.register(server_uri.clone(), Some(exp)).await.map_err(err)?;
 
