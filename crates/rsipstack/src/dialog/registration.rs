@@ -470,7 +470,8 @@ impl Registration {
                                     auth: contact_for_retry.uri.auth.clone(),
                                     scheme: Some(rsip::Scheme::Sip),
                                     host_with_port: pa.clone(),
-                                    params: vec![],
+                                    // Preserve URI params (e.g., transport=tcp) from original Contact
+                                    params: contact_for_retry.uri.params.clone(),
                                     headers: vec![],
                                 };
                                 let mut new_contact = contact_for_retry.clone();

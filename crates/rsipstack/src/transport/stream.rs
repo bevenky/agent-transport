@@ -272,7 +272,9 @@ pub async fn send_to_stream<W>(write_half: &Mutex<W>, msg: SipMessage) -> Result
 where
     W: AsyncWrite + Unpin + Send,
 {
-    send_raw_to_stream(write_half, msg.to_string().as_bytes()).await
+    let data = msg.to_string();
+    tracing::debug!(raw_message = %data, "tcp send");
+    send_raw_to_stream(write_half, data.as_bytes()).await
 }
 
 pub async fn send_raw_to_stream<W>(write_half: &Mutex<W>, data: &[u8]) -> Result<()>
