@@ -414,6 +414,12 @@ impl Registration {
         request.headers.unique_push(self.call_id.clone().into());
         request.headers.unique_push(contact.into());
         request.headers.unique_push(self.allow.clone().into());
+        // RFC 3327 Path + RFC 5626 Outbound: tell the proxy to record
+        // a Path header so INVITEs route through the correct edge node
+        // (the one with our TCP connection).
+        request.headers.unique_push(
+            rsip::Header::Other("Supported".into(), "path, outbound".into())
+        );
         if let Some(expires) = expires {
             request
                 .headers

@@ -368,9 +368,30 @@ impl SipEndpoint {
     }
 
     pub fn unregister(&self) -> Result<()> {
-        let mut s = self.state.lock().unwrap();
+        let (srv, st, etx) = (self.config.sip_server.clone(), self.state.clone(), self.event_tx.clone());
+        self.runtime.block_on(async {
+            let (ei, cred) = {
+                let s = st.lock().unwrap();
+                (s.dialog_layer.as_ref().cloned(), s.credential.clone())
+            };
+            if let (Some(ei), Some(cred)) = (ei, cred) {
+                let sip_addr = st.lock().unwrap().sip_server_addr;
+                let mut reg = Registration::new(ei.endpoint.clone(), Some(cred));
+                if let Some(addr) = sip_addr {
+                    reg.outbound_proxy = Some(addr);
+                }
+                let server_uri: rsip::Uri = format!("sip:{};transport=tcp", srv)
+                    .try_into().unwrap_or_default();
+                // REGISTER with Expires: 0 to unregister
+                match reg.register(server_uri, Some(0)).await {
+                    Ok(r) => debug!("Unregistered: {}", r.status_code),
+                    Err(e) => debug!("Unregister failed: {}", e),
+                }
+            }
+        });
+        let mut s = st.lock().unwrap();
         s.registered = false;
-        let _ = self.event_tx.try_send(EndpointEvent::Unregistered);
+        let _ = etx.try_send(EndpointEvent::Unregistered);
         Ok(())
     }
 
@@ -741,6 +762,10 @@ impl SipEndpoint {
 
     pub fn shutdown(&self) -> Result<()> {
         if self.cancel.is_cancelled() { return Ok(()); }
+        // Unregister before shutdown to clear stale registrations at the proxy.
+        // Without this, the proxy keeps the old Contact for up to 120s,
+        // causing 486 BusyHere for new registrations with the same AOR.
+        let _ = self.unregister();
         self.cancel.cancel();
         let ids: Vec<String> = self.state.lock().unwrap().calls.keys().cloned().collect();
         for id in ids { let _ = self.hangup(&id); }
