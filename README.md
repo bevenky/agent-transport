@@ -153,6 +153,10 @@ npm install @livekit/agents @livekit/agents-plugin-silero \
 
 # 4. Download turn detection models (required for MultilingualModel)
 npx tsx examples/livekit/sip_agent.ts download-files
+
+# 5. Run examples (from the adapter directory)
+cd node/agent-transport-sip-livekit
+NODE_PATH="$(pwd)/node_modules" npx tsx ../../examples/livekit/sip_agent.ts dev
 ```
 
 ## Examples
