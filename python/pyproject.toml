@@ -13,8 +13,8 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-livekit = ["livekit-agents>=1.0"]
-pipecat = ["pipecat-ai>=0.0.50"]
+livekit = ["livekit-agents>=1.5"]
+pipecat = ["pipecat-ai>=0.0.108"]
 all = ["agent-transport-adapters[livekit,pipecat]"]
 
 [tool.setuptools.packages.find]

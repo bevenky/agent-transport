@@ -118,6 +118,8 @@ cargo build --features audio-processing         # + jitter buffer, PLC, comfort 
 
 ### Python
 
+Minimum versions: `livekit-agents>=1.5`, `pipecat-ai>=0.0.108`
+
 ```bash
 # 1. Build the native Rust binding
 cd crates/agent-transport-python && pip install -e .
@@ -134,6 +136,8 @@ pip install livekit-plugins-turn-detector       # Optional: ML-based turn detect
 ```
 
 ### TypeScript / Node.js
+
+Minimum versions: `@livekit/agents>=1.2`, `@livekit/rtc-node>=0.13`
 
 ```bash
 # 1. Build the native Rust binding
