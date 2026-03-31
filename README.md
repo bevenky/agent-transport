@@ -150,6 +150,9 @@ cd node/agent-transport-sip-livekit && npm install && npm run build
 npm install @livekit/agents @livekit/agents-plugin-silero \
   @livekit/agents-plugin-deepgram @livekit/agents-plugin-openai \
   @livekit/agents-plugin-livekit zod
+
+# 4. Download turn detection models (required for MultilingualModel)
+npx tsx examples/livekit/sip_agent.ts download-files
 ```
 
 ## Examples

@@ -23,6 +23,7 @@
 import { createServer, type Server, type IncomingMessage, type ServerResponse } from 'node:http';
 import { hostname, cpus } from 'node:os';
 import { AudioStreamEndpoint } from 'agent-transport';
+import { initializeLogger, InferenceRunner, runWithJobContext } from '@livekit/agents';
 import { AudioStreamJobContext } from './audio_stream_context.js';
 import { JobProcess } from './agent_server.js';
 
@@ -112,7 +113,7 @@ export class AudioStreamServer {
   /**
    * LiveKit-compatible setup_fnc setter — accepts a function that receives a JobProcess.
    */
-  set setupFnc(fn: (proc: JobProcess) => void | Record<string, unknown>) {
+  set setupFnc(fn: (proc: JobProcess) => void | Record<string, unknown> | Promise<void | Record<string, unknown>>) {
     this.setupFn = fn as any;
   }
 
@@ -132,14 +133,19 @@ export class AudioStreamServer {
     // Initialize inference executor (for turn detection)
     if (this.setupFn) {
       try {
-        const agents = await import('@livekit/agents');
-        const InferenceRunner = (agents as any).InferenceRunner;
+        initializeLogger({ pretty: true, level: 'info' });
         const runners = InferenceRunner?.registeredRunners;
 
         if (runners && Object.keys(runners).length > 0) {
-          // @ts-ignore — optional deep import, may not exist in all versions
-          const mod = await import('@livekit/agents/dist/ipc/inference_proc_executor.js').catch(() => null);
-          const InferenceProcExecutor = mod?.InferenceProcExecutor ?? null;
+          let InferenceProcExecutor: any = null;
+          try {
+            const { createRequire } = await import('node:module');
+            const require = createRequire(import.meta.url);
+            const agentsPath = require.resolve('@livekit/agents');
+            const execPath = agentsPath.replace(/dist\/index\.(c?)js$/, 'dist/ipc/inference_proc_executor.$1js');
+            const mod = require(execPath);
+            InferenceProcExecutor = mod?.InferenceProcExecutor ?? null;
+          } catch { /* not available */ }
 
           if (InferenceProcExecutor) {
             this.inferenceExecutor = new InferenceProcExecutor({
@@ -159,17 +165,17 @@ export class AudioStreamServer {
         }
 
         // Run setup with job context stub for inference executor
-        if (this.inferenceExecutor && (agents as any).runWithJobContext) {
-          const stub = { inferenceExecutor: this.inferenceExecutor };
-          (agents as any).runWithJobContext(stub, () => this.callSetupFn());
+        if (this.inferenceExecutor) {
+          const stub = { inferenceExecutor: this.inferenceExecutor } as any;
+          await runWithJobContext(stub, () => this.callSetupFn());
         } else {
-          this.callSetupFn();
+          await this.callSetupFn();
         }
-        console.log(`Setup complete: ${Object.keys(this.userdata).join(', ')}`);
-      } catch {
-        this.callSetupFn();
-        console.log(`Setup complete: ${Object.keys(this.userdata).join(', ')}`);
+      } catch (e) {
+        console.warn('Setup failed:', (e as Error)?.message || e);
+        await this.callSetupFn();
       }
+      console.log(`Setup complete: ${Object.keys(this.userdata).join(', ')}`);
     }
 
     // Create AudioStreamEndpoint (starts WS server)
@@ -217,18 +223,11 @@ export class AudioStreamServer {
   /**
    * Call the setup function, supporting both LiveKit proc pattern and plain pattern.
    */
-  private callSetupFn(): void {
+  private async callSetupFn(): Promise<void> {
     if (!this.setupFn) return;
-    try {
-      const result = (this.setupFn as any)(this.proc);
-      if (result && typeof result === 'object') {
-        Object.assign(this.proc.userData, result);
-      }
-    } catch {
-      const result = (this.setupFn as any)();
-      if (result && typeof result === 'object') {
-        Object.assign(this.proc.userData, result);
-      }
+    const result = await (this.setupFn as any)(this.proc);
+    if (result && typeof result === 'object' && !(result instanceof Promise)) {
+      Object.assign(this.proc.userData, result);
     }
     this.userdata = this.proc.userData;
   }

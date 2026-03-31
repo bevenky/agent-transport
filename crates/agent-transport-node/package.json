@@ -2,6 +2,7 @@
   "name": "agent-transport",
   "version": "0.1.0",
   "description": "SIP and audio streaming transport for AI voice agents (pure Rust)",
+  "type": "module",
   "main": "index.js",
   "types": "index.d.ts",
   "license": "MIT",
@@ -15,8 +16,8 @@
     ]
   },
   "scripts": {
-    "build": "CMAKE_POLICY_VERSION_MINIMUM=3.5 napi build --release",
-    "build:debug": "CMAKE_POLICY_VERSION_MINIMUM=3.5 napi build"
+    "build": "CMAKE_POLICY_VERSION_MINIMUM=3.5 napi build --release --no-js",
+    "build:debug": "CMAKE_POLICY_VERSION_MINIMUM=3.5 napi build --no-js"
   },
   "devDependencies": {
     "@napi-rs/cli": "^3"

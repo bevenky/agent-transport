@@ -21,8 +21,8 @@ const server = new AgentServer({
   sipServer: process.env.SIP_DOMAIN ?? 'phone.plivo.com',
 });
 
-server.setupFnc = (proc: JobProcess) => {
-  proc.userData.vad = silero.VAD.load();
+server.setupFnc = async (proc: JobProcess) => {
+  proc.userData.vad = await silero.VAD.load();
   proc.userData.turnDetector = new livekit.turnDetector.MultilingualModel();
 };
 

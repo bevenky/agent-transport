@@ -20,6 +20,7 @@ import { cpus } from 'node:os';
 import { hostname } from 'node:os';
 import { mkdirSync } from 'node:fs';
 import { SipEndpoint } from 'agent-transport';
+import { initializeLogger, InferenceRunner, runWithJobContext } from '@livekit/agents';
 import { JobContext } from './call_context.js';
 
 export class JobProcess {
@@ -139,7 +140,7 @@ export class AgentServer {
   /**
    * LiveKit-compatible setup_fnc setter — accepts a function that receives a JobProcess.
    */
-  set setupFnc(fn: (proc: JobProcess) => void | Record<string, unknown>) {
+  set setupFnc(fn: (proc: JobProcess) => void | Record<string, unknown> | Promise<void | Record<string, unknown>>) {
     this.setupFn = fn as any;
   }
 
@@ -155,6 +156,20 @@ export class AgentServer {
    */
   async run(): Promise<void> {
     const mode = process.argv[2] ?? 'start';
+
+    // Handle download-files command (downloads model files for turn detection etc.)
+    if (mode === 'download-files') {
+      initializeLogger({ pretty: true, level: 'info' });
+      const { Plugin, log: agentLog } = await import('@livekit/agents');
+      const logger = agentLog();
+      for (const plugin of Plugin.registeredPlugins) {
+        logger.info(`Downloading files for ${plugin.title}`);
+        await plugin.downloadFiles();
+        logger.info(`Finished: ${plugin.title}`);
+      }
+      process.exit(0);
+    }
+
     this.configureLogging(mode);
 
     if (!this.sipUsername || !this.sipPassword) {
@@ -173,21 +188,25 @@ export class AgentServer {
       process.exit(1);
     }
 
-    // Initialize inference executor for turn detection (subprocess, same as LiveKit).
-    // Then run setup function within a stub JobContext so MultilingualModel()
-    // can access the executor without a real LiveKit job context.
-    // Initialize inference executor and run setup.
-    // Uses runWithJobContext to provide inference executor to turn detection models.
+    // Initialize LiveKit logger and inference executor before setup.
     if (this.setupFn) {
       try {
-        const agents = await import('@livekit/agents');
-        const InferenceRunner = (agents as any).InferenceRunner;
+        // Initialize logger (required by LiveKit SDK before creating any agents/models)
+        initializeLogger({ pretty: true, level: 'info' });
         const runners = InferenceRunner?.registeredRunners;
+        console.log('[init] Inference runners:', runners ? Object.keys(runners) : 'none');
 
         if (runners && Object.keys(runners).length > 0) {
-          // @ts-ignore — optional deep import, may not exist in all versions
-          const mod = await import('@livekit/agents/dist/ipc/inference_proc_executor.js').catch(() => null);
-          const InferenceProcExecutor = mod?.InferenceProcExecutor ?? null;
+          // InferenceProcExecutor is not publicly exported — resolve via absolute path
+          let InferenceProcExecutor: any = null;
+          try {
+            const { createRequire } = await import('node:module');
+            const require = createRequire(import.meta.url);
+            const agentsPath = require.resolve('@livekit/agents');
+            const execPath = agentsPath.replace(/dist\/index\.(c?)js$/, 'dist/ipc/inference_proc_executor.$1js');
+            const mod = require(execPath);
+            InferenceProcExecutor = mod?.InferenceProcExecutor ?? null;
+          } catch { /* not available in this SDK version */ }
 
           if (InferenceProcExecutor) {
             this.inferenceExecutor = new InferenceProcExecutor({
@@ -207,14 +226,15 @@ export class AgentServer {
         }
 
         // Run setup within job context stub so MultilingualModel() works
-        if (this.inferenceExecutor && (agents as any).runWithJobContext) {
+        if (this.inferenceExecutor) {
           const stub = { inferenceExecutor: this.inferenceExecutor } as any;
-          (agents as any).runWithJobContext(stub, () => this.callSetupFn());
+          await runWithJobContext(stub as any, () => this.callSetupFn());
         } else {
-          this.callSetupFn();
+          await this.callSetupFn();
         }
-      } catch {
-        this.callSetupFn();
+      } catch (e) {
+        console.warn('Setup failed:', (e as Error)?.stack || e);
+        await this.callSetupFn();
       }
       console.log(`Setup complete: ${Object.keys(this.userdata).join(', ')}`);
     }
@@ -269,18 +289,11 @@ export class AgentServer {
   /**
    * Call the setup function, supporting both LiveKit proc pattern and plain pattern.
    */
-  private callSetupFn(): void {
+  private async callSetupFn(): Promise<void> {
     if (!this.setupFn) return;
-    try {
-      const result = (this.setupFn as any)(this.proc);
-      if (result && typeof result === 'object') {
-        Object.assign(this.proc.userData, result);
-      }
-    } catch {
-      const result = (this.setupFn as any)();
-      if (result && typeof result === 'object') {
-        Object.assign(this.proc.userData, result);
-      }
+    const result = await (this.setupFn as any)(this.proc);
+    if (result && typeof result === 'object' && !(result instanceof Promise)) {
+      Object.assign(this.proc.userData, result);
     }
     this.userdata = this.proc.userData;
   }
@@ -398,9 +411,6 @@ export class AgentServer {
       try {
         // Wrap in runWithJobContext so getJobContext().room works inside handler
         // (matches LiveKit WebRTC where entrypoint runs inside job context)
-        let agents: any;
-        try { agents = await import('@livekit/agents'); } catch {}
-
         const stub = {
           room: ctx.room,
           job: { id: `job-${callId}`, agentName: this.agentName, enableRecording: false },
@@ -414,8 +424,8 @@ export class AgentServer {
           shutdown: () => {},
         };
 
-        if (agents?.runWithJobContext) {
-          await agents.runWithJobContext(stub, () => this.entrypointFn!(ctx));
+        if (runWithJobContext) {
+          await runWithJobContext(stub as any, () => this.entrypointFn!(ctx));
         } else {
           await this.entrypointFn!(ctx);
         }
