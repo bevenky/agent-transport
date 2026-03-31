@@ -17,9 +17,9 @@
     "@livekit/rtc-node": ">=0.12.0"
   },
   "devDependencies": {
-    "typescript": "^5.0.0",
+    "@livekit/agents": "^1.2.2",
+    "@livekit/rtc-node": "^0.13.24",
     "@types/node": "^20.0.0",
-    "@livekit/agents": ">=0.5.0",
-    "@livekit/rtc-node": ">=0.12.0"
+    "typescript": "^5.0.0"
   }
 }

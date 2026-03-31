@@ -303,8 +303,8 @@ export class TransportRoom extends EventEmitter {
 
 // Aliases for audio streaming
 export class AudioStreamInput extends SipAudioInput {
-  constructor(endpoint: TransportEndpoint, sessionId: string, label = 'audio-stream-input') {
-    super(endpoint, sessionId, label);
+  constructor(endpoint: TransportEndpoint, sessionId: string) {
+    super(endpoint as any, sessionId);
   }
 }
 
@@ -319,6 +319,6 @@ export class AudioStreamOutput extends SipAudioOutput {
       nextInChain?: SipAudioOutput;
     },
   ) {
-    super(endpoint, sessionId, options?.sampleRate, options?.nextInChain);
+    super(endpoint as any, sessionId, options?.sampleRate, options?.nextInChain);
   }
 }

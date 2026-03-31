@@ -177,7 +177,8 @@ export class AudioStreamServer {
       listenAddr: this.listenAddr,
       plivoAuthId: this.plivoAuthId,
       plivoAuthToken: this.plivoAuthToken,
-      sampleRate: this.sampleRate,
+      inputSampleRate: this.sampleRate,
+      outputSampleRate: this.sampleRate,
     });
     console.log(`Audio stream WebSocket server on ws://${this.listenAddr}`);
 

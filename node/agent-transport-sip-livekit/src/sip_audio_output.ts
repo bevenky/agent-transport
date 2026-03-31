@@ -131,7 +131,7 @@ export class SipAudioOutput extends EventEmitter {
           this.callId,
           frameData,
           frame.sampleRate,
-          frame.numChannels,
+          frame.channels,
           () => resolve(),
         );
       } catch (e) {
