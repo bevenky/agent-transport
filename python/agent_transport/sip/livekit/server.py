@@ -814,4 +814,16 @@ def run_app(server: AgentServer) -> None:
         """Run in debug mode (DEBUG everything including Rust SIP/RTP)."""
         asyncio.run(server._run(log_mode="debug"))
 
+    @app.command(name="download-files")
+    def download_files() -> None:
+        """Download model files for plugins (turn detection, VAD, etc.)."""
+        import logging as _logging
+        from livekit.agents import Plugin
+
+        _logging.basicConfig(level=_logging.DEBUG)
+        for plugin in Plugin.registered_plugins:
+            logger.info("Downloading files for %s", plugin.package)
+            plugin.download_files()
+            logger.info("Finished downloading files for %s", plugin.package)
+
     app()

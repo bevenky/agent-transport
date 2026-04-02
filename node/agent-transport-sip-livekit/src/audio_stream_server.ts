@@ -122,6 +122,21 @@ export class AudioStreamServer {
   }
 
   async run(): Promise<void> {
+    const mode = process.argv[2] ?? 'start';
+
+    // Handle download-files command (downloads model files for turn detection etc.)
+    if (mode === 'download-files') {
+      initializeLogger({ pretty: true, level: 'info' });
+      const { Plugin, log: agentLog } = await import('@livekit/agents');
+      const logger = agentLog();
+      for (const plugin of Plugin.registeredPlugins) {
+        logger.info(`Downloading files for ${plugin.title}`);
+        await plugin.downloadFiles();
+        logger.info(`Finished: ${plugin.title}`);
+      }
+      process.exit(0);
+    }
+
     if (!this.entrypointFn) {
       console.error(
         'No audio stream session entrypoint registered.\n' +
