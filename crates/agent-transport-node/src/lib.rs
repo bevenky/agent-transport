@@ -112,7 +112,7 @@ impl AudioFrame {
 #[napi(object)]
 #[derive(Clone)]
 pub struct CallSession {
-    pub call_id: String,
+    pub session_id: String,
     pub call_uuid: Option<String>,
     pub direction: String,
     pub state: String,
@@ -124,7 +124,7 @@ pub struct CallSession {
 impl From<RustCallSession> for CallSession {
     fn from(s: RustCallSession) -> Self {
         Self {
-            call_id: s.call_id,
+            session_id: s.session_id,
             call_uuid: s.call_uuid,
             direction: format!("{:?}", s.direction),
             state: format!("{:?}", s.state),
@@ -159,7 +159,7 @@ pub struct EndpointConfig {
 #[derive(Clone)]
 pub struct EventInfo {
     pub event_type: String,
-    pub call_id: Option<String>,
+    pub session_id: Option<String>,
     pub session: Option<CallSession>,
     pub error: Option<String>,
     pub reason: Option<String>,
@@ -173,7 +173,7 @@ fn event_to_info(event: &EndpointEvent) -> EventInfo {
     match event {
         EndpointEvent::Registered => EventInfo {
             event_type: "registered".into(),
-            call_id: None,
+            session_id: None,
             session: None,
             error: None,
             reason: None,
@@ -184,7 +184,7 @@ fn event_to_info(event: &EndpointEvent) -> EventInfo {
         },
         EndpointEvent::RegistrationFailed { error } => EventInfo {
             event_type: "registration_failed".into(),
-            call_id: None,
+            session_id: None,
             session: None,
             error: Some(error.clone()),
             reason: None,
@@ -195,7 +195,7 @@ fn event_to_info(event: &EndpointEvent) -> EventInfo {
         },
         EndpointEvent::Unregistered => EventInfo {
             event_type: "unregistered".into(),
-            call_id: None,
+            session_id: None,
             session: None,
             error: None,
             reason: None,
@@ -206,7 +206,7 @@ fn event_to_info(event: &EndpointEvent) -> EventInfo {
         },
         EndpointEvent::IncomingCall { session } => EventInfo {
             event_type: "incoming_call".into(),
-            call_id: Some(session.call_id.clone()),
+            session_id: Some(session.session_id.clone()),
             session: Some(session.clone().into()),
             error: None,
             reason: None,
@@ -217,7 +217,7 @@ fn event_to_info(event: &EndpointEvent) -> EventInfo {
         },
         EndpointEvent::CallStateChanged { session } => EventInfo {
             event_type: "call_state".into(),
-            call_id: Some(session.call_id.clone()),
+            session_id: Some(session.session_id.clone()),
             session: Some(session.clone().into()),
             error: None,
             reason: None,
@@ -228,7 +228,7 @@ fn event_to_info(event: &EndpointEvent) -> EventInfo {
         },
         EndpointEvent::CallMediaActive { call_id } => EventInfo {
             event_type: "call_media_active".into(),
-            call_id: Some(call_id.clone()),
+            session_id: Some(call_id.clone()),
             session: None,
             error: None,
             reason: None,
@@ -239,7 +239,7 @@ fn event_to_info(event: &EndpointEvent) -> EventInfo {
         },
         EndpointEvent::CallTerminated { session, reason } => EventInfo {
             event_type: "call_terminated".into(),
-            call_id: Some(session.call_id.clone()),
+            session_id: Some(session.session_id.clone()),
             session: Some(session.clone().into()),
             error: None,
             reason: Some(reason.clone()),
@@ -254,7 +254,7 @@ fn event_to_info(event: &EndpointEvent) -> EventInfo {
             method,
         } => EventInfo {
             event_type: "dtmf_received".into(),
-            call_id: Some(call_id.clone()),
+            session_id: Some(call_id.clone()),
             session: None,
             error: None,
             reason: None,
@@ -269,7 +269,7 @@ fn event_to_info(event: &EndpointEvent) -> EventInfo {
             duration_ms,
         } => EventInfo {
             event_type: "beep_detected".into(),
-            call_id: Some(call_id.clone()),
+            session_id: Some(call_id.clone()),
             session: None,
             error: None,
             reason: None,
@@ -280,7 +280,7 @@ fn event_to_info(event: &EndpointEvent) -> EventInfo {
         },
         EndpointEvent::BeepTimeout { call_id } => EventInfo {
             event_type: "beep_timeout".into(),
-            call_id: Some(call_id.clone()),
+            session_id: Some(call_id.clone()),
             session: None,
             error: None,
             reason: None,
@@ -362,7 +362,7 @@ impl SipEndpoint {
     /// ```js
     /// ep.on('incoming_call', (event) => {
     ///   console.log(event.session.remoteUri);
-    ///   ep.answer(event.callId);
+    ///   ep.answer(event.sessionId);
     /// });
     /// ```
     #[napi(
@@ -413,123 +413,123 @@ impl SipEndpoint {
         dest_uri: String,
         from_uri: Option<String>,
         headers: Option<HashMap<String, String>>,
-        call_id: Option<String>,
+        session_id: Option<String>,
     ) -> Result<String> {
         self.inner
-            .call_with_from(&dest_uri, from_uri.as_deref(), headers, call_id)
+            .call_with_from(&dest_uri, from_uri.as_deref(), headers, session_id)
             .map_err(napi_err)
     }
 
     #[napi]
-    pub fn answer(&self, call_id: String, code: Option<u32>) -> Result<()> {
+    pub fn answer(&self, session_id: String, code: Option<u32>) -> Result<()> {
         self.inner
-            .answer(&call_id, code.unwrap_or(200) as u16)
+            .answer(&session_id, code.unwrap_or(200) as u16)
             .map_err(napi_err)
     }
 
     #[napi]
-    pub fn reject(&self, call_id: String, code: Option<u32>) -> Result<()> {
+    pub fn reject(&self, session_id: String, code: Option<u32>) -> Result<()> {
         self.inner
-            .reject(&call_id, code.unwrap_or(486) as u16)
+            .reject(&session_id, code.unwrap_or(486) as u16)
             .map_err(napi_err)
     }
 
     #[napi]
-    pub fn hangup(&self, call_id: String) -> Result<()> {
+    pub fn hangup(&self, session_id: String) -> Result<()> {
         self.inner
-            .hangup(&call_id)
+            .hangup(&session_id)
             .map_err(napi_err)
     }
 
     #[napi]
-    pub fn send_dtmf(&self, call_id: String, digits: String, method: Option<String>) -> Result<()> {
+    pub fn send_dtmf(&self, session_id: String, digits: String, method: Option<String>) -> Result<()> {
         self.inner
-            .send_dtmf_with_method(&call_id, &digits, method.as_deref().unwrap_or("rfc2833"))
+            .send_dtmf_with_method(&session_id, &digits, method.as_deref().unwrap_or("rfc2833"))
             .map_err(napi_err)
     }
 
     /// Send a SIP INFO message with custom content type and body.
     #[napi]
-    pub fn send_info(&self, call_id: String, content_type: String, body: String) -> Result<()> {
-        self.inner.send_info(&call_id, &content_type, &body).map_err(napi_err)
+    pub fn send_info(&self, session_id: String, content_type: String, body: String) -> Result<()> {
+        self.inner.send_info(&session_id, &content_type, &body).map_err(napi_err)
     }
 
     #[napi]
-    pub fn transfer(&self, call_id: String, dest_uri: String) -> Result<()> {
+    pub fn transfer(&self, session_id: String, dest_uri: String) -> Result<()> {
         self.inner
-            .transfer(&call_id, &dest_uri)
+            .transfer(&session_id, &dest_uri)
             .map_err(napi_err)
     }
 
     #[napi]
-    pub fn transfer_attended(&self, call_id: String, target_call_id: String) -> Result<()> {
+    pub fn transfer_attended(&self, session_id: String, target_session_id: String) -> Result<()> {
         self.inner
-            .transfer_attended(&call_id, &target_call_id)
+            .transfer_attended(&session_id, &target_session_id)
             .map_err(napi_err)
     }
 
     /// SIP hold — send Re-INVITE with a=sendonly
     #[napi]
-    pub fn hold(&self, call_id: String) -> Result<()> { self.inner.hold(&call_id).map_err(napi_err) }
+    pub fn hold(&self, session_id: String) -> Result<()> { self.inner.hold(&session_id).map_err(napi_err) }
 
     /// SIP unhold — send Re-INVITE with a=sendrecv
     #[napi]
-    pub fn unhold(&self, call_id: String) -> Result<()> { self.inner.unhold(&call_id).map_err(napi_err) }
+    pub fn unhold(&self, session_id: String) -> Result<()> { self.inner.unhold(&session_id).map_err(napi_err) }
 
     #[napi]
-    pub fn mute(&self, call_id: String) -> Result<()> {
+    pub fn mute(&self, session_id: String) -> Result<()> {
         self.inner
-            .mute(&call_id)
+            .mute(&session_id)
             .map_err(napi_err)
     }
 
     #[napi]
-    pub fn unmute(&self, call_id: String) -> Result<()> {
+    pub fn unmute(&self, session_id: String) -> Result<()> {
         self.inner
-            .unmute(&call_id)
+            .unmute(&session_id)
             .map_err(napi_err)
     }
 
     #[napi]
-    pub fn send_audio(&self, call_id: String, frame: AudioFrame) -> Result<()> {
+    pub fn send_audio(&self, session_id: String, frame: AudioFrame) -> Result<()> {
         self.inner
-            .send_audio(&call_id, &frame.to_rust())
+            .send_audio(&session_id, &frame.to_rust())
             .map_err(napi_err)
     }
 
     #[napi]
-    pub fn recv_audio(&self, call_id: String) -> Result<Option<AudioFrame>> {
+    pub fn recv_audio(&self, session_id: String) -> Result<Option<AudioFrame>> {
         self.inner
-            .recv_audio(&call_id)
+            .recv_audio(&session_id)
             .map(|opt| opt.map(AudioFrame::from_rust))
             .map_err(napi_err)
     }
 
     /// Receive audio as raw PCM bytes (little-endian int16). No JS array conversion.
     #[napi]
-    pub fn recv_audio_bytes(&self, call_id: String) -> Result<Option<Vec<u8>>> {
-        self.inner.recv_audio(&call_id).map(|opt| opt.map(|f| f.as_bytes())).map_err(napi_err)
+    pub fn recv_audio_bytes(&self, session_id: String) -> Result<Option<Vec<u8>>> {
+        self.inner.recv_audio(&session_id).map(|opt| opt.map(|f| f.as_bytes())).map_err(napi_err)
     }
 
     /// Send raw PCM bytes (little-endian int16) directly.
     #[napi]
-    pub fn send_audio_bytes(&self, call_id: String, audio: Vec<u8>, sample_rate: u32, num_channels: u32) -> Result<()> {
+    pub fn send_audio_bytes(&self, session_id: String, audio: Vec<u8>, sample_rate: u32, num_channels: u32) -> Result<()> {
         let frame = RustAudioFrame::from_bytes(&audio, sample_rate, num_channels);
-        self.inner.send_audio(&call_id, &frame).map_err(napi_err)
+        self.inner.send_audio(&session_id, &frame).map_err(napi_err)
     }
 
     /// Send background audio to be mixed with agent voice in the RTP send loop.
     #[napi]
-    pub fn send_background_audio(&self, call_id: String, audio: Vec<u8>, sample_rate: u32, num_channels: u32) -> Result<()> {
+    pub fn send_background_audio(&self, session_id: String, audio: Vec<u8>, sample_rate: u32, num_channels: u32) -> Result<()> {
         let f = RustAudioFrame::from_bytes(&audio, sample_rate, num_channels);
-        self.inner.send_background_audio(&call_id, &f).map_err(napi_err)
+        self.inner.send_background_audio(&session_id, &f).map_err(napi_err)
     }
 
     /// Send raw PCM bytes with async completion notification (backpressure).
     /// The callback fires when the buffer drains below threshold.
     /// Matches Python's send_audio_notify pattern.
-    #[napi(ts_args_type = "callId: string, audio: Buffer, sampleRate: number, numChannels: number, notifyFn: () => void")]
-    pub fn send_audio_notify(&self, call_id: String, audio: Vec<u8>, sample_rate: u32, num_channels: u32, notify_fn: JsFunction) -> Result<()> {
+    #[napi(ts_args_type = "sessionId: string, audio: Buffer, sampleRate: number, numChannels: number, notifyFn: () => void")]
+    pub fn send_audio_notify(&self, session_id: String, audio: Vec<u8>, sample_rate: u32, num_channels: u32, notify_fn: JsFunction) -> Result<()> {
         let frame = RustAudioFrame::from_bytes(&audio, sample_rate, num_channels);
         let tsfn: ThreadsafeFunction<(), ErrorStrategy::CalleeHandled> =
             notify_fn.create_threadsafe_function(0, |ctx: ThreadSafeCallContext<()>| {
@@ -538,45 +538,45 @@ impl SipEndpoint {
         let callback: Box<dyn FnOnce() + Send> = Box::new(move || {
             tsfn.call(Ok(()), ThreadsafeFunctionCallMode::NonBlocking);
         });
-        self.inner.send_audio_with_callback(&call_id, &frame, callback).map_err(napi_err)
+        self.inner.send_audio_with_callback(&session_id, &frame, callback).map_err(napi_err)
     }
 
     /// Receive audio frame, blocking until available or timeout (ms).
     #[napi]
-    pub fn recv_audio_blocking(&self, call_id: String, timeout_ms: Option<u32>) -> Result<Option<AudioFrame>> {
+    pub fn recv_audio_blocking(&self, session_id: String, timeout_ms: Option<u32>) -> Result<Option<AudioFrame>> {
         self.inner
-            .recv_audio_blocking(&call_id, timeout_ms.unwrap_or(20) as u64)
+            .recv_audio_blocking(&session_id, timeout_ms.unwrap_or(20) as u64)
             .map(|opt| opt.map(AudioFrame::from_rust))
             .map_err(napi_err)
     }
 
     /// Receive audio as raw bytes, blocking. Fastest path.
     #[napi]
-    pub fn recv_audio_bytes_blocking(&self, call_id: String, timeout_ms: Option<u32>) -> Result<Option<Vec<u8>>> {
+    pub fn recv_audio_bytes_blocking(&self, session_id: String, timeout_ms: Option<u32>) -> Result<Option<Vec<u8>>> {
         self.inner
-            .recv_audio_blocking(&call_id, timeout_ms.unwrap_or(20) as u64)
+            .recv_audio_blocking(&session_id, timeout_ms.unwrap_or(20) as u64)
             .map(|opt| opt.map(|f| f.as_bytes()))
             .map_err(napi_err)
     }
 
     /// Receive audio as raw bytes, non-blocking Promise. Runs on libuv thread pool.
     #[napi(ts_return_type = "Promise<Buffer | null>")]
-    pub fn recv_audio_bytes_async(&self, call_id: String, timeout_ms: Option<u32>) -> Result<AsyncTask<RecvAudioTask>> {
-        let rx = self.inner.incoming_rx(&call_id).map_err(napi_err)?;
+    pub fn recv_audio_bytes_async(&self, session_id: String, timeout_ms: Option<u32>) -> Result<AsyncTask<RecvAudioTask>> {
+        let rx = self.inner.incoming_rx(&session_id).map_err(napi_err)?;
         Ok(AsyncTask::new(RecvAudioTask { rx, timeout_ms: timeout_ms.unwrap_or(20) as u64 }))
     }
 
     /// Wait for playout, non-blocking Promise. Runs on libuv thread pool.
     #[napi(ts_return_type = "Promise<boolean>")]
-    pub fn wait_for_playout_async(&self, call_id: String, timeout_ms: Option<u32>) -> Result<AsyncTask<SipWaitForPlayoutTask>> {
-        let notify = self.inner.playout_notify(&call_id).map_err(napi_err)?;
+    pub fn wait_for_playout_async(&self, session_id: String, timeout_ms: Option<u32>) -> Result<AsyncTask<SipWaitForPlayoutTask>> {
+        let notify = self.inner.playout_notify(&session_id).map_err(napi_err)?;
         Ok(AsyncTask::new(SipWaitForPlayoutTask { notify, timeout_ms: timeout_ms.unwrap_or(5000) as u64 }))
     }
 
     /// Number of audio frames queued for sending. Multiply by 0.02 for seconds.
     #[napi]
-    pub fn queued_frames(&self, call_id: String) -> Result<u32> {
-        self.inner.queued_frames(&call_id).map(|n| n as u32).map_err(napi_err)
+    pub fn queued_frames(&self, session_id: String) -> Result<u32> {
+        self.inner.queued_frames(&session_id).map(|n| n as u32).map_err(napi_err)
     }
 
     /// Audio sample rate in Hz.
@@ -599,23 +599,23 @@ impl SipEndpoint {
     /// Start recording a call to a stereo WAV file (L=user, R=agent).
     /// Set stereo=false for mono (mixed).
     #[napi]
-    pub fn start_recording(&self, call_id: String, path: String, stereo: Option<bool>) -> Result<()> {
+    pub fn start_recording(&self, session_id: String, path: String, stereo: Option<bool>) -> Result<()> {
         self.inner
-            .start_recording(&call_id, &path, stereo.unwrap_or(true))
+            .start_recording(&session_id, &path, stereo.unwrap_or(true))
             .map_err(napi_err)
     }
 
     #[napi]
-    pub fn stop_recording(&self, call_id: String) -> Result<()> {
+    pub fn stop_recording(&self, session_id: String) -> Result<()> {
         self.inner
-            .stop_recording(&call_id)
+            .stop_recording(&session_id)
             .map_err(napi_err)
     }
 
     #[napi]
     pub fn detect_beep(
         &self,
-        call_id: String,
+        session_id: String,
         timeout_ms: Option<u32>,
         min_duration_ms: Option<u32>,
         max_duration_ms: Option<u32>,
@@ -628,49 +628,49 @@ impl SipEndpoint {
             ..Default::default()
         };
         self.inner
-            .detect_beep(&call_id, config)
+            .detect_beep(&session_id, config)
             .map_err(napi_err)
     }
 
     #[napi]
-    pub fn cancel_beep_detection(&self, call_id: String) -> Result<()> {
+    pub fn cancel_beep_detection(&self, session_id: String) -> Result<()> {
         self.inner
-            .cancel_beep_detection(&call_id)
+            .cancel_beep_detection(&session_id)
             .map_err(napi_err)
     }
 
     #[napi]
-    pub fn flush(&self, call_id: String) -> Result<()> {
+    pub fn flush(&self, session_id: String) -> Result<()> {
         self.inner
-            .flush(&call_id)
+            .flush(&session_id)
             .map_err(napi_err)
     }
 
     #[napi]
-    pub fn clear_buffer(&self, call_id: String) -> Result<()> {
+    pub fn clear_buffer(&self, session_id: String) -> Result<()> {
         self.inner
-            .clear_buffer(&call_id)
+            .clear_buffer(&session_id)
             .map_err(napi_err)
     }
 
     #[napi]
-    pub fn wait_for_playout(&self, call_id: String, timeout_ms: Option<u32>) -> Result<bool> {
+    pub fn wait_for_playout(&self, session_id: String, timeout_ms: Option<u32>) -> Result<bool> {
         self.inner
-            .wait_for_playout(&call_id, timeout_ms.unwrap_or(5000) as u64)
+            .wait_for_playout(&session_id, timeout_ms.unwrap_or(5000) as u64)
             .map_err(napi_err)
     }
 
     #[napi]
-    pub fn pause(&self, call_id: String) -> Result<()> {
+    pub fn pause(&self, session_id: String) -> Result<()> {
         self.inner
-            .pause(&call_id)
+            .pause(&session_id)
             .map_err(napi_err)
     }
 
     #[napi]
-    pub fn resume(&self, call_id: String) -> Result<()> {
+    pub fn resume(&self, session_id: String) -> Result<()> {
         self.inner
-            .resume(&call_id)
+            .resume(&session_id)
             .map_err(napi_err)
     }
 

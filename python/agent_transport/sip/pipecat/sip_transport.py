@@ -5,7 +5,7 @@ All audio codec/resampling/pacing is handled in Rust. Python only bridges frames
 
 100% compatible with Pipecat's transport interface. Exposes all SIP features:
 - Event handlers: on_client_connected, on_client_disconnected, on_beep_detected, on_beep_timeout
-- Session metadata: session_id, call_id, remote_uri, direction, extra_headers
+- Session metadata: session_id, remote_uri, direction, extra_headers
 - SIP call control: transfer, hold, reject, beep detection
 - Audio: mute, recording, background audio, flush/playout
 
@@ -57,7 +57,7 @@ class SipInputTransport(BaseInputTransport):
     Pipecat pipeline. DTMF and call lifecycle events are polled separately.
     """
 
-    def __init__(self, endpoint, call_id: str, transport: "SipTransport",
+    def __init__(self, endpoint, session_id: str, transport: "SipTransport",
                  params: Optional[TransportParams] = None,
                  event_queue: Optional[asyncio.Queue] = None, **kwargs):
         if params is None:
@@ -67,7 +67,7 @@ class SipInputTransport(BaseInputTransport):
             )
         super().__init__(params, **kwargs)
         self._ep = endpoint
-        self._cid = call_id
+        self._cid = session_id
         self._transport = transport
         self._event_queue = event_queue
         self._running = False
@@ -203,7 +203,7 @@ class SipOutputTransport(BaseOutputTransport):
     - Jitter buffer, PLC, comfort noise (if enabled)
     """
 
-    def __init__(self, endpoint, call_id: str, transport: "SipTransport",
+    def __init__(self, endpoint, session_id: str, transport: "SipTransport",
                  params: Optional[TransportParams] = None, **kwargs):
         if params is None:
             params = TransportParams(
@@ -211,7 +211,7 @@ class SipOutputTransport(BaseOutputTransport):
             )
         super().__init__(params, **kwargs)
         self._ep = endpoint
-        self._cid = call_id
+        self._cid = session_id
         self._transport = transport
         self._started = False
 
@@ -327,8 +327,8 @@ class SipTransport(BaseTransport):
         on_beep_timeout — beep detection timed out
 
     Session metadata (from SIP call session):
-        transport.session_id    — internal call ID
-        transport.call_id       — SIP call UUID
+        transport.session_id    — internal session ID
+        transport.call_uuid     — SIP call UUID
         transport.remote_uri    — remote SIP URI
         transport.direction     — "Inbound" or "Outbound"
         transport.extra_headers — custom SIP headers
@@ -353,7 +353,7 @@ class SipTransport(BaseTransport):
     def __init__(
         self,
         endpoint,
-        call_id: str,
+        session_id: str,
         *,
         name: Optional[str] = None,
         params: Optional[TransportParams] = None,
@@ -363,7 +363,7 @@ class SipTransport(BaseTransport):
     ):
         super().__init__(name=name or "SipTransport", **kwargs)
         self._ep = endpoint
-        self._cid = call_id
+        self._cid = session_id
         self._params = params
         self._session_data = session_data or {}
         self._event_queue = _event_queue
@@ -399,11 +399,11 @@ class SipTransport(BaseTransport):
 
     @property
     def session_id(self) -> str:
-        """Internal call ID used to address this session."""
+        """Internal session ID used to address this session."""
         return self._cid
 
     @property
-    def call_id(self) -> str:
+    def call_uuid(self) -> str:
         """SIP call UUID."""
         return self._session_data.get("call_uuid", self._cid)
 
@@ -498,9 +498,9 @@ class SipTransport(BaseTransport):
         """Blind transfer — transfer call to another SIP URI."""
         self._ep.transfer(self._cid, dest_uri)
 
-    def transfer_attended(self, target_call_id: str) -> None:
+    def transfer_attended(self, target_session_id: str) -> None:
         """Attended transfer — transfer to an existing call."""
-        self._ep.transfer_attended(self._cid, target_call_id)
+        self._ep.transfer_attended(self._cid, target_session_id)
 
     def hold(self) -> None:
         """Put the call on hold (SIP re-INVITE with a=sendonly)."""

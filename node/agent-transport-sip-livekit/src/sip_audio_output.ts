@@ -53,7 +53,7 @@ export class SipAudioOutput extends EventEmitter {
   static readonly EVENT_PLAYBACK_FINISHED = 'playbackFinished';
 
   private endpoint: SipEndpoint;
-  private callId: string;
+  private sessionId: string;
   readonly sampleRate: number;
   readonly capabilities = { pause: true };
   readonly nextInChain?: SipAudioOutput;
@@ -79,10 +79,10 @@ export class SipAudioOutput extends EventEmitter {
   private _chainStartedCb: ((ev: PlaybackStartedEvent) => void) | null = null;
   private _chainFinishedCb: ((ev: PlaybackFinishedEvent) => void) | null = null;
 
-  constructor(endpoint: SipEndpoint, callId: string, sampleRate?: number, nextInChain?: SipAudioOutput) {
+  constructor(endpoint: SipEndpoint, sessionId: string, sampleRate?: number, nextInChain?: SipAudioOutput) {
     super();
     this.endpoint = endpoint;
-    this.callId = callId;
+    this.sessionId = sessionId;
     this.sampleRate = sampleRate ?? endpoint.outputSampleRate;
     this.nextInChain = nextInChain;
 
@@ -128,7 +128,7 @@ export class SipAudioOutput extends EventEmitter {
     await new Promise<void>((resolve, reject) => {
       try {
         this.endpoint.sendAudioNotify(
-          this.callId,
+          this.sessionId,
           frameData,
           frame.sampleRate,
           frame.channels,
@@ -194,7 +194,7 @@ export class SipAudioOutput extends EventEmitter {
     let pushedDuration = this.pushedDuration;
     if (interrupted) {
       pushedDuration = Math.max(this.pushedDuration - this.queuedDuration, 0);
-      this.endpoint.clearBuffer(this.callId);
+      this.endpoint.clearBuffer(this.sessionId);
       this.releaseWaiter();
     }
 
@@ -240,12 +240,12 @@ export class SipAudioOutput extends EventEmitter {
   }
 
   pause(): void {
-    this.endpoint.pause(this.callId);
+    this.endpoint.pause(this.sessionId);
     this.nextInChain?.pause();
   }
 
   resume(): void {
-    this.endpoint.resume(this.callId);
+    this.endpoint.resume(this.sessionId);
     this.nextInChain?.resume();
   }
 

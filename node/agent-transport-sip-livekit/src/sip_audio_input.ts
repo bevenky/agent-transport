@@ -16,15 +16,15 @@ import type { SipEndpoint } from 'agent-transport';
 
 export class SipAudioInput {
   private endpoint: SipEndpoint;
-  private callId: string;
+  private sessionId: string;
   private closed = false;
   private attached = true;
   private frameCount = 0;
   private _stream: ReadableStream<AudioFrame>;
 
-  constructor(endpoint: SipEndpoint, callId: string) {
+  constructor(endpoint: SipEndpoint, sessionId: string) {
     this.endpoint = endpoint;
-    this.callId = callId;
+    this.sessionId = sessionId;
 
     // Create ReadableStream that AgentSession will consume
     const self = this;
@@ -36,7 +36,7 @@ export class SipAudioInput {
         }
 
         try {
-          const bytes: Buffer | null = await self.endpoint.recvAudioBytesAsync(self.callId, 20);
+          const bytes: Buffer | null = await self.endpoint.recvAudioBytesAsync(self.sessionId, 20);
           if (!bytes || self.closed) {
             self.pushSilenceAndClose(controller);
             return;

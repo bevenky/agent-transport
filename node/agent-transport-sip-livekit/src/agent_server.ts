@@ -21,7 +21,7 @@ import { hostname } from 'node:os';
 import { mkdirSync } from 'node:fs';
 import { SipEndpoint } from 'agent-transport';
 import { initializeLogger, InferenceRunner, runWithJobContext, log as agentLog, voice } from '@livekit/agents';
-import { JobContext } from './call_context.js';
+import { JobContext } from './session_context.js';
 
 export class JobProcess {
   userData: Record<string, unknown> = {};
@@ -300,7 +300,7 @@ export class AgentServer {
 
   // ─── Event dispatcher (single reader, no race conditions) ──────
 
-  private pendingInbound = new Map<string, string>(); // callId → remoteUri
+  private pendingInbound = new Map<string, string>(); // sessionId → remoteUri
   // pendingOutbound removed — outbound calls start session directly after ep.call()
 
   private async sipEventLoop(): Promise<void> {
@@ -309,59 +309,59 @@ export class AgentServer {
       if (!ev) continue;
 
       if (ev.eventType === 'incoming_call' && ev.session) {
-        const callId = ev.session.callId;
+        const sessionId = ev.session.sessionId;
         const remoteUri = ev.session.remoteUri;
-        console.log(`Incoming call ${callId} from ${remoteUri}`);
-        this.ep!.answer(callId);
-        this.pendingInbound.set(callId, remoteUri);
+        console.log(`Incoming call ${sessionId} from ${remoteUri}`);
+        this.ep!.answer(sessionId);
+        this.pendingInbound.set(sessionId, remoteUri);
 
-      } else if (ev.eventType === 'call_media_active' && ev.callId !== undefined) {
-        const callId = ev.callId;
+      } else if (ev.eventType === 'call_media_active' && ev.sessionId !== undefined) {
+        const sessionId = ev.sessionId;
 
-        if (this.pendingInbound.has(callId)) {
-          const remoteUri = this.pendingInbound.get(callId)!;
-          this.pendingInbound.delete(callId);
-          this.startCall(callId, remoteUri, 'inbound').catch((err) => {
-            console.error(`Inbound call ${callId} failed:`, err);
-            try { this.ep!.hangup(callId); } catch {}
+        if (this.pendingInbound.has(sessionId)) {
+          const remoteUri = this.pendingInbound.get(sessionId)!;
+          this.pendingInbound.delete(sessionId);
+          this.startCall(sessionId, remoteUri, 'inbound').catch((err) => {
+            console.error(`Inbound call ${sessionId} failed:`, err);
+            try { this.ep!.hangup(sessionId); } catch {}
           });
         }
 
       } else if (ev.eventType === 'call_terminated' && ev.session) {
-        const callId = ev.session.callId;
+        const sessionId = ev.session.sessionId;
         const reason = ev.reason ?? 'unknown';
-        console.log(`Call ${callId} terminated (reason=${reason})`);
+        console.log(`Call ${sessionId} terminated (reason=${reason})`);
 
         // Emit participant_disconnected on Room facade (matches LiveKit WebRTC)
         // RoomIO._on_participant_disconnected will call _close_soon() → session closes
-        const active = this.activeCalls.get(callId);
+        const active = this.activeCalls.get(sessionId);
         if (active?.room) {
           active.room.emitParticipantDisconnected();
         }
 
         // Clean up pending
-        this.pendingInbound.delete(callId);
+        this.pendingInbound.delete(sessionId);
 
         // Signal active call to end
         if (active) {
           active.resolveEnded();
         }
 
-      } else if (ev.eventType === 'dtmf_received' && ev.callId) {
+      } else if (ev.eventType === 'dtmf_received' && ev.sessionId) {
         // Route DTMF to Room facade (matches Python server pattern)
-        const active = this.activeCalls.get(ev.callId);
+        const active = this.activeCalls.get(ev.sessionId);
         if (active?.room) {
           active.room.emitDtmf(ev.digit ?? '');
         }
 
-      } else if (ev.eventType === 'beep_detected' && ev.callId) {
-        const active = this.activeCalls.get(ev.callId);
+      } else if (ev.eventType === 'beep_detected' && ev.sessionId) {
+        const active = this.activeCalls.get(ev.sessionId);
         if (active?.room) {
           active.room.emit('beep_detected', { frequencyHz: ev.frequencyHz ?? 0, durationMs: ev.durationMs ?? 0 });
         }
 
-      } else if (ev.eventType === 'beep_timeout' && ev.callId) {
-        const active = this.activeCalls.get(ev.callId);
+      } else if (ev.eventType === 'beep_timeout' && ev.sessionId) {
+        const active = this.activeCalls.get(ev.sessionId);
         if (active?.room) {
           active.room.emit('beep_timeout', {});
         }
@@ -369,12 +369,12 @@ export class AgentServer {
     }
   }
 
-  private async startCall(callId: string, remoteUri: string, direction: 'inbound' | 'outbound'): Promise<void> {
+  private async startCall(sessionId: string, remoteUri: string, direction: 'inbound' | 'outbound'): Promise<void> {
     let resolveEnded!: () => void;
     const callEnded = new Promise<void>((r) => { resolveEnded = r; });
 
     const ctx = new JobContext({
-      callId,
+      sessionId,
       remoteUri,
       direction,
       endpoint: this.ep!,
@@ -393,9 +393,9 @@ export class AgentServer {
       if (this.recording) {
         try {
           mkdirSync(this.recordingDir, { recursive: true });
-          this.ep!.startRecording(callId, `${this.recordingDir}/call_${callId}.wav`, this.recordingStereo);
+          this.ep!.startRecording(sessionId, `${this.recordingDir}/call_${sessionId}.wav`, this.recordingStereo);
         } catch {
-          console.warn(`Failed to start recording for call ${callId}`);
+          console.warn(`Failed to start recording for call ${sessionId}`);
         }
       }
 
@@ -404,7 +404,7 @@ export class AgentServer {
         // (matches LiveKit WebRTC where entrypoint runs inside job context)
         const stub = {
           room: ctx.room,
-          job: { id: `job-${callId}`, agentName: this.agentName, enableRecording: false },
+          job: { id: `job-${sessionId}`, agentName: this.agentName, enableRecording: false },
           _primaryAgentSession: null as any,
           sessionDirectory: '/tmp',
           proc: { executorType: null },
@@ -425,14 +425,14 @@ export class AgentServer {
         // so wait for call to actually end (BYE or agent shutdown)
         await ctx.callEnded;
       } catch (e) {
-        console.error(`Call ${callId} handler failed:`, e);
+        console.error(`Call ${sessionId} handler failed:`, e);
       } finally {
         const durationSec = (performance.now() - callStart) / 1000;
         this.sipCallDurations.push(durationSec);
 
         // Stop recording
         if (this.recording) {
-          try { this.ep!.stopRecording(callId); } catch {}
+          try { this.ep!.stopRecording(sessionId); } catch {}
         }
 
         // Log usage
@@ -440,7 +440,7 @@ export class AgentServer {
           try {
             const usage = (ctx.session as any).usage;
             if (usage) {
-              console.log(`Call ${callId} usage:`, JSON.stringify(usage));
+              console.log(`Call ${sessionId} usage:`, JSON.stringify(usage));
             }
           } catch {}
         }
@@ -451,15 +451,15 @@ export class AgentServer {
         }
 
         // Hangup
-        try { this.ep!.hangup(callId); } catch {}
+        try { this.ep!.hangup(sessionId); } catch {}
 
-        this.activeCalls.delete(callId);
-        console.log(`Call ${callId} ended (${direction}) duration=${durationSec.toFixed(1)}s`);
+        this.activeCalls.delete(sessionId);
+        console.log(`Call ${sessionId} ended (${direction}) duration=${durationSec.toFixed(1)}s`);
       }
     };
 
     const callPromise = runCall();
-    this.activeCalls.set(callId, { promise: callPromise, resolveEnded, room: ctx.room });
+    this.activeCalls.set(sessionId, { promise: callPromise, resolveEnded, room: ctx.room });
   }
 
   // ─── HTTP server ────────────────────────────────────────────────
@@ -545,24 +545,24 @@ export class AgentServer {
 
             if (wait) {
               // Blocking mode: wait for call to connect
-              const callId = this.ep!.call(destination, fromUri, headers);
-              console.log(`Outbound call ${callId} to ${destination} connected (from=${fromUri ?? 'default'})`);
-              this.startCall(callId, destination, 'outbound');
+              const sessionId = this.ep!.call(destination, fromUri, headers);
+              console.log(`Outbound call ${sessionId} to ${destination} connected (from=${fromUri ?? 'default'})`);
+              this.startCall(sessionId, destination, 'outbound');
               res.writeHead(200, { 'Content-Type': 'application/json' });
-              res.end(JSON.stringify({ call_id: callId, status: 'connected', to: rawTo, from: rawFrom }));
+              res.end(JSON.stringify({ session_id: sessionId, status: 'connected', to: rawTo, from: rawFrom }));
             } else {
-              // Non-blocking (default): generate call_id upfront, dial in background
-              const callId = 'c' + crypto.randomUUID().replace(/-/g, '').slice(0, 16);
+              // Non-blocking (default): generate session_id upfront, dial in background
+              const sessionId = 'c' + crypto.randomUUID().replace(/-/g, '').slice(0, 16);
               res.writeHead(200, { 'Content-Type': 'application/json' });
-              res.end(JSON.stringify({ call_id: callId, status: 'dialing', to: rawTo, from: rawFrom }));
+              res.end(JSON.stringify({ session_id: sessionId, status: 'dialing', to: rawTo, from: rawFrom }));
 
               setImmediate(async () => {
                 try {
-                  const returnedId = this.ep!.call(destination, fromUri, headers, callId);
+                  const returnedId = this.ep!.call(destination, fromUri, headers, sessionId);
                   console.log(`Outbound call ${returnedId} to ${destination} connected (from=${fromUri ?? 'default'})`);
                   this.startCall(returnedId, destination, 'outbound');
                 } catch (err) {
-                  console.warn(`Outbound call ${callId} to ${destination} failed:`, err);
+                  console.warn(`Outbound call ${sessionId} to ${destination} failed:`, err);
                 }
               });
             }

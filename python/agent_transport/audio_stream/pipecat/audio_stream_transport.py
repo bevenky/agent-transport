@@ -5,7 +5,7 @@ All audio codec/resampling/pacing is handled in Rust. Python only bridges frames
 
 100% compatible with Pipecat's transport interface and Plivo AudioStream protocol:
 - Event handlers: on_client_connected, on_client_disconnected
-- Session metadata: call_id, stream_id, extra_headers
+- Session metadata: session_id, stream_id, extra_headers
 - All Plivo features: mute, recording, checkpoint, background audio, etc.
 
 Frame handling:
@@ -338,7 +338,7 @@ class AudioStreamTransport(BaseTransport):
 
     Session metadata (from Plivo start event):
         transport.session_id    — internal session ID
-        transport.call_id       — Plivo call UUID
+        transport.call_uuid     — Plivo call UUID
         transport.stream_id     — Plivo stream UUID
         transport.extra_headers — custom headers from <Stream> element
 
@@ -404,7 +404,7 @@ class AudioStreamTransport(BaseTransport):
         return self._sid
 
     @property
-    def call_id(self) -> str:
+    def call_uuid(self) -> str:
         """Plivo call UUID (from start event). Used for REST API operations."""
         return self._session_data.get("call_uuid", "")
 

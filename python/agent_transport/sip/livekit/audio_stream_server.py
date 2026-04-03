@@ -171,7 +171,7 @@ class JobContext:
     """
 
     session_id: str
-    call_id: str              # Plivo Call UUID
+    plivo_call_uuid: str      # Plivo Call UUID
     stream_id: str            # Plivo Stream UUID
     direction: str            # Always "inbound" for audio streams
     extra_headers: dict[str, str]
@@ -558,13 +558,13 @@ class AudioStreamServer:
 
             if ev_type == "incoming_call":
                 session = ev["session"]
-                session_id = session.call_id  # internal session ID
-                call_id = session.remote_uri  # Plivo Call UUID
+                session_id = session.session_id  # internal session ID
+                plivo_call_uuid = session.remote_uri  # Plivo Call UUID
                 stream_id = session.local_uri if hasattr(session, "local_uri") else ""
                 extra_headers = session.extra_headers if hasattr(session, "extra_headers") else {}
-                logger.info("Audio stream session %s started (call_id=%s, stream_id=%s)", session_id, call_id, stream_id)
+                logger.info("Audio stream session %s started (plivo_call_uuid=%s, stream_id=%s)", session_id, plivo_call_uuid, stream_id)
                 asyncio.create_task(
-                    self._start_session(session_id, call_id, stream_id, extra_headers)
+                    self._start_session(session_id, plivo_call_uuid, stream_id, extra_headers)
                 )
 
             elif ev_type == "call_media_active":
@@ -572,7 +572,7 @@ class AudioStreamServer:
                 pass
 
             elif ev_type == "call_terminated":
-                session_id = ev["session"].call_id
+                session_id = ev["session"].session_id
                 reason = ev.get("reason", "unknown")
                 logger.info("Session %s terminated (reason=%s)", session_id, reason)
 
@@ -595,7 +595,7 @@ class AudioStreamServer:
 
             elif ev_type == "dtmf_received":
                 # Route DTMF to both ctx listeners AND Room facade
-                session_id = ev.get("call_id", -1)
+                session_id = ev.get("session_id", -1)
                 digit = ev.get("digit", "")
                 logger.debug("DTMF '%s' on session %s", digit, session_id)
                 ctx = self._session_contexts.get(session_id)
@@ -610,7 +610,7 @@ class AudioStreamServer:
                         ctx._room.emit("sip_dtmf_received", dtmf_ev)
 
             elif ev_type == "beep_detected":
-                session_id = ev.get("call_id", "")
+                session_id = ev.get("session_id", "")
                 freq = ev.get("frequency_hz", 0.0)
                 dur = ev.get("duration_ms", 0)
                 logger.info("Beep detected on session %s (freq=%.0fHz, dur=%dms)", session_id, freq, dur)
@@ -621,7 +621,7 @@ class AudioStreamServer:
                         ctx._room.emit("beep_detected", {"frequency_hz": freq, "duration_ms": dur})
 
             elif ev_type == "beep_timeout":
-                session_id = ev.get("call_id", "")
+                session_id = ev.get("session_id", "")
                 logger.debug("Beep timeout on session %s", session_id)
                 ctx = self._session_contexts.get(session_id)
                 if ctx:
@@ -629,7 +629,7 @@ class AudioStreamServer:
                     if ctx._room:
                         ctx._room.emit("beep_timeout", {})
 
-    async def _start_session(self, session_id: str, call_id: str, stream_id: str, extra_headers: dict) -> None:
+    async def _start_session(self, session_id: str, plivo_call_uuid: str, stream_id: str, extra_headers: dict) -> None:
         session_ended = asyncio.Event()
         self._session_ended_events[session_id] = session_ended
 
@@ -637,7 +637,7 @@ class AudioStreamServer:
         room = TransportRoom(
             self._ep, session_id,
             agent_name=self._agent_name,
-            caller_identity=call_id,
+            caller_identity=plivo_call_uuid,
         )
         # Set on JobContext so get_job_context().room works inside handler
         job_stub, job_ctx_token = create_transport_context(
@@ -645,7 +645,7 @@ class AudioStreamServer:
 
         ctx = JobContext(
             session_id=session_id,
-            call_id=call_id,
+            plivo_call_uuid=plivo_call_uuid,
             stream_id=stream_id,
             direction="inbound",
             extra_headers=extra_headers,
