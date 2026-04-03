@@ -17,8 +17,8 @@ import { JobProcess } from './agent_server.js';
 
 export interface AudioStreamJobContextOptions {
   sessionId: string;
-  callId: string;       // Plivo Call UUID
-  streamId: string;     // Plivo Stream UUID
+  plivoCallUuid: string;  // Plivo Call UUID
+  streamId: string;       // Plivo Stream UUID
   direction: 'inbound';
   extraHeaders: Record<string, string>;
   endpoint: AudioStreamEndpoint;
@@ -31,7 +31,7 @@ export interface AudioStreamJobContextOptions {
 
 export class AudioStreamJobContext {
   readonly sessionId: string;
-  readonly callId: string;
+  readonly plivoCallUuid: string;
   readonly streamId: string;
   readonly direction: 'inbound';
   readonly extraHeaders: Record<string, string>;
@@ -47,7 +47,7 @@ export class AudioStreamJobContext {
 
   constructor(opts: AudioStreamJobContextOptions) {
     this.sessionId = opts.sessionId;
-    this.callId = opts.callId;
+    this.plivoCallUuid = opts.plivoCallUuid;
     this.streamId = opts.streamId;
     this.direction = opts.direction;
     this.extraHeaders = opts.extraHeaders;
@@ -59,7 +59,7 @@ export class AudioStreamJobContext {
 
     this.room = new TransportRoom(opts.endpoint as any, opts.sessionId, {
       agentName: opts.agentName ?? 'audio-stream-agent',
-      callerIdentity: opts.callId,
+      callerIdentity: opts.plivoCallUuid,
     });
   }
 

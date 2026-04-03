@@ -202,8 +202,8 @@ class _TransportLocalParticipant:
 class _TransportRemoteParticipant:
     """Stub for the remote caller."""
 
-    def __init__(self, identity, call_id):
-        self.sid = f"PR_{call_id}"
+    def __init__(self, identity, session_id):
+        self.sid = f"PR_{session_id}"
         self.identity = identity
         self.name = identity
         self.metadata = ""

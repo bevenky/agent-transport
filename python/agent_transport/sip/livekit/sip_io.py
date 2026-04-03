@@ -58,13 +58,13 @@ class SipAudioInput(AudioInput):
     - On stream end, pushes 0.5s silence to flush STT, then closes Chan
     """
 
-    def __init__(self, endpoint, call_id: str, *, label: str = "sip-audio-input", source=None, **kwargs):
+    def __init__(self, endpoint, session_id: str, *, label: str = "sip-audio-input", source=None, **kwargs):
         try:
             super().__init__(label=label, source=source)
         except TypeError:
             pass
         self._ep = endpoint
-        self._cid = call_id
+        self._cid = session_id
         self._label = label
         self._source = source
         self._sample_rate = endpoint.input_sample_rate
@@ -179,7 +179,7 @@ class SipAudioOutput(AudioOutput):
     def __init__(
         self,
         endpoint,
-        call_id: str,
+        session_id: str,
         *,
         label: str = "sip-audio-output",
         sample_rate: Optional[int] = None,
@@ -197,11 +197,11 @@ class SipAudioOutput(AudioOutput):
         )
 
         self._ep = endpoint
-        self._cid = call_id
+        self._cid = session_id
 
         # -- Matches _ParticipantAudioOutput exactly --
         self._audio_source = SipAudioSource(
-            endpoint, call_id,
+            endpoint, session_id,
             sample_rate=_sample_rate,
             num_channels=num_channels,
             queue_size_ms=200,  # matches _ParticipantAudioOutput production (not rtc.AudioSource default of 1000)

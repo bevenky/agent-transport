@@ -20,7 +20,7 @@ import { TransportRoom } from './livekit_adapters.js';
 import { JobProcess } from './agent_server.js';
 
 export interface JobContextOptions {
-  callId: string;
+  sessionId: string;
   remoteUri: string;
   direction: 'inbound' | 'outbound';
   endpoint: SipEndpoint;
@@ -32,7 +32,7 @@ export interface JobContextOptions {
 }
 
 export class JobContext {
-  readonly callId: string;
+  readonly sessionId: string;
   readonly remoteUri: string;
   readonly direction: 'inbound' | 'outbound';
   readonly endpoint: SipEndpoint;
@@ -46,7 +46,7 @@ export class JobContext {
   private _shutdownCallbacks: Array<() => void | Promise<void>> = [];
 
   constructor(opts: JobContextOptions) {
-    this.callId = opts.callId;
+    this.sessionId = opts.sessionId;
     this.remoteUri = opts.remoteUri;
     this.direction = opts.direction;
     this.endpoint = opts.endpoint;
@@ -56,7 +56,7 @@ export class JobContext {
     this._resolveCallEnded = opts.resolveCallEnded;
 
     // Create Room facade
-    this.room = new TransportRoom(opts.endpoint as any, opts.callId, {
+    this.room = new TransportRoom(opts.endpoint as any, opts.sessionId, {
       agentName: opts.agentName ?? 'sip-agent',
       callerIdentity: opts.remoteUri,
     });
@@ -76,17 +76,17 @@ export class JobContext {
     this._session = session;
 
     // Wire SIP audio I/O before session.start() is called
-    session.input.audio = new SipAudioInput(this.endpoint, this.callId);
-    session.output.audio = new SipAudioOutput(this.endpoint, this.callId);
+    session.input.audio = new SipAudioInput(this.endpoint, this.sessionId);
+    session.output.audio = new SipAudioOutput(this.endpoint, this.sessionId);
 
     // Listen to session close event — handles agent-initiated shutdown
     session.on('close', async () => {
-      console.log(`Call ${this.callId} session closed`);
+      console.log(`Call ${this.sessionId} session closed`);
       for (const cb of this._shutdownCallbacks) {
         try { await cb(); } catch {}
       }
       this._resolveCallEnded();
-      try { this.endpoint.hangup(this.callId); } catch {}
+      try { this.endpoint.hangup(this.sessionId); } catch {}
     });
   }
 

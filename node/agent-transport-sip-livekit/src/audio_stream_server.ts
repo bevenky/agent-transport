@@ -255,12 +255,12 @@ export class AudioStreamServer {
       if (!ev) continue;
 
       if (ev.eventType === 'incoming_call' && ev.session) {
-        const sessionId = ev.session.callId;
-        const callId = ev.session.remoteUri;
+        const sessionId = ev.session.sessionId;
+        const plivoCallUuid = ev.session.remoteUri;
         const streamId = ev.session.localUri ?? '';
         const extraHeaders = ev.session.extraHeaders ?? {};
-        console.log(`Audio stream session ${sessionId} started (call_id=${callId})`);
-        this.startSession(sessionId, callId, streamId, extraHeaders).catch((err) => {
+        console.log(`Audio stream session ${sessionId} started (plivo_call_uuid=${plivoCallUuid})`);
+        this.startSession(sessionId, plivoCallUuid, streamId, extraHeaders).catch((err) => {
           console.error(`Session ${sessionId} startup failed:`, err);
           try { this.ep!.hangup(sessionId); } catch {}
         });
@@ -269,7 +269,7 @@ export class AudioStreamServer {
         // Consumed — audio stream fires this together with incoming_call
 
       } else if (ev.eventType === 'call_terminated' && ev.session) {
-        const sessionId = ev.session.callId;
+        const sessionId = ev.session.sessionId;
         const reason = ev.reason ?? 'unknown';
         console.log(`Session ${sessionId} terminated (reason=${reason})`);
 
@@ -283,20 +283,20 @@ export class AudioStreamServer {
           active.resolveEnded();
         }
 
-      } else if (ev.eventType === 'dtmf_received' && ev.callId) {
-        const active = this.activeSessions.get(ev.callId);
+      } else if (ev.eventType === 'dtmf_received' && ev.sessionId) {
+        const active = this.activeSessions.get(ev.sessionId);
         if (active?.room) {
           active.room.emitDtmf(ev.digit ?? '');
         }
 
-      } else if (ev.eventType === 'beep_detected' && ev.callId) {
-        const active = this.activeSessions.get(ev.callId);
+      } else if (ev.eventType === 'beep_detected' && ev.sessionId) {
+        const active = this.activeSessions.get(ev.sessionId);
         if (active?.room) {
           active.room.emit('beep_detected', { frequencyHz: ev.frequencyHz ?? 0, durationMs: ev.durationMs ?? 0 });
         }
 
-      } else if (ev.eventType === 'beep_timeout' && ev.callId) {
-        const active = this.activeSessions.get(ev.callId);
+      } else if (ev.eventType === 'beep_timeout' && ev.sessionId) {
+        const active = this.activeSessions.get(ev.sessionId);
         if (active?.room) {
           active.room.emit('beep_timeout', {});
         }
@@ -304,13 +304,13 @@ export class AudioStreamServer {
     }
   }
 
-  private async startSession(sessionId: string, callId: string, streamId: string, extraHeaders: Record<string, string>): Promise<void> {
+  private async startSession(sessionId: string, plivoCallUuid: string, streamId: string, extraHeaders: Record<string, string>): Promise<void> {
     let resolveEnded!: () => void;
     const callEnded = new Promise<void>((r) => { resolveEnded = r; });
 
     const ctx = new AudioStreamJobContext({
       sessionId,
-      callId,
+      plivoCallUuid,
       streamId,
       direction: 'inbound',
       extraHeaders,

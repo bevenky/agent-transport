@@ -77,7 +77,7 @@ if HAS_PROMETHEUS:
 def _session_to_dict(session) -> Dict[str, Any]:
     """Convert a PyO3 CallSession object to a plain dict for transport metadata."""
     return {
-        "call_id": session.call_id,
+        "session_id": session.session_id,
         "call_uuid": getattr(session, "call_uuid", None) or "",
         "remote_uri": getattr(session, "remote_uri", ""),
         "local_uri": getattr(session, "local_uri", ""),
@@ -254,40 +254,40 @@ class WebsocketServerTransport:
 
             if ev_type == "incoming_call":
                 session = event["session"]
-                session_id = session.call_id
+                session_id = session.session_id
                 session_data = _session_to_dict(session)
                 logger.info("Session %s connected (call_uuid=%s)",
                             session_id, session_data.get("call_uuid", ""))
                 pending_sessions[session_id] = session_data
 
             elif ev_type == "call_media_active":
-                call_id = event.get("call_id", "")
-                if call_id in pending_sessions:
-                    session_data = pending_sessions.pop(call_id)
-                    self._start_session(call_id, session_data)
+                session_id = event.get("session_id", "")
+                if session_id in pending_sessions:
+                    session_data = pending_sessions.pop(session_id)
+                    self._start_session(session_id, session_data)
 
             elif ev_type == "call_terminated":
                 session = event["session"]
-                call_id = session.call_id
-                pending_sessions.pop(call_id, None)
+                session_id = session.session_id
+                pending_sessions.pop(session_id, None)
                 # Route to per-session queue
-                q = self._session_event_queues.get(call_id)
+                q = self._session_event_queues.get(session_id)
                 if q:
                     await q.put(event)
 
             elif ev_type == "dtmf_received":
-                call_id = event.get("call_id", "")
-                q = self._session_event_queues.get(call_id)
+                session_id = event.get("session_id", "")
+                q = self._session_event_queues.get(session_id)
                 if q:
                     await q.put(event)
 
             elif ev_type in ("beep_detected", "beep_timeout"):
-                call_id = event.get("call_id", "")
-                q = self._session_event_queues.get(call_id)
+                session_id = event.get("session_id", "")
+                q = self._session_event_queues.get(session_id)
                 if q:
                     await q.put(event)
                 else:
-                    logger.warning("No session queue for %s event on session %s (session not yet started?)", ev_type, call_id)
+                    logger.warning("No session queue for %s event on session %s (session not yet started?)", ev_type, session_id)
 
     def _start_session(self, session_id: str, session_data: dict) -> None:
         """Create transport and spawn session handler task."""

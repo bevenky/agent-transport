@@ -77,7 +77,7 @@ if HAS_PROMETHEUS:
 def _session_to_dict(session) -> Dict[str, Any]:
     """Convert a PyO3 CallSession object to a plain dict for transport metadata."""
     return {
-        "call_id": session.call_id,
+        "session_id": session.session_id,
         "call_uuid": getattr(session, "call_uuid", None) or "",
         "remote_uri": getattr(session, "remote_uri", ""),
         "local_uri": getattr(session, "local_uri", ""),
@@ -198,16 +198,16 @@ class SipServerTransport:
     async def call(self, dest_uri: str, headers: Optional[Dict[str, str]] = None) -> Optional[str]:
         """Make an outbound SIP call.
 
-        Returns call_id if successful, None otherwise.
+        Returns session_id if successful, None otherwise.
         """
         if not self._ep:
             raise RuntimeError("Server not started")
         loop = asyncio.get_running_loop()
         try:
-            call_id = await loop.run_in_executor(
+            session_id = await loop.run_in_executor(
                 None, lambda: self._ep.call(dest_uri, headers=headers)
             )
-            return call_id
+            return session_id
         except Exception as e:
             logger.error("Outbound call failed: %s", e)
             return None
@@ -297,7 +297,7 @@ class SipServerTransport:
         """
         loop = asyncio.get_running_loop()
         # Calls waiting for call_media_active after answer
-        pending_calls: dict[str, dict] = {}  # call_id → session_data
+        pending_calls: dict[str, dict] = {}  # session_id → session_data
 
         while True:
             event = await loop.run_in_executor(
@@ -310,51 +310,51 @@ class SipServerTransport:
 
             if ev_type == "incoming_call":
                 session = event["session"]
-                call_id = session.call_id
+                session_id = session.session_id
                 session_data = _session_to_dict(session)
-                logger.info("Incoming call from %s (call_id=%s)", session_data["remote_uri"], call_id)
+                logger.info("Incoming call from %s (session_id=%s)", session_data["remote_uri"], session_id)
                 try:
-                    await loop.run_in_executor(None, lambda: self._ep.answer(call_id))
+                    await loop.run_in_executor(None, lambda: self._ep.answer(session_id))
                 except Exception as e:
-                    logger.warning("Failed to answer call %s: %s", call_id, e)
+                    logger.warning("Failed to answer call %s: %s", session_id, e)
                     continue
-                pending_calls[call_id] = session_data
+                pending_calls[session_id] = session_data
 
             elif ev_type == "call_media_active":
-                call_id = event.get("call_id", "")
-                if call_id in pending_calls:
-                    session_data = pending_calls.pop(call_id)
-                    self._start_session(call_id, session_data)
+                session_id = event.get("session_id", "")
+                if session_id in pending_calls:
+                    session_data = pending_calls.pop(session_id)
+                    self._start_session(session_id, session_data)
 
             elif ev_type == "call_terminated":
                 session = event["session"]
-                call_id = session.call_id
-                pending_calls.pop(call_id, None)
-                q = self._session_event_queues.get(call_id)
+                session_id = session.session_id
+                pending_calls.pop(session_id, None)
+                q = self._session_event_queues.get(session_id)
                 if q:
                     await q.put(event)
 
             elif ev_type == "dtmf_received":
-                call_id = event.get("call_id", "")
-                q = self._session_event_queues.get(call_id)
+                session_id = event.get("session_id", "")
+                q = self._session_event_queues.get(session_id)
                 if q:
                     await q.put(event)
 
             elif ev_type in ("beep_detected", "beep_timeout"):
-                call_id = event.get("call_id", "")
-                q = self._session_event_queues.get(call_id)
+                session_id = event.get("session_id", "")
+                q = self._session_event_queues.get(session_id)
                 if q:
                     await q.put(event)
                 else:
-                    logger.warning("No session queue for %s event on call %s (session not yet started?)", ev_type, call_id)
+                    logger.warning("No session queue for %s event on call %s (session not yet started?)", ev_type, session_id)
 
-    def _start_session(self, call_id: str, session_data: dict) -> None:
+    def _start_session(self, session_id: str, session_data: dict) -> None:
         """Create transport and spawn session handler task."""
         event_queue: asyncio.Queue = asyncio.Queue()
-        self._session_event_queues[call_id] = event_queue
+        self._session_event_queues[session_id] = event_queue
 
         transport = SipTransport(
-            self._ep, call_id,
+            self._ep, session_id,
             session_data=session_data,
             params=self._transport_params or TransportParams(
                 audio_in_enabled=True,
@@ -363,11 +363,11 @@ class SipServerTransport:
             _event_queue=event_queue,
         )
 
-        task = asyncio.create_task(self._run_session(call_id, transport))
-        self._active_sessions[call_id] = task
-        self._session_start_times[call_id] = time.monotonic()
+        task = asyncio.create_task(self._run_session(session_id, transport))
+        self._active_sessions[session_id] = task
+        self._session_start_times[session_id] = time.monotonic()
 
-    async def _run_session(self, call_id: str, transport: SipTransport) -> None:
+    async def _run_session(self, session_id: str, transport: SipTransport) -> None:
         direction = transport.direction or "inbound"
         if HAS_PROMETHEUS:
             SIP_CALLS_TOTAL.labels(nodename=platform.node(), direction=direction).inc()
@@ -382,15 +382,15 @@ class SipServerTransport:
         except asyncio.CancelledError:
             pass
         except Exception:
-            logger.exception("Session %s handler failed", call_id)
+            logger.exception("Session %s handler failed", session_id)
         finally:
-            duration = time.monotonic() - self._session_start_times.pop(call_id, time.monotonic())
-            self._active_sessions.pop(call_id, None)
-            self._session_event_queues.pop(call_id, None)
+            duration = time.monotonic() - self._session_start_times.pop(session_id, time.monotonic())
+            self._active_sessions.pop(session_id, None)
+            self._session_event_queues.pop(session_id, None)
             if HAS_PROMETHEUS:
                 RUNNING_CALLS_GAUGE.dec()
                 SIP_CALL_DURATION.observe(duration)
-            logger.info("Session %s ended (%.1fs)", call_id, duration)
+            logger.info("Session %s ended (%.1fs)", session_id, duration)
 
     # ── HTTP server ──────────────────────────────────────────────────────
 
@@ -443,9 +443,9 @@ class SipServerTransport:
             headers = body.get("headers")
             if not dest:
                 return web.json_response({"error": "missing 'to' field"}, status=400)
-            call_id = await self.call(dest, headers)
-            if call_id:
-                return web.json_response({"call_id": call_id})
+            session_id = await self.call(dest, headers)
+            if session_id:
+                return web.json_response({"session_id": session_id})
             return web.json_response({"error": "call failed"}, status=500)
         except Exception as e:
             return web.json_response({"error": str(e)}, status=500)
