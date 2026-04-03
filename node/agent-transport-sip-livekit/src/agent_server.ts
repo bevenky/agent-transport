@@ -533,11 +533,13 @@ export class AgentServer {
               return;
             }
 
-            // Normalize destination: add sip: prefix and @domain if missing
+            const rawTo = destination;
+            // Normalize destination for SIP: add sip: prefix and @domain if missing
             if (!destination.startsWith('sip:')) destination = 'sip:' + destination;
             if (!destination.split(':')[1]?.includes('@')) destination = destination + '@' + this.sipServer;
 
             const fromUri: string | undefined = data.from;
+            const rawFrom = fromUri ?? '';
             const headers: Record<string, string> | undefined = data.headers;
             const wait: boolean = data.wait_until_answered ?? false;
 
@@ -547,12 +549,12 @@ export class AgentServer {
               console.log(`Outbound call ${callId} to ${destination} connected (from=${fromUri ?? 'default'})`);
               this.startCall(callId, destination, 'outbound');
               res.writeHead(200, { 'Content-Type': 'application/json' });
-              res.end(JSON.stringify({ call_id: callId, status: 'connected', to: destination, from: fromUri ?? '' }));
+              res.end(JSON.stringify({ call_id: callId, status: 'connected', to: rawTo, from: rawFrom }));
             } else {
               // Non-blocking (default): generate call_id upfront, dial in background
               const callId = 'c' + crypto.randomUUID().replace(/-/g, '').slice(0, 16);
               res.writeHead(200, { 'Content-Type': 'application/json' });
-              res.end(JSON.stringify({ call_id: callId, status: 'dialing', to: destination, from: fromUri ?? '' }));
+              res.end(JSON.stringify({ call_id: callId, status: 'dialing', to: rawTo, from: rawFrom }));
 
               setImmediate(async () => {
                 try {

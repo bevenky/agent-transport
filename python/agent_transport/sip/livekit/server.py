@@ -576,17 +576,19 @@ class AgentServer:
         except Exception:
             return web.json_response({"error": "invalid JSON"}, status=400)
 
-        destination = data.get("to", "")
-        if not destination:
+        raw_to = data.get("to", "")
+        if not raw_to:
             return web.json_response({"error": "missing 'to' field"}, status=400)
 
-        # Normalize destination: add sip: prefix and @domain if missing
+        # Normalize destination for SIP: add sip: prefix and @domain if missing
+        destination = raw_to
         if not destination.startswith("sip:"):
             destination = "sip:" + destination
         if "@" not in destination.split(":", 1)[1]:
             destination = destination + "@" + self._sip_server
 
         from_uri = data.get("from")  # Optional SIP From URI
+        raw_from = from_uri or ""
         headers = data.get("headers")  # Optional custom SIP headers
         wait = data.get("wait_until_answered", False)
 
@@ -605,7 +607,7 @@ class AgentServer:
             asyncio.create_task(self._start_call(call_id, destination, direction="outbound"))
             return web.json_response({
                 "call_id": call_id, "status": "connected",
-                "to": destination, "from": from_uri or "",
+                "to": raw_to, "from": raw_from,
             })
         else:
             # Non-blocking (default): generate call_id upfront, dial in background
@@ -624,7 +626,7 @@ class AgentServer:
             asyncio.create_task(_dial())
             return web.json_response({
                 "call_id": call_id, "status": "dialing",
-                "to": destination, "from": from_uri or "",
+                "to": raw_to, "from": raw_from,
             })
 
     async def _sip_event_loop(self) -> None:
