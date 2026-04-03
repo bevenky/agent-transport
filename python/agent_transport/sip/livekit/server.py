@@ -25,6 +25,7 @@ import signal
 import sys
 import threading
 import time
+import uuid
 from dataclasses import dataclass, field
 from typing import Any, Callable, Coroutine
 
@@ -302,7 +303,7 @@ class AgentServer:
         self._active_calls: dict[int, asyncio.Task] = {}
         self._call_ended_events: dict[int, asyncio.Event] = {}
         self._call_contexts: dict[int, JobContext] = {}
-        self._pending_outbound: dict[int, asyncio.Future] = {}
+        # _pending_outbound removed — outbound calls start session directly after ep.call()
         self._load_monitor = _LoadMonitor()
 
     @property
@@ -579,23 +580,52 @@ class AgentServer:
         if not destination:
             return web.json_response({"error": "missing 'to' field"}, status=400)
 
+        # Normalize destination: add sip: prefix and @domain if missing
+        if not destination.startswith("sip:"):
+            destination = "sip:" + destination
+        if "@" not in destination.split(":", 1)[1]:
+            destination = destination + "@" + self._sip_server
+
         from_uri = data.get("from")  # Optional SIP From URI
         headers = data.get("headers")  # Optional custom SIP headers
+        wait = data.get("wait_until_answered", False)
 
         loop = asyncio.get_running_loop()
-        try:
-            call_id = await loop.run_in_executor(
-                None, lambda: self._ep.call(destination, from_uri, headers)
-            )
-        except Exception as e:
-            return web.json_response({"error": str(e)}, status=500)
 
-        logger.info("Outbound call %s to %s (from=%s)", call_id, destination, from_uri or "default")
+        if wait:
+            # Blocking mode: wait for call to connect, then return
+            try:
+                call_id = await loop.run_in_executor(
+                    None, lambda: self._ep.call(destination, from_uri, headers)
+                )
+            except Exception as e:
+                return web.json_response({"error": str(e)}, status=500)
 
-        # ep.call() blocks until 200 OK + RTP setup, so media is already active.
-        # Start the agent session immediately.
-        asyncio.create_task(self._start_call(call_id, destination, direction="outbound"))
-        return web.json_response({"status": "calling", "call_id": call_id, "to": destination})
+            logger.info("Outbound call %s to %s connected (from=%s)", call_id, destination, from_uri or "default")
+            asyncio.create_task(self._start_call(call_id, destination, direction="outbound"))
+            return web.json_response({
+                "call_id": call_id, "status": "connected",
+                "to": destination, "from": from_uri or "",
+            })
+        else:
+            # Non-blocking (default): generate call_id upfront, dial in background
+            call_id = "c" + uuid.uuid4().hex[:16]
+
+            async def _dial():
+                try:
+                    returned_id = await loop.run_in_executor(
+                        None, lambda: self._ep.call(destination, from_uri, headers, call_id)
+                    )
+                    logger.info("Outbound call %s to %s connected (from=%s)", returned_id, destination, from_uri or "default")
+                    await self._start_call(returned_id, destination, direction="outbound")
+                except Exception as e:
+                    logger.warning("Outbound call %s to %s failed: %s", call_id, destination, e)
+
+            asyncio.create_task(_dial())
+            return web.json_response({
+                "call_id": call_id, "status": "dialing",
+                "to": destination, "from": from_uri or "",
+            })
 
     async def _sip_event_loop(self) -> None:
         """Single event dispatcher — reads all SIP events and routes them.
@@ -636,11 +666,6 @@ class AgentServer:
                     asyncio.create_task(
                         self._start_call(call_id, remote_uri, direction="inbound")
                     )
-                elif call_id in self._pending_outbound:
-                    # Outbound call — media ready
-                    fut = self._pending_outbound.pop(call_id)
-                    if not fut.done():
-                        fut.set_result(True)
 
             elif ev_type == "call_terminated":
                 call_id = ev["session"].call_id
@@ -664,12 +689,6 @@ class AgentServer:
 
                 # Clean up pending inbound if call died before media
                 pending_inbound.pop(call_id, None)
-
-                # Clean up pending outbound
-                if call_id in self._pending_outbound:
-                    fut = self._pending_outbound.pop(call_id)
-                    if not fut.done():
-                        fut.set_result(False)
 
                 # Signal active call to end
                 if call_id in self._call_ended_events:

@@ -366,12 +366,12 @@ impl SipEndpoint {
     /// Make an outbound call. Returns call_id. Releases GIL (blocks on SIP signaling).
     /// `from_uri` sets the SIP From header (e.g. "sip:+15551234567@provider.com").
     /// If None, uses the registered contact URI.
-    #[pyo3(signature = (dest_uri, from_uri=None, headers=None))]
-    fn call(&self, py: Python, dest_uri: &str, from_uri: Option<&str>, headers: Option<HashMap<String, String>>) -> PyResult<String> {
+    #[pyo3(signature = (dest_uri, from_uri=None, headers=None, call_id=None))]
+    fn call(&self, py: Python, dest_uri: &str, from_uri: Option<&str>, headers: Option<HashMap<String, String>>, call_id: Option<String>) -> PyResult<String> {
         let inner = &self.inner;
         let uri = dest_uri.to_string();
         let from = from_uri.map(|s| s.to_string());
-        py.allow_threads(move || inner.call_with_from(&uri, from.as_deref(), headers)).map_err(py_err)
+        py.allow_threads(move || inner.call_with_from(&uri, from.as_deref(), headers, call_id)).map_err(py_err)
     }
 
     /// Answer an incoming call. Releases GIL.

@@ -400,12 +400,12 @@ impl SipEndpoint {
     // ─── Outbound call ───────────────────────────────────────────────────────
 
     pub fn call(&self, dest_uri: &str, headers: Option<HashMap<String, String>>) -> Result<String> {
-        self.call_with_from(dest_uri, None, headers)
+        self.call_with_from(dest_uri, None, headers, None)
     }
 
     /// Make an outbound call with an optional From URI.
     /// If `from_uri` is None, uses the AOR (sip:user@domain) from registration.
-    pub fn call_with_from(&self, dest_uri: &str, from_uri: Option<&str>, headers: Option<HashMap<String, String>>) -> Result<String> {
+    pub fn call_with_from(&self, dest_uri: &str, from_uri: Option<&str>, headers: Option<HashMap<String, String>>, external_call_id: Option<String>) -> Result<String> {
         let (dest, cfg, st, etx) = (dest_uri.to_string(), self.config.clone(), self.state.clone(), self.event_tx.clone());
         let from_override = from_uri.map(|s| s.to_string());
         self.runtime.block_on(async {
@@ -443,7 +443,7 @@ impl SipEndpoint {
 
             let (ds, dr) = dl.new_dialog_state_channel();
             let (dialog, resp) = dl.do_invite(opt, ds).await.map_err(err)?;
-            let call_id = format!("call-{:016x}", rand::random::<u64>());
+            let call_id = external_call_id.unwrap_or_else(|| format!("c{:016x}", rand::random::<u64>()));
 
             let resp = resp.ok_or_else(|| EndpointError::Other("no response".into()))?;
             let sc = resp.status_code.clone();
@@ -787,7 +787,7 @@ async fn handle_incoming(dl: &Arc<DialogLayer>, st: &Arc<Mutex<EndpointState>>, 
     // Send 180 Ringing to keep the transaction alive until Python calls answer()
     if let Err(e) = dialog.ringing(None, None) { error!("failed to send ringing: {}", e); return; }
 
-    let call_id = format!("call-{:016x}", rand::random::<u64>());
+    let call_id = format!("c{:016x}", rand::random::<u64>());
     let cc = CancellationToken::new();
     let (mut ctx, mut session) = new_call_context(&call_id, CallDirection::Inbound, cc.clone(), output_sample_rate);
 

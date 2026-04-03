@@ -413,9 +413,10 @@ impl SipEndpoint {
         dest_uri: String,
         from_uri: Option<String>,
         headers: Option<HashMap<String, String>>,
+        call_id: Option<String>,
     ) -> Result<String> {
         self.inner
-            .call_with_from(&dest_uri, from_uri.as_deref(), headers)
+            .call_with_from(&dest_uri, from_uri.as_deref(), headers, call_id)
             .map_err(napi_err)
     }
 

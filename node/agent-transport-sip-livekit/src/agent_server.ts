@@ -301,7 +301,7 @@ export class AgentServer {
   // ─── Event dispatcher (single reader, no race conditions) ──────
 
   private pendingInbound = new Map<string, string>(); // callId → remoteUri
-  private pendingOutbound = new Map<string, { resolve: (ok: boolean) => void }>();
+  // pendingOutbound removed — outbound calls start session directly after ep.call()
 
   private async sipEventLoop(): Promise<void> {
     while (true) {
@@ -325,10 +325,6 @@ export class AgentServer {
             console.error(`Inbound call ${callId} failed:`, err);
             try { this.ep!.hangup(callId); } catch {}
           });
-        } else if (this.pendingOutbound.has(callId)) {
-          const pending = this.pendingOutbound.get(callId)!;
-          this.pendingOutbound.delete(callId);
-          pending.resolve(true);
         }
 
       } else if (ev.eventType === 'call_terminated' && ev.session) {
@@ -345,11 +341,6 @@ export class AgentServer {
 
         // Clean up pending
         this.pendingInbound.delete(callId);
-        if (this.pendingOutbound.has(callId)) {
-          const pending = this.pendingOutbound.get(callId)!;
-          this.pendingOutbound.delete(callId);
-          pending.resolve(false);
-        }
 
         // Signal active call to end
         if (active) {
@@ -542,36 +533,37 @@ export class AgentServer {
               return;
             }
 
+            // Normalize destination: add sip: prefix and @domain if missing
+            if (!destination.startsWith('sip:')) destination = 'sip:' + destination;
+            if (!destination.split(':')[1]?.includes('@')) destination = destination + '@' + this.sipServer;
+
             const fromUri: string | undefined = data.from;
             const headers: Record<string, string> | undefined = data.headers;
-            const callId = this.ep!.call(destination, fromUri, headers);
-            console.log(`Outbound call ${callId} to ${destination} (from=${fromUri ?? 'default'})`);
+            const wait: boolean = data.wait_until_answered ?? false;
 
-            // Register pending outbound with 30s timeout
-            const mediaReady = new Promise<boolean>((resolve) => {
-              this.pendingOutbound.set(callId, { resolve });
-              setTimeout(() => {
-                if (this.pendingOutbound.has(callId)) {
-                  this.pendingOutbound.delete(callId);
-                  resolve(false);
+            if (wait) {
+              // Blocking mode: wait for call to connect
+              const callId = this.ep!.call(destination, fromUri, headers);
+              console.log(`Outbound call ${callId} to ${destination} connected (from=${fromUri ?? 'default'})`);
+              this.startCall(callId, destination, 'outbound');
+              res.writeHead(200, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ call_id: callId, status: 'connected', to: destination, from: fromUri ?? '' }));
+            } else {
+              // Non-blocking (default): generate call_id upfront, dial in background
+              const callId = 'c' + crypto.randomUUID().replace(/-/g, '').slice(0, 16);
+              res.writeHead(200, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ call_id: callId, status: 'dialing', to: destination, from: fromUri ?? '' }));
+
+              setImmediate(async () => {
+                try {
+                  const returnedId = this.ep!.call(destination, fromUri, headers, callId);
+                  console.log(`Outbound call ${returnedId} to ${destination} connected (from=${fromUri ?? 'default'})`);
+                  this.startCall(returnedId, destination, 'outbound');
+                } catch (err) {
+                  console.warn(`Outbound call ${callId} to ${destination} failed:`, err);
                 }
-              }, 30000);
-            });
-
-            mediaReady.then((ok) => {
-              if (ok) {
-                this.startCall(callId, destination, 'outbound');
-              } else {
-                console.warn(`Outbound call ${callId} timed out waiting for media`);
-                try { this.ep!.hangup(callId); } catch {}
-              }
-            }).catch((err) => {
-              console.error(`Outbound call ${callId} failed:`, err);
-              try { this.ep!.hangup(callId); } catch {}
-            });
-
-            res.writeHead(200, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ status: 'calling', call_id: callId, to: destination }));
+              });
+            }
           } catch {
             res.writeHead(400, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({ error: 'invalid JSON' }));
