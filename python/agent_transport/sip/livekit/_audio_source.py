@@ -158,28 +158,54 @@ class AudioStreamAudioSource(SipAudioSource):
     - flush() sends a checkpoint to Plivo
     - wait_for_playout() waits for Plivo's playedStream event confirming audio was played
     - clear_queue() sends clearAudio to Plivo and clears local buffer
+
+    Uses shared future pattern — multiple callers within one flush cycle share
+    the same Plivo checkpoint confirmation (matches SipAudioSource._playout_fut).
     """
 
-    async def wait_for_playout(self) -> None:
-        """Wait for Plivo server confirmation that queued audio has been played."""
-        # Send checkpoint to Plivo — Plivo responds with playedStream when audio finishes
-        try:
-            self._ep.flush(self._id)
-        except Exception:
-            logger.warning("AudioStreamAudioSource: flush failed for session %d", self._id, exc_info=True)
-            return
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._plivo_playout_fut: asyncio.Future[None] | None = None
 
-        # Wait for playedStream confirmation (blocking call, releases GIL)
-        loop = asyncio.get_running_loop()
-        try:
-            confirmed = await loop.run_in_executor(
-                None, self._ep.wait_for_playout, self._id, 30000
-            )
-            if not confirmed:
-                logger.warning("AudioStreamAudioSource: wait_for_playout timed out on session %d", self._id)
-        except Exception:
-            logger.warning("AudioStreamAudioSource: wait_for_playout error on session %d", self._id, exc_info=True)
+    async def wait_for_playout(self) -> None:
+        """Wait for Plivo server confirmation that queued audio has been played.
+
+        Uses shared future — first caller sends checkpoint, subsequent callers
+        await the same future without sending duplicate checkpoints.
+        """
+        if self._plivo_playout_fut is None:
+            self._plivo_playout_fut = self._loop.create_future()
+
+            async def _wait():
+                try:
+                    self._ep.flush(self._id)
+                except Exception:
+                    logger.warning("AudioStreamAudioSource: flush failed for session %s", self._id, exc_info=True)
+                    return
+
+                loop = asyncio.get_running_loop()
+                try:
+                    confirmed = await loop.run_in_executor(
+                        None, self._ep.wait_for_playout, self._id, 30000
+                    )
+                    if not confirmed:
+                        logger.warning("AudioStreamAudioSource: wait_for_playout timed out on session %s", self._id)
+                except Exception:
+                    logger.warning("AudioStreamAudioSource: wait_for_playout error on session %s", self._id, exc_info=True)
+                finally:
+                    fut = self._plivo_playout_fut
+                    if fut is not None and not fut.done():
+                        fut.set_result(None)
+                    self._plivo_playout_fut = None
+
+            asyncio.create_task(_wait())
+
+        await asyncio.shield(self._plivo_playout_fut)
 
     def clear_queue(self) -> None:
         """Clear buffer — sends clearAudio to Plivo + clears local AudioBuffer."""
         self._ep.clear_buffer(self._id)
+        # Resolve any pending playout future (interrupt cancels the checkpoint wait)
+        if self._plivo_playout_fut is not None and not self._plivo_playout_fut.done():
+            self._plivo_playout_fut.set_result(None)
+        self._plivo_playout_fut = None
