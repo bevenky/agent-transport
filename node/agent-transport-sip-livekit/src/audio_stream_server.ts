@@ -335,7 +335,7 @@ export class AudioStreamServer {
         const stub = {
           room: ctx.room,
           job: { id: `job-${sessionId}`, agentName: this.agentName, enableRecording: true },
-          _primaryAgentSession: null as any,
+          _primaryAgentSession: undefined as any,
           sessionDirectory: sessionDir,
           proc: { executorType: null },
           inferenceExecutor: this.inferenceExecutor,

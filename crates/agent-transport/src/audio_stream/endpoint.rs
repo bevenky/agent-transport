@@ -285,6 +285,22 @@ impl AudioStreamEndpoint {
         Ok(sess.audio_buf.len() / spf)
     }
 
+    pub fn queued_duration_ms(&self, session_id: &str) -> Result<f64> {
+        let s = self.sessions.lock().unwrap();
+        let sess = s.get(session_id).ok_or_else(|| EndpointError::CallNotActive(session_id.to_string()))?;
+        Ok(sess.audio_buf.queued_duration_ms(self.config.output_sample_rate))
+    }
+
+    pub fn wait_for_playout_notify(&self, session_id: &str, on_complete: crate::sip::audio_buffer::CompletionCallback) -> Result<()> {
+        let audio_buf = {
+            let s = self.sessions.lock().unwrap();
+            let sess = s.get(session_id).ok_or_else(|| EndpointError::CallNotActive(session_id.to_string()))?;
+            sess.audio_buf.clone()
+        };
+        audio_buf.set_playout_callback(on_complete);
+        Ok(())
+    }
+
     pub fn input_sample_rate(&self) -> u32 { self.config.input_sample_rate }
     pub fn output_sample_rate(&self) -> u32 { self.config.output_sample_rate }
     pub fn events(&self) -> Receiver<EndpointEvent> { self.event_rx.clone() }
