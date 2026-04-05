@@ -360,26 +360,15 @@ export class AudioStreamServer {
         let agents: any;
         try { agents = await import('@livekit/agents'); } catch {}
 
-        const sessionDir = `/tmp/agent-sessions/${sessionId}`;
+        const sessionDir = `/tmp/agent-sessions`;
         const stub = {
           room: ctx.room,
-          job: { id: `job-${sessionId}`, agentName: this.agentName, enableRecording: true },
+          job: { id: `job-${sessionId}`, agentName: this.agentName, enableRecording: false },
           _primaryAgentSession: undefined as any,
           sessionDirectory: sessionDir,
           proc: { executorType: null },
           inferenceExecutor: this.inferenceExecutor,
-          initRecording: () => {
-            try {
-              const { mkdirSync } = require('node:fs');
-              mkdirSync(sessionDir, { recursive: true });
-              this.ep!.startRecording(sessionId, `${sessionDir}/recording_${sessionId}.ogg`, true);
-              if (stub._primaryAgentSession) {
-                stub._primaryAgentSession._enableRecording = false;
-              }
-            } catch (err) {
-              console.warn('Rust recording failed, falling back to RecorderIO:', err);
-            }
-          },
+          initRecording: () => {},
           connect: async () => {},
           addShutdownCallback: () => {},
           shutdown: () => {},
@@ -394,6 +383,14 @@ export class AudioStreamServer {
         } else {
           await this.entrypointFn!(ctx);
         }
+
+        // Start Rust recording (stereo OGG/Opus at transport layer)
+        try {
+          const { mkdirSync } = await import('node:fs');
+          mkdirSync(sessionDir, { recursive: true });
+          this.ep!.startRecording(sessionId, `${sessionDir}/recording_${sessionId}.ogg`, true);
+          console.log(`Recording started: ${sessionDir}/recording_${sessionId}.ogg`);
+        } catch {}
 
         // Hook user state changes for debug logging
         if (ctx.session) {
