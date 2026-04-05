@@ -733,12 +733,10 @@ struct AudioStreamEndpoint {
 #[pymethods]
 impl AudioStreamEndpoint {
     #[new]
-    #[pyo3(signature = (listen_addr="0.0.0.0:8080", plivo_auth_id="", plivo_auth_token="", input_sample_rate=8000, output_sample_rate=8000, auto_hangup=true, tls_cert_path=None, tls_key_path=None))]
-    fn new(listen_addr: &str, plivo_auth_id: &str, plivo_auth_token: &str, input_sample_rate: u32, output_sample_rate: u32, auto_hangup: bool, tls_cert_path: Option<&str>, tls_key_path: Option<&str>) -> PyResult<Self> {
+    #[pyo3(signature = (listen_addr="0.0.0.0:8080", plivo_auth_id="", plivo_auth_token="", input_sample_rate=8000, output_sample_rate=8000, auto_hangup=true))]
+    fn new(listen_addr: &str, plivo_auth_id: &str, plivo_auth_token: &str, input_sample_rate: u32, output_sample_rate: u32, auto_hangup: bool) -> PyResult<Self> {
         let config = RustAudioStreamConfig {
             listen_addr: listen_addr.into(), input_sample_rate, output_sample_rate, auto_hangup,
-            tls_cert_path: tls_cert_path.map(String::from),
-            tls_key_path: tls_key_path.map(String::from),
         };
         let protocol = std::sync::Arc::new(PlivoProtocol::new(plivo_auth_id.into(), plivo_auth_token.into()));
         let inner = RustAudioStreamEndpoint::new(config, protocol).map_err(py_err)?;

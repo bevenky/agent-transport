@@ -12,11 +12,9 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use crossbeam_channel::{Receiver, Sender};
-use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
 use tokio::runtime::Runtime;
 use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::WebSocketStream;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
@@ -79,20 +77,6 @@ impl AudioStreamEndpoint {
         let cancel = CancellationToken::new();
         let sessions = Arc::new(Mutex::new(HashMap::new()));
 
-        // Load TLS config if cert/key paths provided
-        let tls_acceptor = match (&config.tls_cert_path, &config.tls_key_path) {
-            (Some(cert_path), Some(key_path)) => {
-                let acceptor = load_tls_acceptor(cert_path, key_path)
-                    .map_err(|e| EndpointError::Other(format!("TLS config error: {}", e)))?;
-                info!("TLS enabled (cert={}, key={})", cert_path, key_path);
-                Some(acceptor)
-            }
-            (Some(_), None) | (None, Some(_)) => {
-                return Err(EndpointError::Other("Both tls_cert_path and tls_key_path are required for TLS".into()));
-            }
-            _ => None,
-        };
-
         let recording_mgr = crate::recorder::RecordingManager::new();
 
         let (addr, sess, etx2, cc, isr, osr, proto, rmgr) = (
@@ -101,13 +85,12 @@ impl AudioStreamEndpoint {
             recording_mgr.clone(),
         );
         rt.spawn(async move {
-            if let Err(e) = run_ws_server(&addr, sess, etx2, cc, isr, osr, proto, tls_acceptor, rmgr).await {
+            if let Err(e) = run_ws_server(&addr, sess, etx2, cc, isr, osr, proto, rmgr).await {
                 error!("WS server: {}", e);
             }
         });
 
-        let scheme = if config.tls_cert_path.is_some() { "wss" } else { "ws" };
-        info!("Audio streaming endpoint on {}://{}", scheme, config.listen_addr);
+        info!("Audio streaming endpoint on ws://{}", config.listen_addr);
         Ok(Self {
             config, protocol, runtime: rt, sessions, event_tx: etx, event_rx: erx,
             cancel, recording_mgr,
@@ -373,33 +356,6 @@ impl AudioStreamEndpoint {
 
 impl Drop for AudioStreamEndpoint { fn drop(&mut self) { let _ = self.shutdown(); } }
 
-// ─── TLS helpers ──────────────────────────────────────────────────────────────
-
-fn load_tls_acceptor(cert_path: &str, key_path: &str) -> std::result::Result<tokio_rustls::TlsAcceptor, Box<dyn std::error::Error>> {
-    use std::io::BufReader;
-    use tokio_rustls::rustls::{self, crypto::aws_lc_rs};
-
-    // Install crypto provider if not yet set (needed when both aws-lc-rs and ring are in deps)
-    let _ = aws_lc_rs::default_provider().install_default();
-
-    let cert_file = std::fs::File::open(cert_path)?;
-    let certs: Vec<_> = rustls_pemfile::certs(&mut BufReader::new(cert_file))
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    if certs.is_empty() {
-        return Err("No certificates found in cert file".into());
-    }
-
-    let key_file = std::fs::File::open(key_path)?;
-    let key = rustls_pemfile::private_key(&mut BufReader::new(key_file))?
-        .ok_or("No private key found in key file")?;
-
-    let config = rustls::ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(certs, key)?;
-
-    Ok(tokio_rustls::TlsAcceptor::from(Arc::new(config)))
-}
-
 // ─── WebSocket server ────────────────────────────────────────────────────────
 
 async fn run_ws_server(
@@ -409,7 +365,6 @@ async fn run_ws_server(
     cancel: CancellationToken,
     input_sample_rate: u32, output_sample_rate: u32,
     protocol: Arc<dyn StreamProtocol>,
-    tls_acceptor: Option<tokio_rustls::TlsAcceptor>,
     recording_mgr: Arc<crate::recorder::RecordingManager>,
 ) -> std::result::Result<(), Box<dyn std::error::Error>> {
     let listener = TcpListener::bind(addr).await?;
@@ -424,30 +379,13 @@ async fn run_ws_server(
                 info!("WS connection from {}", peer);
                 let sid = format!("ws-{:016x}", rand::random::<u64>());
                 let (s, e, c, p, r) = (sessions.clone(), etx.clone(), cancel.clone(), protocol.clone(), recording_mgr.clone());
-
-                if let Some(ref acceptor) = tls_acceptor {
-                    let acceptor = acceptor.clone();
-                    tokio::spawn(async move {
-                        let tls_stream = match acceptor.accept(stream).await {
-                            Ok(s) => s,
-                            Err(e) => { warn!("TLS handshake failed from {}: {}", peer, e); return; }
-                        };
-                        debug!("TLS handshake complete from {}", peer);
-                        let ws = match tokio_tungstenite::accept_async(tls_stream).await {
-                            Ok(ws) => ws,
-                            Err(e) => { warn!("WS handshake failed from {}: {}", peer, e); return; }
-                        };
-                        handle_ws(ws, sid, s, e, c, input_sample_rate, output_sample_rate, p, r).await;
-                    });
-                } else {
-                    tokio::spawn(async move {
-                        let ws = match tokio_tungstenite::accept_async(stream).await {
-                            Ok(ws) => ws,
-                            Err(e) => { warn!("WS handshake failed from {}: {}", peer, e); return; }
-                        };
-                        handle_ws(ws, sid, s, e, c, input_sample_rate, output_sample_rate, p, r).await;
-                    });
-                }
+                tokio::spawn(async move {
+                    let ws = match tokio_tungstenite::accept_async(stream).await {
+                        Ok(ws) => ws,
+                        Err(e) => { warn!("WS handshake failed from {}: {}", peer, e); return; }
+                    };
+                    handle_ws(ws, sid, s, e, c, input_sample_rate, output_sample_rate, p, r).await;
+                });
             }
         }
     }
@@ -456,8 +394,8 @@ async fn run_ws_server(
 
 // ─── Per-connection WebSocket handler ────────────────────────────────────────
 
-async fn handle_ws<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
-    ws: WebSocketStream<S>,
+async fn handle_ws(
+    ws: tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
     sid: String,
     sessions: Arc<Mutex<HashMap<String, StreamSession>>>,
     etx: Sender<EndpointEvent>,

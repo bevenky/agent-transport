@@ -269,6 +269,10 @@ export class AudioStreamServer {
   // ─── Event loop ─────────────────────────────────────────────────────
 
   private async eventLoop(): Promise<void> {
+    // Matches SIP server pattern: incoming_call stores metadata,
+    // call_media_active (fired on first audio frame) starts the agent session.
+    const pendingSessions = new Map<string, { callUuid: string; streamId: string; headers: Record<string, string> }>();
+
     while (true) {
       const ev = await this.waitForEvent(1000);
       if (!ev) continue;
@@ -278,14 +282,20 @@ export class AudioStreamServer {
         const plivoCallUuid = ev.session.remoteUri;
         const streamId = ev.session.localUri ?? '';
         const extraHeaders = ev.session.extraHeaders ?? {};
-        console.log(`Audio stream session ${sessionId} started (plivo_call_uuid=${plivoCallUuid})`);
-        this.startSession(sessionId, plivoCallUuid, streamId, extraHeaders).catch((err) => {
-          console.error(`Session ${sessionId} startup failed:`, err);
-          try { this.ep!.hangup(sessionId); } catch {}
-        });
+        console.log(`Audio stream session ${sessionId} connected (plivo_call_uuid=${plivoCallUuid})`);
+        pendingSessions.set(sessionId, { callUuid: plivoCallUuid, streamId, headers: extraHeaders });
 
       } else if (ev.eventType === 'call_media_active') {
-        // Consumed — audio stream fires this together with incoming_call
+        const sessionId = ev.sessionId;
+        const pending = pendingSessions.get(sessionId);
+        if (pending) {
+          pendingSessions.delete(sessionId);
+          console.log(`Audio stream session ${sessionId} media active, starting agent`);
+          this.startSession(sessionId, pending.callUuid, pending.streamId, pending.headers).catch((err) => {
+            console.error(`Session ${sessionId} startup failed:`, err);
+            try { this.ep!.hangup(sessionId); } catch {}
+          });
+        }
 
       } else if (ev.eventType === 'call_terminated' && ev.session) {
         const sessionId = ev.session.sessionId;
