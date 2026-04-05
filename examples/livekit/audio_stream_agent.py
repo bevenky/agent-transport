@@ -46,6 +46,8 @@ server = AudioStreamServer(
     listen_addr=os.environ.get("AUDIO_STREAM_ADDR", "0.0.0.0:8765"),
     plivo_auth_id=os.environ.get("PLIVO_AUTH_ID", ""),
     plivo_auth_token=os.environ.get("PLIVO_AUTH_TOKEN", ""),
+    tls_cert_path=os.environ.get("TLS_CERT_PATH"),
+    tls_key_path=os.environ.get("TLS_KEY_PATH"),
 )
 
 

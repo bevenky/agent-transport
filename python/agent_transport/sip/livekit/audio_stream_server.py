@@ -275,10 +275,14 @@ class AudioStreamServer:
         port: int | None = None,
         agent_name: str = "audio-stream-agent",
         auth: Callable[..., bool | Coroutine] | None = None,
+        tls_cert_path: str | None = None,
+        tls_key_path: str | None = None,
     ) -> None:
         self._listen_addr = listen_addr or os.environ.get("AUDIO_STREAM_ADDR", "0.0.0.0:8765")
         self._plivo_auth_id = plivo_auth_id or os.environ.get("PLIVO_AUTH_ID", "")
         self._plivo_auth_token = plivo_auth_token or os.environ.get("PLIVO_AUTH_TOKEN", "")
+        self._tls_cert_path = tls_cert_path or os.environ.get("TLS_CERT_PATH")
+        self._tls_key_path = tls_key_path or os.environ.get("TLS_KEY_PATH")
         self._sample_rate = sample_rate
         self._host = host
         self._port = port or int(os.environ.get("PORT", "8080"))
@@ -422,8 +426,11 @@ class AudioStreamServer:
             plivo_auth_token=self._plivo_auth_token,
             input_sample_rate=self._sample_rate,
             output_sample_rate=self._sample_rate,
+            tls_cert_path=self._tls_cert_path,
+            tls_key_path=self._tls_key_path,
         )
-        logger.info("Audio stream WebSocket server on ws://%s", self._listen_addr)
+        scheme = "wss" if self._tls_cert_path else "ws"
+        logger.info("Audio stream WebSocket server on %s://%s", scheme, self._listen_addr)
 
         # Start HTTP server
         http_app = self._build_http_app()
@@ -539,11 +546,14 @@ class AudioStreamServer:
     async def _event_loop(self) -> None:
         """Event dispatcher — reads audio stream events and routes them.
 
-        Audio streaming fires incoming_call + call_media_active together
-        on the Plivo 'start' event. We dispatch on incoming_call and
-        consume call_media_active to prevent queue buildup.
+        Matches SIP server pattern: incoming_call stores session info,
+        call_media_active (fired on first audio frame) starts the agent session.
+        This gap lets the system initialize before the agent pipeline starts,
+        avoiding races between FFI init and BackgroundAudioPlayer's decoder.
         """
         loop = asyncio.get_running_loop()
+        # Sessions waiting for first audio frame: {session_id: (call_uuid, stream_id, headers)}
+        pending_sessions: dict[str, tuple[str, str, dict]] = {}
 
         while True:
             try:
@@ -558,18 +568,21 @@ class AudioStreamServer:
 
             if ev_type == "incoming_call":
                 session = ev["session"]
-                session_id = session.session_id  # internal session ID
-                plivo_call_uuid = session.remote_uri  # Plivo Call UUID
+                session_id = session.session_id
+                plivo_call_uuid = session.remote_uri
                 stream_id = session.local_uri if hasattr(session, "local_uri") else ""
                 extra_headers = session.extra_headers if hasattr(session, "extra_headers") else {}
-                logger.info("Audio stream session %s started (plivo_call_uuid=%s, stream_id=%s)", session_id, plivo_call_uuid, stream_id)
-                asyncio.create_task(
-                    self._start_session(session_id, plivo_call_uuid, stream_id, extra_headers)
-                )
+                logger.info("Audio stream session %s connected (plivo_call_uuid=%s, stream_id=%s)", session_id, plivo_call_uuid, stream_id)
+                pending_sessions[session_id] = (plivo_call_uuid, stream_id, extra_headers)
 
             elif ev_type == "call_media_active":
-                # Consumed — audio stream fires this together with incoming_call
-                pass
+                session_id = ev["session_id"]
+                if session_id in pending_sessions:
+                    plivo_call_uuid, stream_id, extra_headers = pending_sessions.pop(session_id)
+                    logger.info("Audio stream session %s media active, starting agent", session_id)
+                    asyncio.create_task(
+                        self._start_session(session_id, plivo_call_uuid, stream_id, extra_headers)
+                    )
 
             elif ev_type == "call_terminated":
                 session_id = ev["session"].session_id
