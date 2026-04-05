@@ -269,6 +269,10 @@ export class AudioStreamServer {
   // ─── Event loop ─────────────────────────────────────────────────────
 
   private async eventLoop(): Promise<void> {
+    // Matches SIP server pattern: incoming_call stores metadata,
+    // call_media_active (fired on first audio frame) starts the agent session.
+    const pendingSessions = new Map<string, { callUuid: string; streamId: string; headers: Record<string, string> }>();
+
     while (true) {
       const ev = await this.waitForEvent(1000);
       if (!ev) continue;
@@ -278,14 +282,20 @@ export class AudioStreamServer {
         const plivoCallUuid = ev.session.remoteUri;
         const streamId = ev.session.localUri ?? '';
         const extraHeaders = ev.session.extraHeaders ?? {};
-        console.log(`Audio stream session ${sessionId} started (plivo_call_uuid=${plivoCallUuid})`);
-        this.startSession(sessionId, plivoCallUuid, streamId, extraHeaders).catch((err) => {
-          console.error(`Session ${sessionId} startup failed:`, err);
-          try { this.ep!.hangup(sessionId); } catch {}
-        });
+        console.log(`Audio stream session ${sessionId} connected (plivo_call_uuid=${plivoCallUuid})`);
+        pendingSessions.set(sessionId, { callUuid: plivoCallUuid, streamId, headers: extraHeaders });
 
       } else if (ev.eventType === 'call_media_active') {
-        // Consumed — audio stream fires this together with incoming_call
+        const sessionId = ev.sessionId;
+        const pending = pendingSessions.get(sessionId);
+        if (pending) {
+          pendingSessions.delete(sessionId);
+          console.log(`Audio stream session ${sessionId} media active, starting agent`);
+          this.startSession(sessionId, pending.callUuid, pending.streamId, pending.headers).catch((err) => {
+            console.error(`Session ${sessionId} startup failed:`, err);
+            try { this.ep!.hangup(sessionId); } catch {}
+          });
+        }
 
       } else if (ev.eventType === 'call_terminated' && ev.session) {
         const sessionId = ev.session.sessionId;
@@ -350,26 +360,15 @@ export class AudioStreamServer {
         let agents: any;
         try { agents = await import('@livekit/agents'); } catch {}
 
-        const sessionDir = `/tmp/agent-sessions/${sessionId}`;
+        const sessionDir = `/tmp/agent-sessions`;
         const stub = {
           room: ctx.room,
-          job: { id: `job-${sessionId}`, agentName: this.agentName, enableRecording: true },
+          job: { id: `job-${sessionId}`, agentName: this.agentName, enableRecording: false },
           _primaryAgentSession: undefined as any,
           sessionDirectory: sessionDir,
           proc: { executorType: null },
           inferenceExecutor: this.inferenceExecutor,
-          initRecording: () => {
-            try {
-              const { mkdirSync } = require('node:fs');
-              mkdirSync(sessionDir, { recursive: true });
-              this.ep!.startRecording(sessionId, `${sessionDir}/audio.wav`, true);
-              if (stub._primaryAgentSession) {
-                stub._primaryAgentSession._enableRecording = false;
-              }
-            } catch (err) {
-              console.warn('Rust recording failed, falling back to RecorderIO:', err);
-            }
-          },
+          initRecording: () => {},
           connect: async () => {},
           addShutdownCallback: () => {},
           shutdown: () => {},
@@ -384,6 +383,14 @@ export class AudioStreamServer {
         } else {
           await this.entrypointFn!(ctx);
         }
+
+        // Start Rust recording (stereo OGG/Opus at transport layer)
+        try {
+          const { mkdirSync } = await import('node:fs');
+          mkdirSync(sessionDir, { recursive: true });
+          this.ep!.startRecording(sessionId, `${sessionDir}/recording_${sessionId}.ogg`, true);
+          console.log(`Recording started: ${sessionDir}/recording_${sessionId}.ogg`);
+        } catch {}
 
         // Hook user state changes for debug logging
         if (ctx.session) {
@@ -405,6 +412,8 @@ export class AudioStreamServer {
           try { await (ctx.session as any).close(); } catch {}
         }
 
+        // Stop Rust recording if active
+        try { this.ep!.stopRecording(sessionId); } catch {}
         try { this.ep!.hangup(sessionId); } catch {}
 
         ctx.room._onSessionEnded();

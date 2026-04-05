@@ -293,10 +293,12 @@ class AudioStreamOutput(AudioOutput):
             while not self._audio_buf.empty():
                 if not self._playback_enabled.is_set():
                     await self._playback_enabled.wait()
-                logger.debug("_wait_buffered_audio: chan_qsize=%d, awaiting audio_source.wait_for_playout", self._audio_buf.qsize())
-                await self._audio_source.wait_for_playout()
-                await asyncio.sleep(0)
-            logger.debug("_wait_buffered_audio: chan empty, playout done")
+                await asyncio.sleep(0.01)
+            # All frames forwarded to Rust's AudioBuffer.
+            # Wait for Rust send loop to flush to provider and get confirmation.
+            logger.debug("_wait_buffered_audio: chan empty, waiting for playout confirmation")
+            await self._audio_source.wait_for_playout()
+            logger.debug("_wait_buffered_audio: playout confirmed")
 
         wait_for_playout = asyncio.create_task(_wait_buffered_audio())
         await asyncio.wait(
@@ -333,8 +335,8 @@ class AudioStreamOutput(AudioOutput):
                 self._audio_source.clear_queue()
                 await self._playback_enabled.wait()
 
-            if self._interrupted_event.is_set() or self._pushed_duration == 0:
-                if self._interrupted_event.is_set() and self._flush_task:
+            if self._interrupted_event.is_set():
+                if self._flush_task:
                     await self._flush_task
 
                 continue

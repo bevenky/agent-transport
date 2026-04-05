@@ -44,6 +44,13 @@ struct StreamSession {
     checkpoint_counter: AtomicU64,
     checkpoint_notify: Arc<(Mutex<Option<String>>, Condvar)>,
     send_loop_notify: Arc<tokio::sync::Notify>,
+    /// Checkpoint name queued by flush() — send loop sends it when buffer empties.
+    /// Ensures checkpoint is ordered AFTER all playAudio messages.
+    pending_flush: Arc<Mutex<Option<String>>>,
+    /// The checkpoint name we're currently waiting for Plivo to confirm.
+    /// Set when the send loop sends the checkpoint, cleared on confirm or clear_buffer.
+    /// CheckpointAck only notifies condvar if the name matches, preventing stale acks.
+    awaiting_checkpoint: Arc<Mutex<Option<String>>>,
     recorder: Arc<Mutex<Option<Arc<crate::recorder::CallRecorder>>>>,
     beep_detector: Arc<Mutex<Option<BeepDetector>>>,
     cancel: CancellationToken,
@@ -70,20 +77,23 @@ impl AudioStreamEndpoint {
         let cancel = CancellationToken::new();
         let sessions = Arc::new(Mutex::new(HashMap::new()));
 
-        let (addr, sess, etx2, cc, isr, osr, proto) = (
+        let recording_mgr = crate::recorder::RecordingManager::new();
+
+        let (addr, sess, etx2, cc, isr, osr, proto, rmgr) = (
             config.listen_addr.clone(), sessions.clone(), etx.clone(),
             cancel.clone(), config.input_sample_rate, config.output_sample_rate, protocol.clone(),
+            recording_mgr.clone(),
         );
         rt.spawn(async move {
-            if let Err(e) = run_ws_server(&addr, sess, etx2, cc, isr, osr, proto).await {
+            if let Err(e) = run_ws_server(&addr, sess, etx2, cc, isr, osr, proto, rmgr).await {
                 error!("WS server: {}", e);
             }
         });
 
-        info!("Audio streaming endpoint on {}", config.listen_addr);
+        info!("Audio streaming endpoint on ws://{}", config.listen_addr);
         Ok(Self {
             config, protocol, runtime: rt, sessions, event_tx: etx, event_rx: erx,
-            cancel, recording_mgr: crate::recorder::RecordingManager::new(),
+            cancel, recording_mgr,
         })
     }
 
@@ -145,10 +155,12 @@ impl AudioStreamEndpoint {
         let s = self.sessions.lock().unwrap();
         let sess = s.get(session_id).ok_or_else(|| EndpointError::CallNotActive(session_id.to_string()))?;
         sess.paused.store(true, Ordering::Relaxed);
-        // Tell provider to mute (stops audio output on their side)
-        if let Some(msg) = self.protocol.build_mute_stream(&sess.stream_id) {
-            let _ = sess.ws_tx.send(Message::Text(msg));
-        }
+        // Send clearAudio to immediately stop playback on Plivo's side.
+        // Plivo doesn't support muteStream — clearAudio is the only way to stop playback.
+        // The Rust AudioBuffer retains queued audio for resume (send loop skips drain while paused).
+        let json = self.protocol.build_clear_audio(&sess.stream_id);
+        let _ = sess.ws_tx.send(Message::Text(json));
+        debug!("Paused session {} (clearAudio sent to provider)", session_id);
         Ok(())
     }
 
@@ -156,10 +168,8 @@ impl AudioStreamEndpoint {
         let s = self.sessions.lock().unwrap();
         let sess = s.get(session_id).ok_or_else(|| EndpointError::CallNotActive(session_id.to_string()))?;
         sess.paused.store(false, Ordering::Relaxed);
-        // Tell provider to unmute
-        if let Some(msg) = self.protocol.build_unmute_stream(&sess.stream_id) {
-            let _ = sess.ws_tx.send(Message::Text(msg));
-        }
+        // No unmute needed — send loop will resume sending audio from the Rust buffer.
+        debug!("Resumed session {}", session_id);
         Ok(())
     }
 
@@ -171,9 +181,22 @@ impl AudioStreamEndpoint {
         let s = self.sessions.lock().unwrap();
         let sess = s.get(session_id).ok_or_else(|| EndpointError::CallNotActive(session_id.to_string()))?;
         sess.audio_buf.clear();
-        sess.send_loop_notify.notify_one();
-        let json = self.protocol.build_clear_audio(&sess.stream_id);
-        sess.ws_tx.send(Message::Text(json)).map_err(|_| EndpointError::Other("WS send failed".into()))
+        // Cancel any pending flush checkpoint — interrupt overrides playout
+        *sess.pending_flush.lock().unwrap() = None;
+        // Clear awaiting_checkpoint so late Plivo confirmations are ignored
+        *sess.awaiting_checkpoint.lock().unwrap() = None;
+        // Wake any blocked wait_for_playout so executor thread returns immediately
+        {
+            let (lock, cvar) = &*sess.checkpoint_notify;
+            *lock.lock().unwrap() = Some("_cleared".into());
+            cvar.notify_all();
+        }
+        // Only send clearAudio if not already paused (pause already sent clearAudio)
+        if !sess.paused.load(Ordering::Relaxed) {
+            let json = self.protocol.build_clear_audio(&sess.stream_id);
+            sess.ws_tx.send(Message::Text(json)).map_err(|_| EndpointError::Other("WS send failed".into()))?;
+        }
+        Ok(())
     }
 
     pub fn checkpoint(&self, session_id: &str, name: Option<&str>) -> Result<String> {
@@ -188,11 +211,15 @@ impl AudioStreamEndpoint {
         Ok(cp_name)
     }
 
-    /// Send a checkpoint marker. Does NOT block — use wait_for_playout() after
-    /// to block until the provider confirms the checkpoint was played.
+    /// Queue a flush checkpoint — the send loop sends it after all buffered audio.
+    /// This ensures the checkpoint is ordered AFTER all playAudio messages,
+    /// so Plivo's playedStream confirms when ALL audio has actually been played.
     pub fn flush(&self, session_id: &str) -> Result<()> {
-        let cp_name = self.checkpoint(session_id, None)?;
-        debug!("Flush: checkpoint '{}' sent on session {}", cp_name, session_id);
+        let s = self.sessions.lock().unwrap();
+        let sess = s.get(session_id).ok_or_else(|| EndpointError::CallNotActive(session_id.to_string()))?;
+        let cp_name = format!("cp-{}", sess.checkpoint_counter.fetch_add(1, Ordering::Relaxed));
+        *sess.pending_flush.lock().unwrap() = Some(cp_name.clone());
+        debug!("Flush: checkpoint '{}' queued for session {} (send loop will send after drain)", cp_name, session_id);
         Ok(())
     }
 
@@ -262,7 +289,7 @@ impl AudioStreamEndpoint {
     pub fn hangup(&self, session_id: &str) -> Result<()> {
         let call_id = {
             let sess = self.sessions.lock().unwrap().remove(session_id);
-            match sess { Some(s) => { s.cancel.cancel(); s.call_id.clone() }, None => return Ok(()) }
+            match sess { Some(s) => { cleanup_session(session_id, &s, &self.recording_mgr); s.call_id.clone() }, None => return Ok(()) }
         };
         self.protocol.hangup(&call_id, &self.runtime);
         Ok(())
@@ -338,18 +365,27 @@ async fn run_ws_server(
     cancel: CancellationToken,
     input_sample_rate: u32, output_sample_rate: u32,
     protocol: Arc<dyn StreamProtocol>,
+    recording_mgr: Arc<crate::recorder::RecordingManager>,
 ) -> std::result::Result<(), Box<dyn std::error::Error>> {
     let listener = TcpListener::bind(addr).await?;
     loop {
         tokio::select! {
             _ = cancel.cancelled() => break,
             result = listener.accept() => {
-                let (stream, peer) = result?;
+                let (stream, peer) = match result {
+                    Ok(v) => v,
+                    Err(e) => { warn!("TCP accept error: {}", e); continue; }
+                };
                 info!("WS connection from {}", peer);
-                let ws = tokio_tungstenite::accept_async(stream).await?;
                 let sid = format!("ws-{:016x}", rand::random::<u64>());
-                let (s, e, c, p) = (sessions.clone(), etx.clone(), cancel.clone(), protocol.clone());
-                tokio::spawn(async move { handle_ws(ws, sid, s, e, c, input_sample_rate, output_sample_rate, p).await; });
+                let (s, e, c, p, r) = (sessions.clone(), etx.clone(), cancel.clone(), protocol.clone(), recording_mgr.clone());
+                tokio::spawn(async move {
+                    let ws = match tokio_tungstenite::accept_async(stream).await {
+                        Ok(ws) => ws,
+                        Err(e) => { warn!("WS handshake failed from {}: {}", peer, e); return; }
+                    };
+                    handle_ws(ws, sid, s, e, c, input_sample_rate, output_sample_rate, p, r).await;
+                });
             }
         }
     }
@@ -366,6 +402,7 @@ async fn handle_ws(
     cancel: CancellationToken,
     input_sample_rate: u32, output_sample_rate: u32,
     protocol: Arc<dyn StreamProtocol>,
+    recording_mgr: Arc<crate::recorder::RecordingManager>,
 ) {
     use futures_util::{SinkExt, StreamExt};
     let (mut sink, mut stream) = ws.split();
@@ -388,6 +425,7 @@ async fn handle_ws(
     let mut upsampler: Option<crate::sip::resampler::Resampler> = None;
     let mut media_recorder: Option<Arc<Mutex<Option<Arc<crate::recorder::CallRecorder>>>>> = None;
     let mut media_beep_det: Option<Arc<Mutex<Option<BeepDetector>>>> = None;
+    let mut media_active_sent = false;
 
     loop {
         tokio::select! {
@@ -418,27 +456,37 @@ async fn handle_ws(
                         let send_loop_notify = Arc::new(tokio::sync::Notify::new());
                         let session_recorder: Arc<Mutex<Option<Arc<crate::recorder::CallRecorder>>>> = Arc::new(Mutex::new(None));
                         let session_beep_detector: Arc<Mutex<Option<BeepDetector>>> = Arc::new(Mutex::new(None));
+                        let pending_flush: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+                        let awaiting_checkpoint: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
                         let session_cancel = CancellationToken::new();
 
-                        // Spawn checkpoint-paced send loop
+                        // Spawn send loop
                         let wstx = ws_tx.clone();
                         let ab = audio_buf.clone();
                         let bg = bg_audio_buf.clone();
                         let rec_send = session_recorder.clone();
                         let (m, p, pn) = (muted.clone(), paused.clone(), playout_notify.clone());
-                        let sln = send_loop_notify.clone();
+                        let pf = pending_flush.clone();
+                        let aw = awaiting_checkpoint.clone();
                         let sc = session_cancel.clone();
                         let stream_id_for_loop = stream_id.clone();
-                        let chunk_spf: usize = (output_sample_rate * 100 / 1000) as usize;
-                        let cp_counter = Arc::new(AtomicU64::new(0));
+                        // Send loop: 20ms interval pacing (matches SIP RTP send loop).
+                        // Drains 20ms of audio from agent + background buffers, mixes, encodes, sends.
+                        // No checkpoint blocking — audio flows at real-time pace.
+                        let chunk_spf: usize = (output_sample_rate * 20 / 1000) as usize; // 20ms chunks
                         let send_proto = protocol.clone();
                         let send_enc = encoding;
 
                         tokio::spawn(async move {
                             let mut resampler = crate::sip::resampler::Resampler::new_voip(output_sample_rate, send_enc.sample_rate());
+                            let mut interval = tokio::time::interval(Duration::from_millis(20));
+                            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
                             loop {
-                                if sc.is_cancelled() { break; }
+                                tokio::select! {
+                                    _ = sc.cancelled() => break,
+                                    _ = interval.tick() => {}
+                                }
 
                                 // Drain background audio regardless of pause state
                                 let bg_samples = bg.drain(chunk_spf);
@@ -450,7 +498,15 @@ async fn handle_ws(
                                         let play_msg = send_proto.build_play_audio(&encoded, send_enc, &stream_id_for_loop);
                                         let _ = wstx.send(Message::Text(play_msg));
                                     }
-                                    tokio::time::sleep(Duration::from_millis(20)).await;
+                                    // If agent buffer already drained before pause, send pending checkpoint
+                                    if ab.is_empty() {
+                                        if let Some(cp_name) = pf.lock().unwrap().take() {
+                                            *aw.lock().unwrap() = Some(cp_name.clone());
+                                            let cp_msg = send_proto.build_checkpoint(&stream_id_for_loop, &cp_name);
+                                            let _ = wstx.send(Message::Text(cp_msg));
+                                            debug!("Send loop: flush checkpoint '{}' sent (paused, buffer empty)", cp_name);
+                                        }
+                                    }
                                     continue;
                                 }
 
@@ -500,24 +556,20 @@ async fn handle_ws(
                                         let encoded = send_enc.encode(&mixed, &mut resampler);
                                         let play_msg = send_proto.build_play_audio(&encoded, send_enc, &stream_id_for_loop);
                                         let _ = wstx.send(Message::Text(play_msg));
-
-                                        let cp_name = format!("sl-{}", cp_counter.fetch_add(1, Ordering::Relaxed));
-                                        let cp_msg = send_proto.build_checkpoint(&stream_id_for_loop, &cp_name);
-                                        let _ = wstx.send(Message::Text(cp_msg));
-
-                                        tokio::select! {
-                                            _ = sc.cancelled() => break,
-                                            _ = sln.notified() => {},
-                                            _ = tokio::time::sleep(Duration::from_secs(2)) => {
-                                                debug!("Send loop: checkpoint timeout, continuing");
-                                            }
-                                        }
                                     }
                                 } else {
+                                    // Buffer empty — send queued flush checkpoint if any.
+                                    // This guarantees checkpoint is AFTER all playAudio messages,
+                                    // so Plivo's playedStream confirms actual playout completion.
+                                    if let Some(cp_name) = pf.lock().unwrap().take() {
+                                        *aw.lock().unwrap() = Some(cp_name.clone());
+                                        let cp_msg = send_proto.build_checkpoint(&stream_id_for_loop, &cp_name);
+                                        let _ = wstx.send(Message::Text(cp_msg));
+                                        debug!("Send loop: flush checkpoint '{}' sent (buffer drained)", cp_name);
+                                    }
                                     if ab.is_empty() {
                                         if let Ok(mut d) = pn.0.lock() { *d = true; pn.1.notify_all(); }
                                     }
-                                    tokio::time::sleep(Duration::from_millis(10)).await;
                                 }
                             }
                         });
@@ -531,7 +583,7 @@ async fn handle_ws(
                             audio_buf, bg_audio_buf, extra_headers: headers.clone(), encoding,
                             muted, paused, playout_notify,
                             checkpoint_counter: AtomicU64::new(0), checkpoint_notify: cp_notify,
-                            send_loop_notify,
+                            send_loop_notify, pending_flush, awaiting_checkpoint,
                             recorder: session_recorder,
                             beep_detector: session_beep_detector,
                             cancel: session_cancel,
@@ -543,11 +595,19 @@ async fn handle_ws(
                         session.local_uri = stream_id;
                         session.extra_headers = headers;
                         let _ = etx.try_send(EndpointEvent::IncomingCall { session });
-                        let _ = etx.try_send(EndpointEvent::CallMediaActive { call_id: sid.clone() });
-                        info!("Session {} started (encoding={:?}, checkpoint pacing)", sid, encoding);
+                        // CallMediaActive fired on first audio frame (matches SIP pattern
+                        // where media_active fires when RTP starts, not on INVITE).
+                        // This gives the agent pipeline time to initialize before audio flows.
+                        info!("Session {} started (encoding={:?})", sid, encoding);
                     }
 
                     StreamEvent::Media { payload } => {
+                        // Fire CallMediaActive on first audio frame (matches SIP pattern)
+                        if !media_active_sent {
+                            media_active_sent = true;
+                            let _ = etx.try_send(EndpointEvent::CallMediaActive { call_id: sid.clone() });
+                            debug!("First media frame → CallMediaActive on session {}", sid);
+                        }
                         let pcm = {
                             let native = encoding.decode(&payload);
                             let wire_rate = encoding.sample_rate();
@@ -596,10 +656,21 @@ async fn handle_ws(
                     StreamEvent::CheckpointAck { name } => {
                         debug!("Checkpoint '{}' confirmed on session {}", name, sid);
                         if let Some(sess) = sessions.lock().unwrap().get(sid.as_str()) {
-                            sess.send_loop_notify.notify_one();
-                            let (lock, cvar) = &*sess.checkpoint_notify;
-                            *lock.lock().unwrap() = Some(name);
-                            cvar.notify_all();
+                            // Only accept if this matches the checkpoint we're waiting for.
+                            // Prevents stale confirmations (from cancelled flushes) from
+                            // polluting the condvar for the next flush cycle.
+                            let matches = sess.awaiting_checkpoint.lock().unwrap()
+                                .as_ref()
+                                .map(|expected| *expected == name)
+                                .unwrap_or(false);
+                            if matches {
+                                *sess.awaiting_checkpoint.lock().unwrap() = None;
+                                let (lock, cvar) = &*sess.checkpoint_notify;
+                                *lock.lock().unwrap() = Some(name);
+                                cvar.notify_all();
+                            } else {
+                                debug!("Ignoring stale checkpoint '{}' on session {} (not awaiting)", name, sid);
+                            }
                         }
                     }
 
@@ -618,7 +689,7 @@ async fn handle_ws(
                     StreamEvent::StreamError { reason } => {
                         warn!("Stream error on session {}: {}", sid, reason);
                         if let Some(sess) = sessions.lock().unwrap().remove(&sid) {
-                            sess.cancel.cancel();
+                            cleanup_session(&sid, &sess, &recording_mgr);
                             let session = crate::sip::call::CallSession::new(sid.clone(), crate::sip::call::CallDirection::Inbound);
                             let _ = etx.try_send(EndpointEvent::CallTerminated { session, reason: format!("stream error: {}", reason) });
                         }
@@ -642,7 +713,7 @@ async fn handle_ws(
                     StreamEvent::Stop => {
                         info!("Session {} stopped", sid);
                         if let Some(sess) = sessions.lock().unwrap().remove(&sid) {
-                            sess.cancel.cancel();
+                            cleanup_session(&sid, &sess, &recording_mgr);
                             let session = crate::sip::call::CallSession::new(sid.clone(), crate::sip::call::CallDirection::Inbound);
                             let _ = etx.try_send(EndpointEvent::CallTerminated { session, reason: "stream stopped".into() });
                         }
@@ -655,9 +726,20 @@ async fn handle_ws(
 
     // Cleanup on WS disconnect
     if let Some(sess) = sessions.lock().unwrap().remove(&sid) {
-        sess.cancel.cancel();
+        cleanup_session(&sid, &sess, &recording_mgr);
         let session = crate::sip::call::CallSession::new(sid.clone(), crate::sip::call::CallDirection::Inbound);
         let _ = etx.try_send(EndpointEvent::CallTerminated { session, reason: "ws disconnected".into() });
         info!("Session {} cleaned up (WS disconnected)", sid);
     }
+}
+
+/// Clean up a session — cancel send loop and wake any blocked wait_for_playout.
+fn cleanup_session(session_id: &str, sess: &StreamSession, recording_mgr: &Arc<crate::recorder::RecordingManager>) {
+    sess.cancel.cancel();
+    // Stop recording — wakes encoder thread for immediate finalization
+    recording_mgr.stop(session_id);
+    // Wake blocked wait_for_playout so executor threads don't hang for 30s
+    let (lock, cvar) = &*sess.checkpoint_notify;
+    *lock.lock().unwrap() = Some("_closed".into());
+    cvar.notify_all();
 }

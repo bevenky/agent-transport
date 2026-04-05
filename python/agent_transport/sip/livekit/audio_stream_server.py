@@ -539,11 +539,14 @@ class AudioStreamServer:
     async def _event_loop(self) -> None:
         """Event dispatcher — reads audio stream events and routes them.
 
-        Audio streaming fires incoming_call + call_media_active together
-        on the Plivo 'start' event. We dispatch on incoming_call and
-        consume call_media_active to prevent queue buildup.
+        Matches SIP server pattern: incoming_call stores session info,
+        call_media_active (fired on first audio frame) starts the agent session.
+        This gap lets the system initialize before the agent pipeline starts,
+        avoiding races between FFI init and BackgroundAudioPlayer's decoder.
         """
         loop = asyncio.get_running_loop()
+        # Sessions waiting for first audio frame: {session_id: (call_uuid, stream_id, headers)}
+        pending_sessions: dict[str, tuple[str, str, dict]] = {}
 
         while True:
             try:
@@ -558,18 +561,21 @@ class AudioStreamServer:
 
             if ev_type == "incoming_call":
                 session = ev["session"]
-                session_id = session.session_id  # internal session ID
-                plivo_call_uuid = session.remote_uri  # Plivo Call UUID
+                session_id = session.session_id
+                plivo_call_uuid = session.remote_uri
                 stream_id = session.local_uri if hasattr(session, "local_uri") else ""
                 extra_headers = session.extra_headers if hasattr(session, "extra_headers") else {}
-                logger.info("Audio stream session %s started (plivo_call_uuid=%s, stream_id=%s)", session_id, plivo_call_uuid, stream_id)
-                asyncio.create_task(
-                    self._start_session(session_id, plivo_call_uuid, stream_id, extra_headers)
-                )
+                logger.info("Audio stream session %s connected (plivo_call_uuid=%s, stream_id=%s)", session_id, plivo_call_uuid, stream_id)
+                pending_sessions[session_id] = (plivo_call_uuid, stream_id, extra_headers)
 
             elif ev_type == "call_media_active":
-                # Consumed — audio stream fires this together with incoming_call
-                pass
+                session_id = ev["session_id"]
+                if session_id in pending_sessions:
+                    plivo_call_uuid, stream_id, extra_headers = pending_sessions.pop(session_id)
+                    logger.info("Audio stream session %s media active, starting agent", session_id)
+                    asyncio.create_task(
+                        self._start_session(session_id, plivo_call_uuid, stream_id, extra_headers)
+                    )
 
             elif ev_type == "call_terminated":
                 session_id = ev["session"].session_id

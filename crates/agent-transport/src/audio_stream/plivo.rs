@@ -174,17 +174,8 @@ impl StreamProtocol for PlivoProtocol {
         })).unwrap_or_else(|e| { warn!("JSON serialize error: {}", e); String::new() })
     }
 
-    fn build_mute_stream(&self, stream_id: &str) -> Option<String> {
-        Some(serde_json::to_string(&serde_json::json!({
-            "event": "muteStream", "streamId": stream_id
-        })).unwrap_or_default())
-    }
-
-    fn build_unmute_stream(&self, stream_id: &str) -> Option<String> {
-        Some(serde_json::to_string(&serde_json::json!({
-            "event": "unmuteStream", "streamId": stream_id
-        })).unwrap_or_default())
-    }
+    // Plivo does not support muteStream/unmuteStream.
+    // Pause uses clearAudio instead (handled in endpoint.rs).
 
     fn hangup(&self, call_id: &str, rt: &tokio::runtime::Runtime) {
         if self.auth_id.is_empty() { return; }
