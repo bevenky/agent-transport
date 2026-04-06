@@ -110,30 +110,21 @@ Full examples: [`audio_stream_agent.py`](examples/pipecat/audio_stream_agent.py)
 
 ## Installation
 
+### For LiveKit Agents
+
 ```bash
-pip install agent-transport                     # Core only (Rust bindings)
-pip install agent-transport[livekit]            # + LiveKit adapter
-pip install agent-transport[pipecat]            # + Pipecat adapter
-pip install agent-transport[all]                # Both adapters
+pip install agent-transport[livekit]
+```
+
+### For Pipecat
+
+```bash
+pip install agent-transport[pipecat]
 ```
 
 Minimum versions: `livekit-agents>=1.5`, `pipecat-ai>=0.0.108`
 
-### Building from Source
-
-Requires Rust, a C compiler, and CMake.
-
-```bash
-# Rust core
-cargo build                                     # Core library (SIP transport)
-cargo build --features audio-stream             # + Plivo audio streaming
-cargo build --features audio-processing         # + jitter buffer, PLC, comfort noise
-
-# Python binding
-cd crates/agent-transport-python && pip install -e .
-```
-
-> **CMake 4.x:** If you see `Compatibility with CMake < 3.5 has been removed`, set `CMAKE_POLICY_VERSION_MINIMUM=3.5` in your environment.
+<sub>[Building from source](docs/compile.md)</sub>
 
 ## Examples
 
