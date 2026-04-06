@@ -124,7 +124,7 @@ pip install agent-transport[pipecat]
 
 Minimum versions: `livekit-agents>=1.5`, `pipecat-ai>=0.0.108`
 
-<sub>[Building from source](docs/compile.md)</sub>
+[Building from source](docs/compile.md)
 
 ## Examples
 
