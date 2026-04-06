@@ -96,7 +96,8 @@ jobs:
         run: |
           npm install
           npm run build
-          cp -r dist ../../crates/agent-transport-node/livekit
+          mkdir -p ../../crates/agent-transport-node/livekit
+          cp -r dist/* ../../crates/agent-transport-node/livekit/
 
       - name: Copy root README into package
         run: cp README.md crates/agent-transport-node/README.md

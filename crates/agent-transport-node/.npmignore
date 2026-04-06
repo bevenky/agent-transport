@@ -1,0 +1,4 @@
+# Override .gitignore for npm: include livekit/ in published package
+src/
+Cargo.toml
+build.rs
