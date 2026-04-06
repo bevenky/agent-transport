@@ -113,13 +113,13 @@ Full examples: [`audio_stream_agent.py`](examples/pipecat/audio_stream_agent.py)
 ### For LiveKit Agents
 
 ```bash
-pip install agent-transport[livekit]
+pip install "agent-transport[livekit]"
 ```
 
 ### For Pipecat
 
 ```bash
-pip install agent-transport[pipecat]
+pip install "agent-transport[pipecat]"
 ```
 
 Minimum versions: `livekit-agents>=1.5`, `pipecat-ai>=0.0.108`
