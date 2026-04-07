@@ -4,15 +4,23 @@ build-backend = "maturin"
 
 [project]
 name = "agent-transport"
-version = "0.1.5"
+version = "0.1.7"
 description = "SIP and audio streaming transport for AI voice agents (pure Rust)"
 readme = "../../README.md"
 requires-python = ">=3.10"
 license = "MIT"
 
 [project.optional-dependencies]
-livekit = ["aiohttp", "livekit-agents>=1.5"]
-pipecat = ["pipecat-ai>=0.0.108"]
+livekit = [
+    "aiohttp",
+    "python-dotenv",
+    "livekit-agents>=1.5",
+    "livekit-plugins-deepgram",
+    "livekit-plugins-openai",
+    "livekit-plugins-silero",
+    "livekit-plugins-turn-detector",
+]
+pipecat = ["python-dotenv", "pipecat-ai>=0.0.108"]
 all = ["agent-transport[livekit,pipecat]"]
 
 [tool.maturin]
