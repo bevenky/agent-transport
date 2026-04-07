@@ -38,22 +38,22 @@ pub(crate) fn build_offer(local_ip: IpAddr, rtp_port: u16, codecs: &[Codec]) -> 
     sdp
 }
 
-/// Build an SDP answer that mirrors the remote offer's attributes.
-/// Echoes `a=rtcp-mux` when the parsed offer contained it (#20).
-pub(crate) fn build_answer(local_ip: IpAddr, rtp_port: u16, codecs: &[Codec], remote: &SdpAnswer) -> String {
+/// Build an SDP answer using negotiated values from the remote offer.
+/// Only includes the single agreed codec, the remote's DTMF payload type,
+/// the remote's ptime, and echoes rtcp-mux if offered.
+pub(crate) fn build_answer(local_ip: IpAddr, rtp_port: u16, negotiated: &SdpAnswer) -> String {
     let sid = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
-    let pts: Vec<String> = codecs.iter().map(|c| c.payload_type().to_string())
-        .chain(std::iter::once(DEFAULT_DTMF_PT.to_string())).collect();
+    let codec = negotiated.codec;
+    let dtmf_pt = negotiated.dtmf_payload_type.unwrap_or(DEFAULT_DTMF_PT);
 
     let mut sdp = format!(
-        "v=0\r\no=- {} 1 IN IP4 {}\r\ns=-\r\nc=IN IP4 {}\r\nt=0 0\r\nm=audio {} RTP/AVP {}\r\n",
-        sid, local_ip, local_ip, rtp_port, pts.join(" "),
+        "v=0\r\no=- {} 1 IN IP4 {}\r\ns=-\r\nc=IN IP4 {}\r\nt=0 0\r\nm=audio {} RTP/AVP {} {}\r\n",
+        sid, local_ip, local_ip, rtp_port, codec.payload_type(), dtmf_pt,
     );
-    for c in codecs {
-        sdp.push_str(&format!("a=rtpmap:{} {}\r\n", c.payload_type(), c.rtpmap_line()));
-    }
-    sdp.push_str(&format!("a=rtpmap:{} telephone-event/8000\r\na=fmtp:{} 0-15\r\na=ptime:20\r\na=sendrecv\r\n", DEFAULT_DTMF_PT, DEFAULT_DTMF_PT));
-    if remote.rtcp_mux {
+    sdp.push_str(&format!("a=rtpmap:{} {}\r\n", codec.payload_type(), codec.rtpmap_line()));
+    sdp.push_str(&format!("a=rtpmap:{} telephone-event/8000\r\na=fmtp:{} 0-15\r\n", dtmf_pt, dtmf_pt));
+    sdp.push_str(&format!("a=ptime:{}\r\na=sendrecv\r\n", negotiated.ptime_ms));
+    if negotiated.rtcp_mux {
         sdp.push_str("a=rtcp-mux\r\n");
         sdp.push_str(&format!("a=rtcp:{} IN IP4 {}\r\n", rtp_port, local_ip));
     }
@@ -241,25 +241,42 @@ mod tests {
     }
 
     #[test]
-    fn test_build_answer_echoes_rtcp_mux() {
-        let remote = SdpAnswer {
+    fn test_build_answer_negotiated_values() {
+        let negotiated = SdpAnswer {
             remote_ip: IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)),
             remote_port: 5000, codec: Codec::PCMU, payload_type: 0,
-            dtmf_payload_type: Some(101), ptime_ms: 20, rtcp_mux: true,
+            dtmf_payload_type: Some(96), ptime_ms: 30, rtcp_mux: true,
         };
-        let sdp = build_answer(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 6000, &[Codec::PCMU], &remote);
-        assert!(sdp.contains("a=rtcp-mux\r\n"), "answer must include rtcp-mux when offered: {}", sdp);
-        assert!(sdp.contains("a=rtcp:6000 IN IP4 10.0.0.1\r\n"), "answer must include rtcp attribute: {}", sdp);
+        let sdp = build_answer(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 6000, &negotiated);
+        // Single negotiated codec (not all codecs)
+        assert!(sdp.contains("m=audio 6000 RTP/AVP 0 96\r\n"), "m= line should have negotiated codec + dtmf pt: {}", sdp);
+        assert!(sdp.contains("a=rtpmap:0 PCMU/8000\r\n"), "should have single codec rtpmap: {}", sdp);
+        assert!(!sdp.contains("PCMA"), "should not include non-negotiated codecs: {}", sdp);
+        // Remote's DTMF payload type (not hardcoded 101)
+        assert!(sdp.contains("a=rtpmap:96 telephone-event/8000\r\n"), "should use remote's dtmf pt: {}", sdp);
+        assert!(sdp.contains("a=fmtp:96 0-15\r\n"), "fmtp should use remote's dtmf pt: {}", sdp);
+        // Remote's ptime (not hardcoded 20)
+        assert!(sdp.contains("a=ptime:30\r\n"), "should use remote's ptime: {}", sdp);
+        // rtcp-mux echoed
+        assert!(sdp.contains("a=rtcp-mux\r\n"), "should echo rtcp-mux: {}", sdp);
+        assert!(sdp.contains("a=rtcp:6000 IN IP4 10.0.0.1\r\n"), "should include rtcp attribute: {}", sdp);
     }
 
     #[test]
-    fn test_build_answer_omits_rtcp_mux_when_not_offered() {
-        let remote = SdpAnswer {
+    fn test_build_answer_no_rtcp_mux_default_dtmf() {
+        let negotiated = SdpAnswer {
             remote_ip: IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)),
-            remote_port: 5000, codec: Codec::PCMU, payload_type: 0,
-            dtmf_payload_type: Some(101), ptime_ms: 20, rtcp_mux: false,
+            remote_port: 5000, codec: Codec::PCMA, payload_type: 8,
+            dtmf_payload_type: None, ptime_ms: 20, rtcp_mux: false,
         };
-        let sdp = build_answer(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 6000, &[Codec::PCMU], &remote);
-        assert!(!sdp.contains("rtcp-mux"), "answer must not include rtcp-mux when not offered: {}", sdp);
+        let sdp = build_answer(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 6000, &negotiated);
+        // PCMA codec
+        assert!(sdp.contains("m=audio 6000 RTP/AVP 8 101\r\n"), "m= line should have PCMA + default dtmf: {}", sdp);
+        assert!(sdp.contains("a=rtpmap:8 PCMA/8000\r\n"), "should have PCMA rtpmap: {}", sdp);
+        // Default DTMF PT when remote didn't specify
+        assert!(sdp.contains("a=rtpmap:101 telephone-event/8000\r\n"), "should use default dtmf pt: {}", sdp);
+        // No rtcp-mux
+        assert!(!sdp.contains("rtcp-mux"), "should not include rtcp-mux when not offered: {}", sdp);
+        assert!(sdp.contains("a=ptime:20\r\n"), "should use ptime 20: {}", sdp);
     }
 }
