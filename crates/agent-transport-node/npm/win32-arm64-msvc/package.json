@@ -1,6 +1,6 @@
 {
   "name": "agent-transport-win32-arm64-msvc",
-  "version": "0.1.6",
+  "version": "0.1.7",
   "cpu": [
     "arm64"
   ],
