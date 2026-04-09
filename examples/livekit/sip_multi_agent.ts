@@ -7,8 +7,9 @@
  * - SupportAgent: handles support issues with tool calling
  *
  * Usage:
- *   npx ts-node examples/livekit/sip_multi_agent.ts start
- *   npx ts-node examples/livekit/sip_multi_agent.ts dev
+ *   cd examples/livekit && npm install
+ *   npx tsx sip_multi_agent.ts start
+ *   npx tsx sip_multi_agent.ts dev
  */
 
 import { AgentServer, JobProcess, type JobContext } from 'agent-transport/livekit';

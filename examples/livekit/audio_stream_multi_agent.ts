@@ -10,8 +10,9 @@
  * - SupportAgent: handles support issues with tool calling
  *
  * Usage:
- *   npx ts-node examples/livekit/audio_stream_multi_agent.ts start
- *   npx ts-node examples/livekit/audio_stream_multi_agent.ts dev
+ *   cd examples/livekit && npm install
+ *   npx tsx audio_stream_multi_agent.ts start
+ *   npx tsx audio_stream_multi_agent.ts dev
  */
 
 import { AudioStreamServer, JobProcess, type AudioStreamJobContext } from 'agent-transport/livekit';

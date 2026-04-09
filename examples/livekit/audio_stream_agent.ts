@@ -14,7 +14,8 @@
  *   </Response>
  *
  * Usage:
- *   npx ts-node examples/livekit/audio_stream_agent.ts
+ *   cd examples/livekit && npm install
+ *   npx tsx audio_stream_agent.ts
  */
 
 import { AudioStreamServer, JobProcess, type AudioStreamJobContext } from 'agent-transport/livekit';
