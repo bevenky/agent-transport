@@ -2,9 +2,10 @@
  * SIP voice agent with tool calling — handles inbound and outbound calls.
  *
  * Usage:
- *   npx ts-node examples/livekit/sip_agent.ts start     # production
- *   npx ts-node examples/livekit/sip_agent.ts dev       # dev mode
- *   npx ts-node examples/livekit/sip_agent.ts debug     # full debug
+ *   cd examples/livekit && npm install
+ *   npx tsx sip_agent.ts start     # production
+ *   npx tsx sip_agent.ts dev       # dev mode
+ *   npx tsx sip_agent.ts debug     # full debug
  */
 
 import { AgentServer, JobProcess, type JobContext } from 'agent-transport/livekit';
