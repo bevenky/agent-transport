@@ -19,7 +19,7 @@ def _make_sip_input():
     """Construct SipInputTransport without running its full __init__."""
     t = SipInputTransport.__new__(SipInputTransport)
     t._cid = "call-test"
-    t._running = True
+    t._started = True
     t._event_queue = asyncio.Queue()
     t._ep = None
     t._transport = None
@@ -29,7 +29,7 @@ def _make_sip_input():
 def _make_audio_stream_input():
     t = AudioStreamInputTransport.__new__(AudioStreamInputTransport)
     t._sid = "session-test"
-    t._running = True
+    t._started = True
     t._event_queue = asyncio.Queue()
     t._ep = None
     t._transport = None
@@ -62,7 +62,7 @@ async def test_sip_event_loop_survives_handler_exception():
         if len(handled) >= 3:
             break
 
-    t._running = False
+    t._started = False
     await asyncio.wait_for(loop_task, timeout=2.0)
 
     assert "good1" in handled
@@ -94,7 +94,7 @@ async def test_audio_stream_event_loop_survives_handler_exception():
         if len(handled) >= 4:
             break
 
-    t._running = False
+    t._started = False
     await asyncio.wait_for(loop_task, timeout=2.0)
 
     assert handled == ["a", "boom", "b", "c"], f"got {handled}"
@@ -102,7 +102,7 @@ async def test_audio_stream_event_loop_survives_handler_exception():
 
 @pytest.mark.asyncio
 async def test_sip_event_loop_stops_on_running_false():
-    """Loop exits cleanly when _running is set to False."""
+    """Loop exits cleanly when _started is set to False."""
     t = _make_sip_input()
 
     async def _handle(event):
@@ -111,5 +111,5 @@ async def test_sip_event_loop_stops_on_running_false():
     t._handle_event = _handle
     loop_task = asyncio.create_task(t._event_loop_from_queue())
     await asyncio.sleep(0.05)
-    t._running = False
+    t._started = False
     await asyncio.wait_for(loop_task, timeout=2.0)
