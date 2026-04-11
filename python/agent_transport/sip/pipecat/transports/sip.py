@@ -154,6 +154,10 @@ class SipServerTransport:
         self._session_start_times: Dict[str, float] = {}
         # Per-session event queues — server dispatches events to the right session
         self._session_event_queues: Dict[str, asyncio.Queue] = {}
+        # Strong-reference set for fire-and-forget asyncio tasks. Python's
+        # event loop only holds weak references to tasks; without storing
+        # them here, the GC can collect a task mid-execution.
+        self._background_tasks: set[asyncio.Task] = set()
 
     @property
     def endpoint(self) -> Optional[SipEndpoint]:
@@ -501,7 +505,9 @@ class SipServerTransport:
                 except Exception as e:
                     logger.warning("Outbound call {} to {} failed: {}", session_id, dest, e)
 
-            asyncio.create_task(_dial())
+            t = asyncio.create_task(_dial())
+            self._background_tasks.add(t)
+            t.add_done_callback(self._background_tasks.discard)
             return web.json_response({
                 "session_id": session_id, "status": "dialing",
                 "to": raw_to, "from": raw_from,
