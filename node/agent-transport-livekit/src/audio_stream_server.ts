@@ -280,9 +280,9 @@ export class AudioStreamServer {
   // ─── Event loop ─────────────────────────────────────────────────────
 
   private async eventLoop(): Promise<void> {
-    // Matches SIP server pattern: incoming_call stores metadata,
-    // call_media_active (fired on first audio frame) starts the agent session.
-    const pendingSessions = new Map<string, { callUuid: string; streamId: string; headers: Record<string, string> }>();
+    // With the post-answer event refactor, Plivo's WebSocket `start` maps
+    // directly to `call_answered` — the session is created immediately.
+    // No pending map, no wait-for-first-media gate.
 
     while (!this.shutdownRequested) {
       const ev = await this.waitForEvent(1000);
@@ -293,25 +293,24 @@ export class AudioStreamServer {
         break;
       }
 
-      if (ev.eventType === 'incoming_call' && ev.session) {
-        const sessionId = ev.session.sessionId;
-        const plivoCallUuid = ev.session.remoteUri;
-        const streamId = ev.session.localUri ?? '';
-        const extraHeaders = ev.session.extraHeaders ?? {};
-        console.log(`Audio stream session ${sessionId} connected (plivo_call_uuid=${plivoCallUuid})`);
-        pendingSessions.set(sessionId, { callUuid: plivoCallUuid, streamId, headers: extraHeaders });
-
-      } else if (ev.eventType === 'call_media_active') {
-        const sessionId = ev.sessionId;
-        const pending = pendingSessions.get(sessionId);
-        if (pending) {
-          pendingSessions.delete(sessionId);
-          console.log(`Audio stream session ${sessionId} media active, starting agent`);
-          this.startSession(sessionId, pending.callUuid, pending.streamId, pending.headers).catch((err) => {
-            console.error(`Session ${sessionId} startup failed:`, err);
-            try { this.ep!.hangup(sessionId); } catch {}
-          });
+      if (ev.eventType === 'call_answered' && ev.session) {
+        // Plivo WebSocket start → Rust fired CallAnswered → create agent.
+        const session = ev.session;
+        const sessionId = session.sessionId;
+        const plivoCallUuid = session.remoteUri;
+        const streamId = session.localUri ?? '';
+        const extraHeaders = session.extraHeaders ?? {};
+        if (this.activeSessions.has(sessionId)) {
+          // Defensive: duplicate event or retry.
+          continue;
         }
+        console.log(
+          `Audio stream session ${sessionId} connected (plivo_call_uuid=${plivoCallUuid}, stream_id=${streamId})`,
+        );
+        this.startSession(sessionId, plivoCallUuid, streamId, extraHeaders).catch((err) => {
+          console.error(`Session ${sessionId} startup failed:`, err);
+          try { this.ep!.hangup(sessionId); } catch {}
+        });
 
       } else if (ev.eventType === 'call_terminated' && ev.session) {
         const sessionId = ev.session.sessionId;

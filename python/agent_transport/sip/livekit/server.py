@@ -319,8 +319,16 @@ class AgentServer:
         # the GC can collect a task mid-execution and emit
         # "Task was destroyed but it is pending!" warnings.
         self._background_tasks: set[asyncio.Task] = set()
-        # _pending_outbound removed — outbound calls start session directly after ep.call()
+        # Outbound sessions whose `_start_call` task has been scheduled but
+        # may not yet be visible in `_active_calls`. The `call_answered`
+        # event handler checks this set to avoid racing against an outbound
+        # session that `_start_call` will create asynchronously.
+        self._outbound_session_ids: set[str] = set()
         self._load_monitor = _LoadMonitor()
+        # Server-level event listeners (distinct from per-JobContext events
+        # which only exist after session creation). Used for pre-answer
+        # hooks like `ringing` that fire before the JobContext exists.
+        self._server_listeners: dict[str, list[Callable]] = {}
 
     @property
     def setup_fnc(self):
@@ -353,6 +361,56 @@ class AgentServer:
             self._entrypoint_fnc = fn
             return fn
         return decorator
+
+    def on(self, event_name: str, callback: Callable | None = None) -> Callable:
+        """Register a server-level event listener.
+
+        Server events fire before a per-call :class:`JobContext` exists, so
+        they can't be attached to ``ctx``. Use these for pre-answer hooks
+        like call screening, logging, and metrics.
+
+        Available events:
+
+        - ``"ringing"`` — fires on inbound SIP calls immediately after Rust
+          has sent ``180 Ringing``. Handler receives a ``CallSession`` with
+          ``session_id``, ``remote_uri``, ``call_uuid``, and
+          ``extra_headers``. Rust auto-answers right after this event, so
+          the hook is currently observational only — return values are
+          ignored. Future enhancement: allow handlers to return
+          ``False``/raise to reject the call before auto-answer runs.
+
+        Handlers may be ``async def`` or plain functions. Async handlers
+        are scheduled as background tasks.
+
+        Usage::
+
+            @server.on("ringing")
+            def on_ringing(session):
+                logger.info("Incoming call from %s", session.remote_uri)
+
+            @server.on("ringing")
+            async def log_to_db(session):
+                await db.insert_call_record(session.call_uuid)
+        """
+        def decorator(fn: Callable) -> Callable:
+            self._server_listeners.setdefault(event_name, []).append(fn)
+            return fn
+        if callback is not None:
+            return decorator(callback)
+        return decorator
+
+    def _emit_server_event(self, event_name: str, *args, **kwargs) -> None:
+        """Fire a server-level event to all registered listeners."""
+        listeners = self._server_listeners.get(event_name, [])
+        for listener in listeners:
+            try:
+                result = listener(*args, **kwargs)
+                if asyncio.iscoroutine(result):
+                    task = asyncio.create_task(result)
+                    self._background_tasks.add(task)
+                    task.add_done_callback(self._background_tasks.discard)
+            except Exception:
+                logger.exception("Server event listener for %r failed", event_name)
 
     def run(self, port: int | None = None) -> None:
         """Build CLI and run — equivalent of cli.run_app(server)."""
@@ -626,6 +684,9 @@ class AgentServer:
                 return web.json_response({"error": str(e)}, status=500)
 
             logger.info("Outbound call %s to %s connected (from=%s)", session_id, destination, from_uri or "default")
+            # Mark synchronously so the event loop doesn't race-create a
+            # duplicate session when `call_answered` arrives.
+            self._outbound_session_ids.add(session_id)
             t = asyncio.create_task(self._start_call(session_id, destination, direction="outbound"))
             self._background_tasks.add(t)
             t.add_done_callback(self._background_tasks.discard)
@@ -636,6 +697,9 @@ class AgentServer:
         else:
             # Non-blocking (default): generate session_id upfront, dial in background
             session_id = "c" + uuid.uuid4().hex[:16]
+            # Reserve the session id up-front so call_answered knows it's
+            # an outbound call we're driving.
+            self._outbound_session_ids.add(session_id)
 
             async def _dial():
                 try:
@@ -646,6 +710,7 @@ class AgentServer:
                     await self._start_call(returned_id, destination, direction="outbound")
                 except Exception as e:
                     logger.warning("Outbound call %s to %s failed: %s", session_id, destination, e)
+                    self._outbound_session_ids.discard(session_id)
 
             t = asyncio.create_task(_dial())
             self._background_tasks.add(t)
@@ -661,8 +726,6 @@ class AgentServer:
         Avoids multiple consumers racing on wait_for_event.
         """
         loop = asyncio.get_running_loop()
-        # Inbound calls waiting for call_media_active: {session_id: remote_uri}
-        pending_inbound: dict[str, str] = {}
 
         while True:
             try:
@@ -684,27 +747,42 @@ class AgentServer:
                     logger.debug("sip event loop received shutdown sentinel")
                     break
 
-                if ev_type == "incoming_call":
-                    session_id = ev["session"].session_id
-                    remote_uri = ev["session"].remote_uri
-                    logger.info("Incoming call %s from %s", session_id, remote_uri)
-                    try:
-                        await loop.run_in_executor(None, self._ep.answer, session_id)
-                    except Exception as e:
-                        logger.warning("Failed to answer call %s: %s", session_id, e)
+                if ev_type == "call_ringing":
+                    # Pre-answer hook. Rust has sent 180 Ringing and will
+                    # auto-answer immediately after this event. We don't
+                    # create the session yet — that happens on call_answered.
+                    # This is purely observational: fire server-level
+                    # "ringing" listeners for logging / screening.
+                    session = ev["session"]
+                    logger.info(
+                        "Incoming call %s ringing (from=%s, call_uuid=%s)",
+                        session.session_id, session.remote_uri, session.call_uuid,
+                    )
+                    self._emit_server_event("ringing", session)
+
+                elif ev_type == "call_answered":
+                    # Call is answered and media is active — safe to create
+                    # the agent session. Fires for both inbound and outbound.
+                    # Outbound sessions are reserved synchronously by the
+                    # HTTP outbound path (via _outbound_session_ids), so we
+                    # skip the event for them.
+                    session = ev["session"]
+                    session_id = session.session_id
+                    if session_id in self._outbound_session_ids:
+                        # Outbound path owns session creation. Clear the
+                        # marker so a hypothetical session_id reuse after
+                        # this call ends doesn't keep matching.
+                        self._outbound_session_ids.discard(session_id)
                         continue
-                    pending_inbound[session_id] = remote_uri
-
-                elif ev_type == "call_media_active":
-                    session_id = ev["session_id"]
-
-                    if session_id in pending_inbound:
-                        remote_uri = pending_inbound.pop(session_id)
-                        t = asyncio.create_task(
-                            self._start_call(session_id, remote_uri, direction="inbound")
-                        )
-                        self._background_tasks.add(t)
-                        t.add_done_callback(self._background_tasks.discard)
+                    if session_id in self._active_calls:
+                        # Defensive: session already being driven (e.g.,
+                        # duplicate event, retry). Ignore.
+                        continue
+                    t = asyncio.create_task(
+                        self._start_call(session_id, session.remote_uri, direction="inbound")
+                    )
+                    self._background_tasks.add(t)
+                    t.add_done_callback(self._background_tasks.discard)
 
                 elif ev_type == "call_terminated":
                     session_id = ev["session"].session_id
@@ -725,9 +803,6 @@ class AgentServer:
                         remote = ctx._room._remote
                         remote.disconnect_reason = 1  # CLIENT_INITIATED
                         ctx._room.emit("participant_disconnected", remote)
-
-                    # Clean up pending inbound if call died before media
-                    pending_inbound.pop(session_id, None)
 
                     # Signal active call to end
                     if session_id in self._call_ended_events:

@@ -103,6 +103,13 @@ export class AgentServer {
   private httpServer?: Server;
   private loadMonitor = new LoadMonitor();
   private inferenceExecutor: any = null;
+  // Server-level event listeners. Used for pre-answer hooks like "ringing"
+  // that fire before the per-call JobContext exists.
+  private serverListeners = new Map<string, Array<(...args: any[]) => void | Promise<void>>>();
+  // Outbound session ids reserved synchronously by the /outbound_call HTTP
+  // handler. The event loop checks this set so `call_answered` events for
+  // outbound sessions don't race-create a duplicate agent session.
+  private outboundSessionIds = new Set<string>();
   // Cooperative shutdown flag for the SIP event loop. The loop polls this
   // each iteration and breaks when set, so the run() promise can await the
   // loop's exit before tearing down the endpoint. Without this, the loop
@@ -140,6 +147,51 @@ export class AgentServer {
    */
   set setupFnc(fn: (proc: JobProcess) => void | Record<string, unknown> | Promise<void | Record<string, unknown>>) {
     this.setupFn = fn as any;
+  }
+
+  /**
+   * Register a server-level event listener.
+   *
+   * Server events fire before a per-call JobContext exists, so they can't
+   * be attached to `ctx`. Use these for pre-answer hooks like call
+   * screening, logging, and metrics.
+   *
+   * Available events:
+   *   - `"ringing"` — fires on inbound SIP calls immediately after Rust
+   *     has sent 180 Ringing. Handler receives a CallSession with
+   *     sessionId, remoteUri, callUuid, extraHeaders. Rust auto-answers
+   *     right after this event, so the hook is currently observational
+   *     only. Return values / thrown errors are ignored.
+   *
+   * Handlers may be synchronous or async.
+   *
+   * ```ts
+   * server.on('ringing', (session) => {
+   *   console.log(`Incoming call from ${session.remoteUri}`);
+   * });
+   * ```
+   */
+  on(eventName: string, callback: (...args: any[]) => void | Promise<void>): void {
+    const arr = this.serverListeners.get(eventName) ?? [];
+    arr.push(callback);
+    this.serverListeners.set(eventName, arr);
+  }
+
+  private emitServerEvent(eventName: string, ...args: any[]): void {
+    const listeners = this.serverListeners.get(eventName);
+    if (!listeners) return;
+    for (const listener of listeners) {
+      try {
+        const result = listener(...args);
+        if (result && typeof (result as any).catch === 'function') {
+          (result as Promise<void>).catch((err) =>
+            console.error(`[agent-server] server event listener for ${eventName} failed:`, err)
+          );
+        }
+      } catch (err) {
+        console.error(`[agent-server] server event listener for ${eventName} failed:`, err);
+      }
+    }
   }
 
   /**
@@ -332,9 +384,6 @@ export class AgentServer {
 
   // ─── Event dispatcher (single reader, no race conditions) ──────
 
-  private pendingInbound = new Map<string, string>(); // sessionId → remoteUri
-  // pendingOutbound removed — outbound calls start session directly after ep.call()
-
   private async sipEventLoop(): Promise<void> {
     while (!this.shutdownRequested) {
       const ev = await this.waitForEvent(1000);
@@ -346,24 +395,35 @@ export class AgentServer {
         break;
       }
 
-      if (ev.eventType === 'incoming_call' && ev.session) {
-        const sessionId = ev.session.sessionId;
-        const remoteUri = ev.session.remoteUri;
-        console.log(`Incoming call ${sessionId} from ${remoteUri}`);
-        this.ep!.answer(sessionId);
-        this.pendingInbound.set(sessionId, remoteUri);
+      if (ev.eventType === 'call_ringing' && ev.session) {
+        // Pre-answer observational event. Rust is about to auto-answer.
+        // Fire server-level `ringing` listeners so user code can log /
+        // screen the call before media starts flowing.
+        const session = ev.session;
+        console.log(
+          `Incoming call ${session.sessionId} ringing (from=${session.remoteUri})`,
+        );
+        this.emitServerEvent('ringing', session);
 
-      } else if (ev.eventType === 'call_media_active' && ev.sessionId !== undefined) {
-        const sessionId = ev.sessionId;
-
-        if (this.pendingInbound.has(sessionId)) {
-          const remoteUri = this.pendingInbound.get(sessionId)!;
-          this.pendingInbound.delete(sessionId);
-          this.startCall(sessionId, remoteUri, 'inbound').catch((err) => {
-            console.error(`Inbound call ${sessionId} failed:`, err);
-            try { this.ep!.hangup(sessionId); } catch {}
-          });
+      } else if (ev.eventType === 'call_answered' && ev.session) {
+        // Call is answered and media is active — create the agent session.
+        // Outbound sessions are owned by the /outbound_call HTTP handler,
+        // which reserves the session id synchronously so we can skip the
+        // event here.
+        const session = ev.session;
+        const sessionId = session.sessionId;
+        if (this.outboundSessionIds.has(sessionId)) {
+          this.outboundSessionIds.delete(sessionId);
+          continue;
         }
+        if (this.activeCalls.has(sessionId)) {
+          // Defensive: duplicate event or retry.
+          continue;
+        }
+        this.startCall(sessionId, session.remoteUri, 'inbound').catch((err) => {
+          console.error(`Inbound call ${sessionId} failed:`, err);
+          try { this.ep!.hangup(sessionId); } catch {}
+        });
 
       } else if (ev.eventType === 'call_terminated' && ev.session) {
         const sessionId = ev.session.sessionId;
@@ -377,8 +437,8 @@ export class AgentServer {
           active.room.emitParticipantDisconnected();
         }
 
-        // Clean up pending
-        this.pendingInbound.delete(sessionId);
+        // Clean up outbound marker in case the call failed before answer
+        this.outboundSessionIds.delete(sessionId);
 
         // Signal active call to end
         if (active) {
@@ -599,12 +659,17 @@ export class AgentServer {
               // Blocking mode: wait for call to connect
               const sessionId = this.ep!.call(destination, fromUri, headers);
               console.log(`Outbound call ${sessionId} to ${destination} connected (from=${fromUri ?? 'default'})`);
+              // Reserve the id synchronously so the event loop doesn't
+              // race-create a duplicate session when `call_answered` arrives.
+              this.outboundSessionIds.add(sessionId);
               this.startCall(sessionId, destination, 'outbound');
               res.writeHead(200, { 'Content-Type': 'application/json' });
               res.end(JSON.stringify({ session_id: sessionId, status: 'connected', to: rawTo, from: rawFrom }));
             } else {
               // Non-blocking (default): generate session_id upfront, dial in background
               const sessionId = 'c' + crypto.randomUUID().replace(/-/g, '').slice(0, 16);
+              // Reserve up front so event loop recognizes this as outbound.
+              this.outboundSessionIds.add(sessionId);
               res.writeHead(200, { 'Content-Type': 'application/json' });
               res.end(JSON.stringify({ session_id: sessionId, status: 'dialing', to: rawTo, from: rawFrom }));
 
@@ -615,6 +680,7 @@ export class AgentServer {
                   this.startCall(returnedId, destination, 'outbound');
                 } catch (err) {
                   console.warn('Outbound call %s to %s failed:', sessionId, destination, err);
+                  this.outboundSessionIds.delete(sessionId);
                 }
               });
             }
