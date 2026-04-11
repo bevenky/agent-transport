@@ -314,7 +314,11 @@ impl TransportLayerInner {
     pub(super) fn add_connection(&self, connection: SipConnection) {
         match self.connections.write() {
             Ok(mut connections) => {
-                connections.insert(connection.get_addr().to_owned(), connection.clone());
+                // Normalize the cache key so a later lookup that arrives
+                // with a port-less SipAddr (e.g. from a Record-Route URI)
+                // still finds this connection.
+                let key = connection.get_addr().with_default_port();
+                connections.insert(key, connection.clone());
                 self.serve_connection(connection);
             }
             Err(e) => {
@@ -355,10 +359,18 @@ impl TransportLayerInner {
             target
         };
 
+        // Normalize the target so that a Record-Route URI without an
+        // explicit port (e.g. `sip:52.9.254.123;transport=tcp`) compares
+        // equal to the connection we already have for `52.9.254.123:5060`.
+        // Otherwise the cache lookup misses and a second TCP connection is
+        // opened to the same peer for the duration of the dialog.
+        let normalized_target = target.with_default_port();
+        let target = &normalized_target;
+
         debug!(?key, src = %destination, %target, "lookup target");
         match self.connections.read() {
             Ok(connections) => {
-                if let Some(transport) = connections.get(&target) {
+                if let Some(transport) = connections.get(target) {
                     return Ok((transport.clone(), target.clone()));
                 }
             }

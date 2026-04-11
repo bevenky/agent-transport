@@ -108,6 +108,43 @@ impl SipAddr {
             }
         }
     }
+
+    /// The RFC 3261 default port for this transport.
+    ///
+    /// Used to normalize SipAddr instances so that `sip:proxy.example`
+    /// (no explicit port) and `sip:proxy.example:5060` compare equal for
+    /// connection-cache lookups.
+    pub fn default_port(transport: Option<rsip::transport::Transport>) -> u16 {
+        use rsip::transport::Transport;
+        match transport {
+            Some(Transport::Tls) | Some(Transport::TlsSctp) => 5061,
+            Some(Transport::Ws) => 80,
+            Some(Transport::Wss) => 443,
+            // UDP/TCP/SCTP and unknown default to 5060.
+            _ => 5060,
+        }
+    }
+
+    /// Return a copy with the port filled in from the transport default
+    /// when missing. Leaves the SipAddr unchanged if a port is already set.
+    ///
+    /// This exists specifically so the transport layer's connection cache
+    /// treats `sip:52.9.254.123;transport=tcp` and
+    /// `sip:52.9.254.123:5060;transport=tcp` as the same entry — otherwise
+    /// a Record-Route URI with no port opens a duplicate TCP connection.
+    pub fn with_default_port(&self) -> Self {
+        if self.addr.port.is_some() {
+            return self.clone();
+        }
+        let port = Self::default_port(self.r#type);
+        SipAddr {
+            r#type: self.r#type,
+            addr: HostWithPort {
+                host: self.addr.host.clone(),
+                port: Some(rsip::Port::from(port)),
+            },
+        }
+    }
 }
 
 impl From<SipAddr> for rsip::HostWithPort {
@@ -202,5 +239,100 @@ impl<'a> TryFrom<std::borrow::Cow<'a, rsip::Uri>> for SipAddr {
             std::borrow::Cow::Owned(uri) => uri.try_into(),
             std::borrow::Cow::Borrowed(uri) => uri.try_into(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::net::{IpAddr, Ipv4Addr};
+
+    fn ip_addr(ip: &str, port: Option<u16>, transport: rsip::transport::Transport) -> SipAddr {
+        SipAddr {
+            r#type: Some(transport),
+            addr: HostWithPort {
+                host: host_with_port::Host::IpAddr(ip.parse().unwrap()),
+                port: port.map(rsip::Port::from),
+            },
+        }
+    }
+
+    #[test]
+    fn test_default_port_per_transport() {
+        assert_eq!(SipAddr::default_port(Some(rsip::transport::Transport::Tcp)), 5060);
+        assert_eq!(SipAddr::default_port(Some(rsip::transport::Transport::Udp)), 5060);
+        assert_eq!(SipAddr::default_port(Some(rsip::transport::Transport::Tls)), 5061);
+        assert_eq!(SipAddr::default_port(Some(rsip::transport::Transport::TlsSctp)), 5061);
+        assert_eq!(SipAddr::default_port(Some(rsip::transport::Transport::Ws)), 80);
+        assert_eq!(SipAddr::default_port(Some(rsip::transport::Transport::Wss)), 443);
+        assert_eq!(SipAddr::default_port(None), 5060);
+    }
+
+    #[test]
+    fn test_with_default_port_fills_missing() {
+        let a = ip_addr("52.9.254.123", None, rsip::transport::Transport::Tcp);
+        let normalized = a.with_default_port();
+        assert_eq!(normalized.addr.port.as_ref().map(|p| *p.value()), Some(5060));
+    }
+
+    #[test]
+    fn test_with_default_port_leaves_existing_port() {
+        let a = ip_addr("52.9.254.123", Some(5080), rsip::transport::Transport::Tcp);
+        let normalized = a.with_default_port();
+        assert_eq!(normalized.addr.port.as_ref().map(|p| *p.value()), Some(5080));
+    }
+
+    #[test]
+    fn test_with_default_port_tls_uses_5061() {
+        let a = ip_addr("52.9.254.123", None, rsip::transport::Transport::Tls);
+        assert_eq!(a.with_default_port().addr.port.as_ref().map(|p| *p.value()), Some(5061));
+    }
+
+    #[test]
+    fn test_normalized_addr_matches_explicit_port_in_hashmap() {
+        // Regression: Record-Route URI without port opened a duplicate TCP
+        // connection because the cache key `sip:52.9.254.123;transport=tcp`
+        // did not match the existing `sip:52.9.254.123:5060;transport=tcp`.
+        // After normalization, both should be the same cache key.
+        let with_port = ip_addr("52.9.254.123", Some(5060), rsip::transport::Transport::Tcp);
+        let without_port = ip_addr("52.9.254.123", None, rsip::transport::Transport::Tcp);
+
+        // Raw equality BEFORE normalization: not equal.
+        assert_ne!(with_port, without_port);
+
+        // After normalization: equal (port filled in).
+        assert_eq!(with_port, without_port.with_default_port());
+
+        // And a HashMap keyed by the normalized form finds either one.
+        let mut map: HashMap<SipAddr, &str> = HashMap::new();
+        map.insert(with_port.with_default_port(), "connection-1");
+        assert_eq!(map.get(&without_port.with_default_port()), Some(&"connection-1"));
+        assert_eq!(map.get(&with_port.with_default_port()), Some(&"connection-1"));
+    }
+
+    #[test]
+    fn test_normalized_addr_different_ports_not_equal() {
+        // Safety: the normalization must not collapse genuinely different
+        // ports — only fill in missing ones.
+        let a = ip_addr("52.9.254.123", Some(5060), rsip::transport::Transport::Tcp);
+        let b = ip_addr("52.9.254.123", Some(5080), rsip::transport::Transport::Tcp);
+        assert_ne!(a.with_default_port(), b.with_default_port());
+    }
+
+    #[test]
+    fn test_get_socketaddr_still_defaults_to_5060() {
+        // Sanity: the existing get_socketaddr helper continues to default
+        // to 5060 when port is absent (previous behavior, unrelated to the
+        // new with_default_port).
+        let a = SipAddr {
+            r#type: None,
+            addr: HostWithPort {
+                host: host_with_port::Host::IpAddr(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))),
+                port: None,
+            },
+        };
+        let socket = a.get_socketaddr().unwrap();
+        assert_eq!(socket.port(), 5060);
     }
 }
