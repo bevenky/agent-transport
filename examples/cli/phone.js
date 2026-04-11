@@ -51,7 +51,12 @@ const ep = new SipEndpoint({ sipServer: sipDomain, logLevel: 3 });
 
 // Event handling
 ep.on('registered', () => console.log('Registered.'));
-ep.on('call_media_active', (ev) => console.log(`Call ${ev.callId} media active.`));
+// call_answered fires when the call is answered and media is flowing.
+// Rust auto-answers inbound calls, so this is the right hook to kick
+// off per-call setup for both inbound and outbound.
+ep.on('call_answered', (ev) => {
+  console.log(`Call ${ev.session.sessionId} answered, media active.`);
+});
 ep.on('dtmf_received', (ev) => console.log(`  DTMF recv: ${ev.digit}`));
 ep.on('call_terminated', (ev) => {
   console.log(`  Call ended: ${ev.reason || ''}`);
@@ -65,10 +70,11 @@ ep.register(username, password);
 setTimeout(() => {
   if (!destUri) {
     console.log('No destination URI provided. Waiting for incoming call...');
-    ep.on('incoming_call', (ev) => {
-      console.log(`Incoming call from ${ev.session.remoteUri}`);
-      ep.answer(ev.callId);
-      startCall(ev.callId);
+    // call_ringing is observational — Rust auto-answers right after.
+    // We use it to discover the session id for inbound calls.
+    ep.on('call_ringing', (ev) => {
+      console.log(`Incoming call from ${ev.session.remoteUri} (ringing)`);
+      startCall(ev.session.sessionId);
     });
     return;
   }
