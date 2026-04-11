@@ -12,14 +12,28 @@ pub enum EndpointEvent {
     /// Unregistered from the SIP server.
     Unregistered,
 
-    /// An incoming call is ringing.
-    IncomingCall { session: CallSession },
+    /// An inbound SIP call is ringing — `180 Ringing` has been sent to the
+    /// peer but the call has NOT been answered yet. Observational event for
+    /// adapters that want to inspect caller info (headers, remote URI, call
+    /// UUID) and log or screen before the auto-answer runs.
+    ///
+    /// This event is SIP-inbound-only; Plivo audio_stream has no pre-answer
+    /// phase visible over the WebSocket protocol.
+    CallRinging { session: CallSession },
 
     /// Call state changed.
     CallStateChanged { session: CallSession },
 
-    /// Call media (audio) is now active.
-    CallMediaActive { call_id: String },
+    /// Call is answered and media is active. For SIP this fires after
+    /// `200 OK` is sent (inbound) or received (outbound) and the RTP send /
+    /// receive loops are running. For audio_stream this fires as soon as
+    /// Plivo's WebSocket `start` event is parsed — that's already post-
+    /// answer by Plivo's architecture.
+    ///
+    /// Adapters should create the agent session on this event (or on the
+    /// synchronous return of `ep.call()` for outbound SIP — same moment in
+    /// time, different signalling).
+    CallAnswered { session: CallSession },
 
     /// Call has been terminated.
     CallTerminated {
@@ -61,9 +75,9 @@ impl EndpointEvent {
             EndpointEvent::Registered => "registered",
             EndpointEvent::RegistrationFailed { .. } => "registration_failed",
             EndpointEvent::Unregistered => "unregistered",
-            EndpointEvent::IncomingCall { .. } => "incoming_call",
+            EndpointEvent::CallRinging { .. } => "call_ringing",
             EndpointEvent::CallStateChanged { .. } => "call_state",
-            EndpointEvent::CallMediaActive { .. } => "call_media_active",
+            EndpointEvent::CallAnswered { .. } => "call_answered",
             EndpointEvent::CallTerminated { .. } => "call_terminated",
             EndpointEvent::DtmfReceived { .. } => "dtmf_received",
             EndpointEvent::BeepDetected { .. } => "beep_detected",
@@ -91,11 +105,11 @@ mod tests {
         assert_eq!(EndpointEvent::Unregistered.callback_name(), "unregistered");
         let session = CallSession::new("test-0".into(), CallDirection::Inbound);
         assert_eq!(
-            EndpointEvent::IncomingCall {
+            EndpointEvent::CallRinging {
                 session: session.clone()
             }
             .callback_name(),
-            "incoming_call"
+            "call_ringing"
         );
         assert_eq!(
             EndpointEvent::CallStateChanged {
@@ -105,8 +119,11 @@ mod tests {
             "call_state"
         );
         assert_eq!(
-            EndpointEvent::CallMediaActive { call_id: "0".into() }.callback_name(),
-            "call_media_active"
+            EndpointEvent::CallAnswered {
+                session: session.clone()
+            }
+            .callback_name(),
+            "call_answered"
         );
         assert_eq!(
             EndpointEvent::CallTerminated {

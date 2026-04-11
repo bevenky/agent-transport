@@ -60,8 +60,8 @@ fn main() -> anyhow::Result<()> {
             Ok(EndpointEvent::CallStateChanged { session }) => {
                 println!("=== Call state: {:?} ===", session.state);
             }
-            Ok(EndpointEvent::CallMediaActive { call_id: cid }) => {
-                println!("=== Media active on call {} ===", cid);
+            Ok(EndpointEvent::CallAnswered { session }) => {
+                println!("=== Call {} answered, media active ===", session.session_id);
                 media_active = true;
             }
             Ok(EndpointEvent::DtmfReceived { call_id: cid, digit, .. }) => {

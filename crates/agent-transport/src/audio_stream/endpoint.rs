@@ -682,19 +682,24 @@ async fn handle_ws(
                         session.remote_uri = call_id;
                         session.local_uri = stream_id;
                         session.extra_headers = headers;
-                        let _ = etx.try_send(EndpointEvent::IncomingCall { session });
-                        // CallMediaActive fired on first audio frame (matches SIP pattern
-                        // where media_active fires when RTP starts, not on INVITE).
-                        // This gives the agent pipeline time to initialize before audio flows.
+                        // Plivo's WebSocket `start` event is post-answer by
+                        // design — Plivo's media server has already bridged
+                        // PSTN↔WS and media flows bidirectionally from this
+                        // point. Fire CallAnswered immediately so adapters
+                        // can create the agent session right away. No
+                        // separate pre-answer event on audio_stream: Plivo
+                        // doesn't expose a ringing phase over the protocol.
+                        let _ = etx.try_send(EndpointEvent::CallAnswered { session });
                         info!("Session {} started (encoding={:?})", sid, encoding);
                     }
 
                     StreamEvent::Media { payload } => {
-                        // Fire CallMediaActive on first audio frame (matches SIP pattern)
+                        // First-media observability counter — no longer a
+                        // gating event. Session is already active by this
+                        // point (CallAnswered fired on the Start event).
                         if !media_active_sent {
                             media_active_sent = true;
-                            let _ = etx.try_send(EndpointEvent::CallMediaActive { call_id: sid.clone() });
-                            debug!("First media frame → CallMediaActive on session {}", sid);
+                            debug!("First media frame on session {}", sid);
                         }
                         let pcm = {
                             let native = encoding.decode(&payload);

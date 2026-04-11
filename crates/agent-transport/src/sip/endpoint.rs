@@ -80,9 +80,98 @@ struct EndpointState {
 
 // ─── Shared helpers ──────────────────────────────────────────────────────────
 
-/// Parse remote SDP, bind RTP socket, create RtpTransport, start send/recv loops.
-/// Returns (local_ip, rtp_port, negotiated SdpAnswer, remote RTP address).
-/// Caller builds the appropriate SDP — `build_offer` for outbound, `build_answer` for inbound.
+/// Phase 1 of RTP setup: parse the remote SDP and bind a local UDP socket.
+/// This is the only async phase. Kept separate from `setup_rtp_attach` so
+/// callers can perform the UDP bind OUTSIDE the state mutex, avoiding the
+/// "std::sync::Mutex guard held across await" pattern that makes the
+/// enclosing future `!Send`.
+async fn setup_rtp_bind(
+    remote_sdp_bytes: &[u8],
+    codecs: &[crate::config::Codec],
+    public_addr: Option<SocketAddr>,
+    local_ip_str: &str,
+) -> Result<(sdp::SdpAnswer, UdpSocket, u16, IpAddr)> {
+    let answer = sdp::parse_answer(remote_sdp_bytes, codecs)?;
+    let rtp_sock = UdpSocket::bind("0.0.0.0:0").await.map_err(err)?;
+    let rtp_port = rtp_sock.local_addr().unwrap().port();
+    let ip = public_addr
+        .map(|a| a.ip())
+        .unwrap_or_else(|| local_ip_str.parse().unwrap_or(std::net::Ipv4Addr::UNSPECIFIED.into()));
+    Ok((answer, rtp_sock, rtp_port, ip))
+}
+
+/// Phase 2 of RTP setup: attach the bound socket to the call context and
+/// start the send/recv loops. Synchronous — safe to run under the state
+/// mutex. Fires `CallAnswered` on success.
+///
+/// Caller builds the appropriate SDP afterwards — `build_offer` for outbound,
+/// `build_answer` for inbound — and feeds it back via dialog.accept / dialog
+/// ACK processing.
+fn setup_rtp_attach(
+    ctx: &mut CallContext,
+    answer: sdp::SdpAnswer,
+    rtp_sock: UdpSocket,
+    etx: &Sender<EndpointEvent>,
+    call_id: &str,
+    input_sample_rate: u32,
+    output_sample_rate: u32,
+) -> SocketAddr {
+    let remote_rtp = SocketAddr::new(answer.remote_ip, answer.remote_port);
+    let dtmf_pt = answer
+        .dtmf_payload_type
+        .unwrap_or(crate::sip::rtp_transport::DEFAULT_DTMF_PT);
+    debug!(
+        "Call {} negotiated: codec={:?} dtmf_pt={} ptime={}ms remote_rtp={}",
+        call_id, answer.codec, dtmf_pt, answer.ptime_ms, remote_rtp
+    );
+    let rtp = Arc::new(RtpTransport::new(
+        Arc::new(rtp_sock),
+        remote_rtp,
+        answer.codec,
+        ctx.cancel.clone(),
+        dtmf_pt,
+        answer.ptime_ms,
+        input_sample_rate,
+        output_sample_rate,
+    ));
+
+    let (itx, irx) = crossbeam_channel::unbounded();
+    let send_handle = rtp.start_send_loop(
+        ctx.audio_buf.clone(),
+        ctx.bg_audio_buf.clone(),
+        ctx.muted.clone(),
+        ctx.paused.clone(),
+        ctx.playout_notify.clone(),
+        ctx.recorder.clone(),
+    );
+    let recv_handle = rtp.start_recv_loop(
+        itx,
+        etx.clone(),
+        call_id.to_string(),
+        ctx.session.direction,
+        ctx.beep_detector.clone(),
+        ctx.held.clone(),
+        ctx.recorder.clone(),
+    );
+    ctx.rtp_tasks = vec![send_handle, recv_handle];
+
+    ctx.rtp = Some(rtp);
+    ctx.incoming_rx = irx;
+    ctx.session.state = CallState::Confirmed;
+
+    // CallAnswered carries the full session so adapters don't need a
+    // secondary lookup to learn the remote URI / extra headers / direction.
+    let _ = etx.try_send(EndpointEvent::CallAnswered {
+        session: ctx.session.clone(),
+    });
+    remote_rtp
+}
+
+/// Convenience wrapper that runs both phases in sequence. Used by the
+/// outbound `call_with_from` path which is inside `runtime.block_on` and
+/// therefore permits holding `std::sync::Mutex` across an await. The
+/// inbound auto-answer path uses the two-phase split directly so its
+/// enclosing future stays `Send`.
 async fn setup_rtp(
     ctx: &mut CallContext,
     remote_sdp_bytes: &[u8],
@@ -91,31 +180,22 @@ async fn setup_rtp(
     local_ip_str: &str,
     etx: &Sender<EndpointEvent>,
     call_id: &str,
-    input_sample_rate: u32, output_sample_rate: u32,
+    input_sample_rate: u32,
+    output_sample_rate: u32,
 ) -> Result<(IpAddr, u16, sdp::SdpAnswer, SocketAddr)> {
-    let answer = sdp::parse_answer(remote_sdp_bytes, codecs)?;
-    let remote_rtp = SocketAddr::new(answer.remote_ip, answer.remote_port);
-
-    let rtp_sock = UdpSocket::bind("0.0.0.0:0").await.map_err(err)?;
-    let rtp_port = rtp_sock.local_addr().unwrap().port();
-    let ip = public_addr.map(|a| a.ip())
-        .unwrap_or_else(|| local_ip_str.parse().unwrap_or(std::net::Ipv4Addr::UNSPECIFIED.into()));
-
-    let dtmf_pt = answer.dtmf_payload_type.unwrap_or(crate::sip::rtp_transport::DEFAULT_DTMF_PT);
-    debug!("Call {} negotiated: codec={:?} dtmf_pt={} ptime={}ms remote_rtp={}", call_id, answer.codec, dtmf_pt, answer.ptime_ms, remote_rtp);
-    let rtp = Arc::new(RtpTransport::new(Arc::new(rtp_sock), remote_rtp, answer.codec, ctx.cancel.clone(), dtmf_pt, answer.ptime_ms, input_sample_rate, output_sample_rate));
-
-    let (itx, irx) = crossbeam_channel::unbounded();
-    let send_handle = rtp.start_send_loop(ctx.audio_buf.clone(), ctx.bg_audio_buf.clone(), ctx.muted.clone(), ctx.paused.clone(), ctx.playout_notify.clone(), ctx.recorder.clone());
-    let recv_handle = rtp.start_recv_loop(itx, etx.clone(), call_id.to_string(), ctx.session.direction, ctx.beep_detector.clone(), ctx.held.clone(), ctx.recorder.clone());
-    ctx.rtp_tasks = vec![send_handle, recv_handle];
-
-    ctx.rtp = Some(rtp);
-    ctx.incoming_rx = irx;
-    ctx.session.state = CallState::Confirmed;
-
-    let _ = etx.try_send(EndpointEvent::CallMediaActive { call_id: call_id.to_string() });
-    Ok((ip, rtp_port, answer, remote_rtp))
+    let (answer, rtp_sock, rtp_port, ip) =
+        setup_rtp_bind(remote_sdp_bytes, codecs, public_addr, local_ip_str).await?;
+    let answer_copy = answer.clone();
+    let remote_rtp = setup_rtp_attach(
+        ctx,
+        answer,
+        rtp_sock,
+        etx,
+        call_id,
+        input_sample_rate,
+        output_sample_rate,
+    );
+    Ok((ip, rtp_port, answer_copy, remote_rtp))
 }
 
 /// Classify a `TerminatedReason` + call direction into a human-readable
@@ -390,7 +470,8 @@ impl SipEndpoint {
             local_addr: None, public_addr: None, sip_server_addr: None,
         }));
 
-        let (st, cc, etx2, ua, isr, osr) = (state.clone(), cancel.clone(), etx.clone(), config.user_agent.clone(), config.input_sample_rate, config.output_sample_rate);
+        let (st, cc, etx2, ua) = (state.clone(), cancel.clone(), etx.clone(), config.user_agent.clone());
+        let config_inner = config.clone();
         let sip_server = config.sip_server.clone();
         let sip_port = config.sip_port;
         rt.block_on(async {
@@ -430,6 +511,7 @@ impl SipEndpoint {
             // tokio runtime is destroyed (forced kill of the parked task)
             // instead of cooperating cleanly with shutdown().
             let (dl2, st2, etx3, cc4) = (dl.clone(), st.clone(), etx2.clone(), cc.clone());
+            let cfg2 = config_inner;
             let mut rx = rx;
             tokio::spawn(async move {
                 loop {
@@ -441,7 +523,7 @@ impl SipEndpoint {
                         msg = rx.recv() => {
                             let Some(mut tx) = msg else { break; };
                             if tx.original.method == rsip::Method::Invite {
-                                handle_incoming(&dl2, &st2, &etx3, tx, cc4.clone(), isr, osr).await;
+                                handle_incoming(&dl2, &st2, &etx3, tx, cc4.clone(), cfg2.clone()).await;
                             } else if let Some(dialog) = dl2.match_dialog(&tx) {
                                 match dialog {
                                     rsipstack::dialog::dialog::Dialog::ServerInvite(mut d) => { let _ = d.handle(&mut tx).await; }
@@ -629,8 +711,27 @@ impl SipEndpoint {
             ctx.session = session.clone();
             ctx.client_dialog = Some(dialog);
 
-            // Set up RTP — for outbound, the offer was already sent in the INVITE
-            let (ip, rtp_port, _negotiated, remote_rtp) = setup_rtp(&mut ctx, resp.body(), &cfg.codecs, pa, &la_str, &etx, &call_id, cfg.input_sample_rate, cfg.output_sample_rate).await?;
+            // Set up RTP — for outbound, the offer was already sent in the INVITE.
+            // If setup_rtp fails AFTER 200 OK was received (rsipstack already
+            // auto-sent ACK so the dialog is confirmed), we must send BYE to
+            // tear down the peer's call leg. Otherwise the peer hangs waiting
+            // for our RTP until its own inactivity timer fires (~30-60s).
+            let setup_result = setup_rtp(&mut ctx, resp.body(), &cfg.codecs, pa, &la_str, &etx, &call_id, cfg.input_sample_rate, cfg.output_sample_rate).await;
+            let (ip, rtp_port, _negotiated, remote_rtp) = match setup_result {
+                Ok(v) => v,
+                Err(e) => {
+                    error!("Outbound call {} RTP setup failed: {} — sending BYE", call_id, e);
+                    if let Some(ref d) = ctx.client_dialog {
+                        let _ = d.hangup().await;
+                    }
+                    ctx.cancel.cancel();
+                    let _ = etx.try_send(EndpointEvent::CallTerminated {
+                        session: ctx.session.clone(),
+                        reason: format!("rtp_setup_failed: {}", e),
+                    });
+                    return Err(e);
+                }
+            };
             ctx.local_sdp = Some(sdp::build_offer(ip, rtp_port, &cfg.codecs));
 
             // Watch for remote BYE
@@ -648,43 +749,22 @@ impl SipEndpoint {
         })
     }
 
-    // ─── Inbound answer ──────────────────────────────────────────────────────
+    // ─── Inbound answer (deprecated — Rust auto-answers) ────────────────────
 
-    pub fn answer(&self, call_id: &str, code: u16) -> Result<()> {
-        let (cfg, st, etx) = (self.config.clone(), self.state.clone(), self.event_tx.clone());
-        self.runtime.block_on(async {
-            let (pa, la_str) = { let s = st.lock_or_recover(); (s.public_addr, s.local_addr.as_ref().map(|a| a.addr.host.to_string()).unwrap_or("0.0.0.0".into())) };
-
-            let cancel = {
-                let mut s = st.lock_or_recover();
-                let ctx = s.calls.get_mut(call_id).ok_or_else(|| EndpointError::CallNotActive(call_id.to_string()))?;
-
-                if ctx.server_dialog.is_none() {
-                    error!("answer: no server_dialog for call {}", call_id);
-                    None
-                } else if code >= 100 && code < 200 {
-                    ctx.server_dialog.as_ref().unwrap().ringing(None, None).map_err(err)?;
-                    None
-                } else if code >= 200 && code < 300 {
-                    let remote_sdp = ctx.server_dialog.as_ref().unwrap().initial_request().body().to_vec();
-                    // Note: setup_rtp awaits UdpSocket::bind (microseconds). Lock held briefly.
-                    let (ip, rtp_port, negotiated, remote_rtp) = setup_rtp(ctx, &remote_sdp, &cfg.codecs, pa, &la_str, &etx, &call_id, cfg.input_sample_rate, cfg.output_sample_rate).await?;
-                    // Build SDP answer with negotiated codec, ptime, DTMF PT, rtcp-mux
-                    let local_sdp = sdp::build_answer(ip, rtp_port, &negotiated);
-                    ctx.local_sdp = Some(local_sdp.clone());
-                    let hdrs = vec![rsip::Header::ContentType("application/sdp".into())];
-                    ctx.server_dialog.as_ref().unwrap().accept(Some(hdrs), Some(local_sdp.into_bytes())).map_err(err)?;
-                    info!("Inbound call {} connected to {}", call_id, remote_rtp);
-                    Some(ctx.cancel.clone())
-                } else { None }
-            }; // MutexGuard dropped here
-
-            // Session timer (outside the lock)
-            if let Some(cc) = cancel {
-                start_session_timer(None, call_id.to_string(), st, cc);
-            }
-            Ok(())
-        })
+    /// Deprecated: inbound calls are now auto-answered by Rust's
+    /// `handle_incoming` between the `CallRinging` and `CallAnswered`
+    /// events. This method is retained as a no-op for backwards
+    /// compatibility — adapters should stop calling it.
+    ///
+    /// Returns `Ok(())` silently: by the time any adapter calls this,
+    /// the call is either already answered (do nothing) or has failed
+    /// (nothing to do). For rejection, use `reject(code)` instead.
+    pub fn answer(&self, call_id: &str, _code: u16) -> Result<()> {
+        debug!(
+            "SipEndpoint::answer({}) is a no-op: Rust now auto-answers inbound calls",
+            call_id
+        );
+        Ok(())
     }
 
     // ─── Call control ────────────────────────────────────────────────────────
@@ -1025,26 +1105,51 @@ impl Drop for SipEndpoint { fn drop(&mut self) { let _ = self.shutdown(); } }
 
 // ─── Incoming call handler ───────────────────────────────────────────────────
 
-async fn handle_incoming(dl: &Arc<DialogLayer>, st: &Arc<Mutex<EndpointState>>, etx: &Sender<EndpointEvent>, tx: rsipstack::transaction::transaction::Transaction, global_cancel: CancellationToken, _input_sample_rate: u32, output_sample_rate: u32) {
+async fn handle_incoming(
+    dl: &Arc<DialogLayer>,
+    st: &Arc<Mutex<EndpointState>>,
+    etx: &Sender<EndpointEvent>,
+    tx: rsipstack::transaction::transaction::Transaction,
+    global_cancel: CancellationToken,
+    cfg: EndpointConfig,
+) {
     let (ds, dr) = dl.new_dialog_state_channel();
     let cred = st.lock_or_recover().credential.clone();
     let contact = st.lock_or_recover().contact_uri.clone();
-    let dialog = match dl.get_or_create_server_invite(&tx, ds, cred, contact) { Ok(d) => d, Err(e) => { error!("server invite: {}", e); return; } };
+    let dialog = match dl.get_or_create_server_invite(&tx, ds, cred, contact) {
+        Ok(d) => d,
+        Err(e) => {
+            error!("server invite: {}", e);
+            return;
+        }
+    };
 
-    // Send 180 Ringing to keep the transaction alive until Python calls answer()
-    if let Err(e) = dialog.ringing(None, None) { error!("failed to send ringing: {}", e); return; }
+    // Send 180 Ringing to keep the transaction alive while we auto-answer.
+    if let Err(e) = dialog.ringing(None, None) {
+        error!("failed to send ringing: {}", e);
+        return;
+    }
 
     let call_id = format!("c{:016x}", rand::random::<u64>());
     let cc = CancellationToken::new();
-    let (mut ctx, mut session) = new_call_context(&call_id, CallDirection::Inbound, cc.clone(), output_sample_rate);
+    let (mut ctx, mut session) =
+        new_call_context(&call_id, CallDirection::Inbound, cc.clone(), cfg.output_sample_rate);
 
     let req = dialog.initial_request();
-    if let Ok(from) = req.from_header() { session.remote_uri = from.to_string(); }
+    if let Ok(from) = req.from_header() {
+        session.remote_uri = from.to_string();
+    }
     extract_x_headers_from_request(&req, &mut session);
+    // Save remote SDP now — we'll need it below but `dialog` will be moved
+    // into `ctx.server_dialog` on the next line.
+    let remote_sdp = req.body().to_vec();
     ctx.session = session.clone();
     ctx.server_dialog = Some(dialog);
 
-    info!("Incoming call {} from {} (uuid={:?})", call_id, session.remote_uri, session.call_uuid);
+    info!(
+        "Incoming call {} from {} (uuid={:?})",
+        call_id, session.remote_uri, session.call_uuid
+    );
 
     st.lock_or_recover().calls.insert(call_id.clone(), ctx);
 
@@ -1061,9 +1166,113 @@ async fn handle_incoming(dl: &Arc<DialogLayer>, st: &Arc<Mutex<EndpointState>>, 
         }
     });
 
-    let _ = etx.try_send(EndpointEvent::IncomingCall { session });
-
-    // Watch dialog state for remote BYE (same helper as outbound).
+    // Watch dialog state for remote BYE/CANCEL while we auto-answer.
     // Inbound calls — this side is the UAS.
-    spawn_dialog_watcher(dr, call_id.clone(), CallDirection::Inbound, st.clone(), etx.clone(), cc, global_cancel);
+    spawn_dialog_watcher(
+        dr,
+        call_id.clone(),
+        CallDirection::Inbound,
+        st.clone(),
+        etx.clone(),
+        cc,
+        global_cancel,
+    );
+
+    // ── Pre-answer event ─────────────────────────────────────────────────
+    // CallRinging is fired AFTER 180 Ringing is sent and state is set up,
+    // but BEFORE auto-answer runs. Adapters can observe caller info here
+    // (e.g., to emit a user-facing `on_ringing` / room event). Rejection
+    // during this window is a future enhancement — for now it's purely
+    // observational and the auto-answer proceeds regardless.
+    let _ = etx.try_send(EndpointEvent::CallRinging {
+        session: session.clone(),
+    });
+
+    // ── Auto-answer ──────────────────────────────────────────────────────
+    // Runs setup_rtp + build_answer + dialog.accept(200). On success
+    // setup_rtp internally emits CallAnswered. On failure we tear down the
+    // SIP dialog with a 500, remove the call from state, and emit
+    // CallTerminated so the adapter's standard termination handler cleans
+    // up. No "answered but no media" limbo state.
+    match auto_answer_inbound(st, &cfg, &call_id, &remote_sdp, etx).await {
+        Ok(()) => {
+            info!("Inbound call {} auto-answered", call_id);
+        }
+        Err(e) => {
+            error!("Inbound call {} auto-answer failed: {}", call_id, e);
+            // Pull ctx out, tear down, emit CallTerminated.
+            let removed = st.lock_or_recover().calls.remove(&call_id);
+            if let Some(ctx) = removed {
+                if let Some(ref d) = ctx.server_dialog {
+                    let _ = d.reject(Some(rsip::StatusCode::ServerInternalError), None);
+                }
+                ctx.cancel.cancel();
+                let _ = etx.try_send(EndpointEvent::CallTerminated {
+                    session: ctx.session,
+                    reason: format!("auto_answer_failed: {}", e),
+                });
+            }
+        }
+    }
+}
+
+/// Run setup_rtp + build_answer + dialog.accept(200) on an inbound call.
+/// Called from `handle_incoming` (which runs inside a `tokio::spawn` and
+/// therefore requires the returned future to be `Send`).
+///
+/// **Why two-phase RTP setup:** `std::sync::MutexGuard` is `!Send`, so it
+/// cannot be held across `.await` inside a `Send` future. We do the
+/// blocking/async phase (`UdpSocket::bind`) with NO lock held, then
+/// re-acquire the lock for the synchronous phase that mutates `ctx`.
+async fn auto_answer_inbound(
+    st: &Arc<Mutex<EndpointState>>,
+    cfg: &EndpointConfig,
+    call_id: &str,
+    remote_sdp: &[u8],
+    etx: &Sender<EndpointEvent>,
+) -> Result<()> {
+    // Phase 0: snapshot the bits we need under a short read lock
+    let (pa, la_str) = {
+        let s = st.lock_or_recover();
+        (
+            s.public_addr,
+            s.local_addr
+                .as_ref()
+                .map(|a| a.addr.host.to_string())
+                .unwrap_or("0.0.0.0".into()),
+        )
+    };
+
+    // Phase 1: bind UDP socket (the only async step) WITHOUT the state lock
+    let (answer, rtp_sock, rtp_port, ip) =
+        setup_rtp_bind(remote_sdp, &cfg.codecs, pa, &la_str).await?;
+
+    // Phase 2: re-acquire lock, attach to ctx, send 200 OK — all synchronous
+    let mut s = st.lock_or_recover();
+    let ctx = s
+        .calls
+        .get_mut(call_id)
+        .ok_or_else(|| EndpointError::CallNotActive(call_id.to_string()))?;
+    if ctx.server_dialog.is_none() {
+        return Err(EndpointError::Other("no server_dialog".into()));
+    }
+    let negotiated = answer.clone();
+    let _remote_rtp = setup_rtp_attach(
+        ctx,
+        answer,
+        rtp_sock,
+        etx,
+        call_id,
+        cfg.input_sample_rate,
+        cfg.output_sample_rate,
+    );
+    let local_sdp = sdp::build_answer(ip, rtp_port, &negotiated);
+    ctx.local_sdp = Some(local_sdp.clone());
+    let hdrs = vec![rsip::Header::ContentType("application/sdp".into())];
+    ctx.server_dialog
+        .as_ref()
+        .unwrap()
+        .accept(Some(hdrs), Some(local_sdp.into_bytes()))
+        .map_err(err)?;
+    Ok(())
 }

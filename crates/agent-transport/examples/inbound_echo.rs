@@ -36,14 +36,15 @@ fn main() -> anyhow::Result<()> {
     // Main event loop
     loop {
         match events.recv()? {
-            EndpointEvent::IncomingCall { session } => {
-                println!("Incoming call from: {}", session.remote_uri);
-                // Auto-answer with 200 OK
-                ep.answer(&session.session_id, 200)?;
-                println!("Call answered (call_id={})", session.session_id);
+            EndpointEvent::CallRinging { session } => {
+                println!("Inbound call ringing: {}", session.remote_uri);
+                // Rust auto-answers — no need to call ep.answer() anymore.
             }
-            EndpointEvent::CallMediaActive { call_id } => {
-                println!("Media active on call {}. Audio is bridged via conf.", call_id);
+            EndpointEvent::CallAnswered { session } => {
+                println!(
+                    "Call {} answered and media active. Audio is bridged via conf.",
+                    session.session_id
+                );
                 // With null sound device + conf bridge, the SIP stack handles
                 // the audio path. For echo, we'd need a custom media port.
             }

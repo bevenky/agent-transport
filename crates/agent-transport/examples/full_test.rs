@@ -52,9 +52,9 @@ fn main() -> anyhow::Result<()> {
     let call_start = Instant::now();
     loop {
         match events.recv_timeout(Duration::from_millis(100)) {
-            Ok(EndpointEvent::CallMediaActive { .. }) => {
+            Ok(EndpointEvent::CallAnswered { .. }) => {
                 media_active = true;
-                println!("  PASS: Media active");
+                println!("  PASS: Call answered, media active");
                 break;
             }
             Ok(EndpointEvent::CallStateChanged { session }) => {
