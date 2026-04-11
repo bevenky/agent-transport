@@ -85,12 +85,14 @@ async def test_audio_stream_server_event_loop_survives_handler_exception():
 
     srv._session_contexts["session-dead"] = BrokenCtx()
 
-    # Push events:
-    #   1. incoming_call (normal)
+    # Push events (post-refactor event names):
+    #   1. call_answered (normal)
     #   2. call_terminated (triggers BrokenCtx attribute access → exception)
-    #   3. incoming_call (must still be processed after #2 raised)
+    #   3. call_answered (must still be processed after #2 raised)
+    srv._active_sessions = {}
+    srv._background_tasks = set()
     srv._ep.push_event({
-        "type": "incoming_call",
+        "type": "call_answered",
         "session": _FakeSession("session-A"),
     })
     srv._ep.push_event({
@@ -99,7 +101,7 @@ async def test_audio_stream_server_event_loop_survives_handler_exception():
         "reason": "test",
     })
     srv._ep.push_event({
-        "type": "incoming_call",
+        "type": "call_answered",
         "session": _FakeSession("session-B"),
     })
 
