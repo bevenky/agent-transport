@@ -76,14 +76,14 @@ fn outbound_call_and_hangup() {
 
     // Make call
     let call_id = ep.call(&dest_uri(), None).expect("call should succeed");
-    assert!(call_id >= 0);
+    assert!(!call_id.is_empty());
 
-    // Wait for media active (call answered)
+    // Wait for call answered (media active)
     let start = std::time::Instant::now();
     let mut media_active = false;
     loop {
         match events.recv_timeout(Duration::from_millis(200)) {
-            Ok(EndpointEvent::CallMediaActive { .. }) => {
+            Ok(EndpointEvent::CallAnswered { .. }) => {
                 media_active = true;
                 break;
             }
@@ -101,7 +101,7 @@ fn outbound_call_and_hangup() {
     assert!(media_active);
 
     // Hangup
-    ep.hangup(call_id).expect("hangup should succeed");
+    ep.hangup(&call_id).expect("hangup should succeed");
 
     // Wait for termination
     loop {
@@ -133,11 +133,11 @@ fn send_and_receive_audio() {
 
     let call_id = ep.call(&dest_uri(), None).unwrap();
 
-    // Wait for media
+    // Wait for call answered (media active)
     let start = std::time::Instant::now();
     loop {
         match events.recv_timeout(Duration::from_millis(200)) {
-            Ok(EndpointEvent::CallMediaActive { .. }) => break,
+            Ok(EndpointEvent::CallAnswered { .. }) => break,
             Ok(EndpointEvent::CallTerminated { reason, .. }) => {
                 panic!("Call terminated before media: {}", reason);
             }
@@ -162,7 +162,7 @@ fn send_and_receive_audio() {
 
     let mut send_ok = 0;
     for _ in 0..10 {
-        if ep.send_audio(call_id, &tone_frame).is_ok() {
+        if ep.send_audio(&call_id, &tone_frame).is_ok() {
             send_ok += 1;
         }
         std::thread::sleep(Duration::from_millis(20));
@@ -173,13 +173,13 @@ fn send_and_receive_audio() {
     let mut recv_count = 0;
     let recv_start = std::time::Instant::now();
     while recv_start.elapsed() < Duration::from_secs(1) {
-        match ep.recv_audio(call_id) {
+        match ep.recv_audio(&call_id) {
             Ok(Some(_)) => recv_count += 1,
             _ => std::thread::sleep(Duration::from_millis(5)),
         }
     }
     assert!(recv_count > 10, "should receive audio frames, got {}", recv_count);
 
-    ep.hangup(call_id).unwrap();
+    ep.hangup(&call_id).unwrap();
     ep.shutdown().unwrap();
 }
