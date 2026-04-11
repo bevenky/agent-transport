@@ -52,21 +52,18 @@ export class SipAudioOutput extends _AudioOutputBase {
   // -- captureFrame: matches WebRTC's ParticipantAudioOutput.captureFrame --
 
   async captureFrame(frame: AudioFrame): Promise<void> {
-    // Segment tracking (WebRTC doesn't await this — it's sync internally)
+    // Segment tracking (WebRTC's super.captureFrame is sync void)
     super.captureFrame(frame);
 
-    // Emit playback started on first frame
-    if (!this.firstFrameEmitted) {
-      this.firstFrameEmitted = true;
-      this.onPlaybackStarted(Date.now());
-    }
-
-    // Track pushed duration
+    // Track pushed duration before the await so a sync caller's
+    // pushedDuration accounting matches what the upstream sync
+    // super.captureFrame would have done.
     this.pushedDuration += frame.samplesPerChannel / frame.sampleRate;
 
     // Push to Rust with backpressure — callback fires when buffer has space.
-    // Matches WebRTC's await audioSource.captureFrame(frame).
+    // Matches WebRTC's `await audioSource.captureFrame(frame)`.
     const frameData = Buffer.from(frame.data.buffer, frame.data.byteOffset, frame.data.byteLength);
+    const isFirstFrame = !this.firstFrameEmitted;
     await new Promise<void>((resolve) => {
       try {
         this.endpoint.sendAudioNotify(
@@ -77,11 +74,23 @@ export class SipAudioOutput extends _AudioOutputBase {
           () => resolve(),
         );
       } catch {
-        // Buffer full or session gone — drop frame silently (matches WebRTC behavior
-        // where captureFrame returns false on buffer full without throwing)
+        // Buffer full or session gone — drop frame silently (matches WebRTC
+        // behavior where captureFrame returns false on buffer full without
+        // throwing).
         resolve();
       }
     });
+
+    // Emit playback-started AFTER the first frame has actually been
+    // accepted by Rust (the napi callback fired). Upstream LiveKit fires
+    // it after `await audioSource.captureFrame(frame)` returns, so the
+    // TTFB metric reflects "first frame queued for playback" rather than
+    // "first frame received from TTS". Firing it before the await would
+    // overreport TTFB by ~50-100 ms.
+    if (isFirstFrame) {
+      this.firstFrameEmitted = true;
+      this.onPlaybackStarted(Date.now());
+    }
   }
 
   // -- flush: matches WebRTC's ParticipantAudioOutput.flush --
@@ -177,8 +186,9 @@ export class SipAudioOutput extends _AudioOutputBase {
     let pushedDuration = this.pushedDuration;
 
     if (interrupted) {
-      // Real Rust buffer state — matches WebRTC's audioSource.queuedDuration
-      const queuedMs = (this.endpoint as any).queuedDurationMs?.(this.sessionId) ?? 0;
+      // Real Rust buffer state — matches WebRTC's audioSource.queuedDuration.
+      // Always exposed by both SipEndpoint and AudioStreamEndpoint via napi.
+      const queuedMs = this.endpoint.queuedDurationMs(this.sessionId);
       pushedDuration = Math.max(this.pushedDuration - queuedMs / 1000, 0);
       this.clearSourceQueue();
       _log(`SipAudioOutput._waitForPlayout: interrupted, played=${pushedDuration.toFixed(3)}s`);

@@ -499,6 +499,12 @@ export class AgentServer {
         // Hangup
         try { this.ep!.hangup(sessionId); } catch {}
 
+        // Mark room disconnected and emit "disconnected" event so any
+        // hooks attached via `room.on("disconnected", ...)` fire. The
+        // audio_stream server already does this; without it the SIP
+        // server leaves room.connected = true after the call ends.
+        try { ctx.room._onSessionEnded(); } catch {}
+
         this.activeCalls.delete(sessionId);
         console.log(`Call ${sessionId} ended (${direction}) duration=${durationSec.toFixed(1)}s`);
       }

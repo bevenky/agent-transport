@@ -109,6 +109,13 @@ export declare class SipEndpoint {
   transferAttended(sessionId: string, targetSessionId: string): void;
   sendRawMessage(sessionId: string, message: string): void;
   queuedFrames(sessionId: string): number;
+  /**
+   * Number of milliseconds of audio currently queued for outbound playback.
+   * Mirrors WebRTC `audioSource.queuedDuration`. Used by RoomIO-style
+   * adapters to compute "real played duration" on interruption (for
+   * `on_playback_finished` reporting).
+   */
+  queuedDurationMs(sessionId: string): number;
   pollEvent(): EventInfo | null;
   /**
    * Block waiting for the next event up to `timeoutMs`. Resolves to `null`
@@ -150,6 +157,11 @@ export declare class AudioStreamEndpoint {
   sendDtmf(sessionId: string, digits: string): void;
   sendRawMessage(sessionId: string, message: string): void;
   queuedFrames(sessionId: string): number;
+  /**
+   * Number of milliseconds of audio currently queued for outbound playback.
+   * Mirrors WebRTC `audioSource.queuedDuration`.
+   */
+  queuedDurationMs(sessionId: string): number;
   hangup(sessionId: string): void;
   detectBeep(sessionId: string, timeoutMs?: number, minDurationMs?: number, maxDurationMs?: number): void;
   cancelBeepDetection(sessionId: string): void;

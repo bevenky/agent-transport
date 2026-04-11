@@ -74,6 +74,12 @@ export class JobContext {
    * directly — matches LiveKit WebRTC pattern exactly.
    */
   set session(session: any) {
+    if (session == null) {
+      throw new TypeError(
+        "JobContext.session cannot be set to null/undefined. Assign a "
+        + "valid voice.AgentSession instance (or use ctx.session to read)."
+      );
+    }
     this._session = session;
 
     // Wire SIP audio I/O before session.start() is called
