@@ -390,6 +390,22 @@ class _StubJob:
     enable_recording: bool = True
 
 
+class _NoopTagger:
+    """No-op shim for livekit.agents Tagger.
+
+    LiveKit's `JobContext.tagger` returns a real Tagger instance for cloud
+    eval/analytics. We don't have cloud connectivity, so user code that
+    calls ctx.tagger.success() / .fail() / .add() / ._evaluation() should
+    not crash. This shim accepts any method call and silently no-ops.
+    """
+
+    def __getattr__(self, name):
+        # Any method call returns a no-op callable that accepts anything.
+        def _noop(*args, **kwargs):
+            return None
+        return _noop
+
+
 class _StubJobContext:
     """Minimal stub for JobContext — provides .room, .job, and other fields
     that AgentSession.start() accesses via get_job_context().
@@ -409,6 +425,11 @@ class _StubJobContext:
         self.session_directory = Path("/tmp/agent-sessions")
         self.session_directory.mkdir(parents=True, exist_ok=True)
         self.worker_id = "local"
+        # Storage for ctx.log_context_fields (also accessed as
+        # ctx._log_fields by LiveKit's internal _ContextLogFieldsFilter,
+        # though we don't install that filter ourselves).
+        self._log_fields: dict = {}
+        self._tagger = _NoopTagger()
 
     @property
     def room(self):
@@ -479,17 +500,99 @@ class _StubJobContext:
                 pass
 
     def add_shutdown_callback(self, callback):
-        self._shutdown_callbacks.append(callback)
+        """Register an async callback to fire on job shutdown.
+
+        Mirrors LiveKit's JobContext.add_shutdown_callback signature
+        normalization: callbacks may be either `async def cb()` or
+        `async def cb(reason: str)`. Zero-arg callbacks get wrapped so
+        the stored list always contains `async def(reason: str)`. This
+        lets us call them uniformly from shutdown(reason).
+        """
+        import inspect
+        min_args_num = 2 if inspect.ismethod(callback) else 1
+        if hasattr(callback, "__code__") and callback.__code__.co_argcount >= min_args_num:
+            self._shutdown_callbacks.append(callback)
+        else:
+            async def _wrapper(_reason: str) -> None:
+                await callback()
+            self._shutdown_callbacks.append(_wrapper)
 
     def shutdown(self, reason: str = ""):
-        pass
+        """Terminate the agent job and drop the underlying SIP/audio_stream call.
+
+        Called by LiveKit's EndCallTool (via job_ctx.shutdown(reason=...)) and
+        by user code that wants to abort the agent session. In a real LiveKit
+        deployment this terminates the job process and indirectly drops the
+        SIP caller via room teardown — we don't have rooms, so we explicitly
+        hangup the call here. Idempotent: hangup on an already-terminated
+        call is a no-op in the Rust core.
+        """
+        logger.info("JobContext.shutdown(reason=%r) — dropping call %s", reason, self._room._sid if self._room else "?")
+        ep = self._room._ep if self._room else None
+        session_id = self._room._sid if self._room else None
+        if ep and session_id:
+            try:
+                ep.hangup(session_id)
+            except Exception:
+                logger.debug("hangup during JobContext.shutdown failed", exc_info=True)
+        # Fire user-registered shutdown callbacks. LiveKit calls them with
+        # the reason string; we do the same after add_shutdown_callback
+        # normalized them to all take (reason,).
+        import asyncio as _asyncio
+        for cb in self._shutdown_callbacks:
+            try:
+                coro = cb(reason)
+                if coro is not None and hasattr(coro, "__await__"):
+                    # shutdown() is synchronous per LiveKit's contract, so
+                    # async user cleanup runs fire-and-forget on the loop.
+                    try:
+                        loop = _asyncio.get_event_loop()
+                        if loop.is_running():
+                            loop.create_task(coro)
+                    except Exception:
+                        pass
+            except Exception:
+                logger.debug("shutdown callback failed", exc_info=True)
 
     async def delete_room(self, room_name=""):
-        pass
+        """Drop the underlying SIP/audio_stream call.
+
+        LiveKit's EndCallTool calls this (via add_shutdown_callback ->
+        job_ctx.delete_room()) to disconnect remote SIP callers by deleting
+        the WebRTC room. We don't have rooms, so this maps directly to
+        ep.hangup(). Idempotent — safe to call multiple times.
+
+        Note: LiveKit's real signature returns asyncio.Future, not async def,
+        but `await job_ctx.delete_room()` works correctly with both forms
+        (await on a coroutine and await on a future are interchangeable
+        from the caller's perspective).
+        """
+        logger.info("JobContext.delete_room — dropping call %s", self._room._sid if self._room else "?")
+        ep = self._room._ep if self._room else None
+        session_id = self._room._sid if self._room else None
+        if ep and session_id:
+            try:
+                ep.hangup(session_id)
+            except Exception:
+                logger.debug("hangup during JobContext.delete_room failed", exc_info=True)
 
     @property
-    def log_context_fields(self):
-        return {}
+    def log_context_fields(self) -> dict:
+        """Returns the dict of structured log fields. Mutable.
+
+        Mirrors LiveKit's contract: callers can either edit the returned
+        dict in place or replace it via `ctx.log_context_fields = {...}`.
+        We don't actually install LiveKit's _ContextLogFieldsFilter (it
+        requires a real worker setup), so the fields aren't injected
+        into log records — but the getter/setter still need to exist
+        so user code that does `ctx.log_context_fields = {...}` doesn't
+        crash with AttributeError.
+        """
+        return self._log_fields
+
+    @log_context_fields.setter
+    def log_context_fields(self, fields: dict) -> None:
+        self._log_fields = fields
 
     @property
     def primary_session(self):
@@ -500,22 +603,43 @@ class _StubJobContext:
         return self._room._local_participant.identity if self._room else ""
 
     def make_session_report(self, *args, **kwargs):
-        pass
+        # LiveKit uses this for cloud session telemetry. We don't ship to
+        # LiveKit Cloud, so this is a no-op. Tools that read the return
+        # value should not depend on it being non-None.
+        return None
 
     @property
     def tagger(self):
-        return None
+        """Returns a no-op Tagger shim.
+
+        LiveKit's Tagger sends success/fail/eval signals to LiveKit Cloud.
+        We don't have cloud connectivity, so any user code that calls
+        `ctx.tagger.success()` / `.fail()` / `.add()` / `._evaluation()`
+        gets a silent no-op via `_NoopTagger.__getattr__`. Returning None
+        would crash on attribute access; the shim is required for parity.
+        """
+        return self._tagger
 
     def token_claims(self):
         return {}
 
     @property
     def api(self):
+        # LiveKit's `JobContext.api` returns a LiveKitAPI client for room
+        # control / SIP outbound / data publishing. We don't have one,
+        # so callers that touch ctx.api will get None and need to guard.
+        # Code in EndCallTool / RoomIO doesn't use ctx.api directly.
         return None
 
     @property
     def agent(self):
-        return None
+        """Returns the local participant — shorthand for ctx.room.local_participant.
+
+        Mirrors LiveKit JobContext.agent at job.py:406. Some agent code uses
+        `ctx.agent.publish_track(...)` as shorthand. Returning None here
+        would crash; we forward to the local participant.
+        """
+        return self._room.local_participant if self._room else None
 
 
 def create_transport_context(room: TransportRoom, agent_name: str = "agent",
