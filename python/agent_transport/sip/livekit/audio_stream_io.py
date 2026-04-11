@@ -268,22 +268,22 @@ class AudioStreamOutput(AudioOutput):
         super().pause()
         self._playback_enabled.clear()
         if not self._rust_paused:
-            self._rust_paused = True
             try:
                 self._ep.pause(self._sid)
+                self._rust_paused = True
             except Exception:
-                pass
+                logger.warning("AudioStreamOutput.pause failed for session %s", self._sid, exc_info=True)
 
     def resume(self) -> None:
         super().resume()
         self._playback_enabled.set()
         self._first_frame_event.clear()
         if self._rust_paused:
-            self._rust_paused = False
             try:
                 self._ep.resume(self._sid)
+                self._rust_paused = False
             except Exception:
-                pass
+                logger.warning("AudioStreamOutput.resume failed for session %s", self._sid, exc_info=True)
 
     async def _wait_for_playout(self) -> None:
         logger.debug("_wait_for_playout: starting (pushed=%.3fs)", self._pushed_duration)

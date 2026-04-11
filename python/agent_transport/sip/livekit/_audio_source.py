@@ -140,6 +140,11 @@ class SipAudioSource:
             try:
                 self._ep.wait_for_playout_notify(self._id, _on_playout)
             except Exception:
+                # Resolve the orphaned future so any concurrent awaiters
+                # don't hang on a future that will never fire.
+                fut = self._playout_fut
+                if fut is not None and not fut.done():
+                    fut.set_result(None)
                 self._playout_fut = None
                 return
 
@@ -178,21 +183,23 @@ class AudioStreamAudioSource(SipAudioSource):
 
             async def _wait():
                 try:
-                    self._ep.flush(self._id)
-                except Exception:
-                    logger.warning("AudioStreamAudioSource: flush failed for session %s", self._id, exc_info=True)
-                    return
+                    try:
+                        self._ep.flush(self._id)
+                    except Exception:
+                        logger.warning("AudioStreamAudioSource: flush failed for session %s", self._id, exc_info=True)
+                        return
 
-                loop = asyncio.get_running_loop()
-                try:
-                    confirmed = await loop.run_in_executor(
-                        None, self._ep.wait_for_playout, self._id, 30000
-                    )
-                    if not confirmed:
-                        logger.warning("AudioStreamAudioSource: wait_for_playout timed out on session %s", self._id)
-                except Exception:
-                    logger.warning("AudioStreamAudioSource: wait_for_playout error on session %s", self._id, exc_info=True)
+                    loop = asyncio.get_running_loop()
+                    try:
+                        confirmed = await loop.run_in_executor(
+                            None, self._ep.wait_for_playout, self._id, 30000
+                        )
+                        if not confirmed:
+                            logger.warning("AudioStreamAudioSource: wait_for_playout timed out on session %s", self._id)
+                    except Exception:
+                        logger.warning("AudioStreamAudioSource: wait_for_playout error on session %s", self._id, exc_info=True)
                 finally:
+                    # Always resolve the shared future so concurrent awaiters don't hang.
                     fut = self._plivo_playout_fut
                     if fut is not None and not fut.done():
                         fut.set_result(None)

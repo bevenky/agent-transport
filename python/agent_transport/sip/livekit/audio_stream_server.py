@@ -45,6 +45,7 @@ from livekit.agents.utils.hw import get_cpu_monitor
 from livekit.agents.utils import MovingAverage
 from .audio_stream_io import AudioStreamInput, AudioStreamOutput
 from ._room_facade import TransportRoom, create_transport_context
+from ._aio_utils import call_setup as _call_setup
 from livekit.rtc.room import SipDTMF
 from .server import JobProcess
 
@@ -400,16 +401,17 @@ class AudioStreamServer:
             await self._inference_executor.initialize()
             logger.info("Inference executor ready (turn detection models available)")
 
-        # Run user's setup function
+        # Run user's setup function (supports sync and async)
         if self._setup_fnc:
             if self._inference_executor:
                 _set_inference_context(self._inference_executor)
             try:
-                self._setup_fnc(self._proc)  # New pattern: fn(proc)
-            except TypeError:
-                result = self._setup_fnc()  # Old pattern: fn() -> dict
-                if isinstance(result, dict):
-                    self._proc.userdata = result
+                await _call_setup(self._setup_fnc, self._proc)
+            except Exception:
+                logger.exception("Setup function failed")
+                if self._inference_executor:
+                    _clear_inference_context()
+                raise
             if self._inference_executor:
                 _clear_inference_context()
             self._userdata = self._proc.userdata
@@ -552,88 +554,92 @@ class AudioStreamServer:
             try:
                 ev = await loop.run_in_executor(None, self._ep.wait_for_event, 1000)
             except Exception:
+                logger.exception("audio_stream wait_for_event failed")
                 break
 
             if not ev:
                 continue
 
-            ev_type = ev["type"]
+            try:
+                ev_type = ev["type"]
 
-            if ev_type == "incoming_call":
-                session = ev["session"]
-                session_id = session.session_id
-                plivo_call_uuid = session.remote_uri
-                stream_id = session.local_uri if hasattr(session, "local_uri") else ""
-                extra_headers = session.extra_headers if hasattr(session, "extra_headers") else {}
-                logger.info("Audio stream session %s connected (plivo_call_uuid=%s, stream_id=%s)", session_id, plivo_call_uuid, stream_id)
-                pending_sessions[session_id] = (plivo_call_uuid, stream_id, extra_headers)
+                if ev_type == "incoming_call":
+                    session = ev["session"]
+                    session_id = session.session_id
+                    plivo_call_uuid = session.remote_uri
+                    stream_id = session.local_uri if hasattr(session, "local_uri") else ""
+                    extra_headers = session.extra_headers if hasattr(session, "extra_headers") else {}
+                    logger.info("Audio stream session %s connected (plivo_call_uuid=%s, stream_id=%s)", session_id, plivo_call_uuid, stream_id)
+                    pending_sessions[session_id] = (plivo_call_uuid, stream_id, extra_headers)
 
-            elif ev_type == "call_media_active":
-                session_id = ev["session_id"]
-                if session_id in pending_sessions:
-                    plivo_call_uuid, stream_id, extra_headers = pending_sessions.pop(session_id)
-                    logger.info("Audio stream session %s media active, starting agent", session_id)
-                    asyncio.create_task(
-                        self._start_session(session_id, plivo_call_uuid, stream_id, extra_headers)
-                    )
+                elif ev_type == "call_media_active":
+                    session_id = ev["session_id"]
+                    if session_id in pending_sessions:
+                        plivo_call_uuid, stream_id, extra_headers = pending_sessions.pop(session_id)
+                        logger.info("Audio stream session %s media active, starting agent", session_id)
+                        asyncio.create_task(
+                            self._start_session(session_id, plivo_call_uuid, stream_id, extra_headers)
+                        )
 
-            elif ev_type == "call_terminated":
-                session_id = ev["session"].session_id
-                reason = ev.get("reason", "unknown")
-                logger.info("Session %s terminated (reason=%s)", session_id, reason)
+                elif ev_type == "call_terminated":
+                    session_id = ev["session"].session_id
+                    reason = ev.get("reason", "unknown")
+                    logger.info("Session %s terminated (reason=%s)", session_id, reason)
 
-                # Clear audio buffer immediately to abort any pending playout
-                try:
-                    self._ep.clear_buffer(session_id)
-                except Exception:
-                    pass
+                    # Clear audio buffer immediately to abort any pending playout
+                    try:
+                        self._ep.clear_buffer(session_id)
+                    except Exception:
+                        pass
 
-                # Emit participant_disconnected on Room facade (matches LiveKit WebRTC)
-                # RoomIO._on_participant_disconnected will call _close_soon() → session closes
-                ctx = self._session_contexts.get(session_id)
-                if ctx and ctx._room:
-                    remote = ctx._room._remote
-                    remote.disconnect_reason = 1  # CLIENT_INITIATED
-                    ctx._room.emit("participant_disconnected", remote)
+                    # Emit participant_disconnected on Room facade (matches LiveKit WebRTC)
+                    # RoomIO._on_participant_disconnected will call _close_soon() → session closes
+                    ctx = self._session_contexts.get(session_id)
+                    if ctx and ctx._room:
+                        remote = ctx._room._remote
+                        remote.disconnect_reason = 1  # CLIENT_INITIATED
+                        ctx._room.emit("participant_disconnected", remote)
 
-                if session_id in self._session_ended_events:
-                    self._session_ended_events[session_id].set()
+                    if session_id in self._session_ended_events:
+                        self._session_ended_events[session_id].set()
 
-            elif ev_type == "dtmf_received":
-                # Route DTMF to both ctx listeners AND Room facade
-                session_id = ev.get("session_id", -1)
-                digit = ev.get("digit", "")
-                logger.debug("DTMF '%s' on session %s", digit, session_id)
-                ctx = self._session_contexts.get(session_id)
-                if ctx:
-                    # Emit on ctx for simple ctx.on("dtmf_received") pattern
-                    ctx._emit("dtmf_received", digit)
-                    # Emit on Room facade for LiveKit GetDtmfTask compatibility
-                    # room.on("sip_dtmf_received", handler) receives SipDTMF(code, digit, participant)
-                    if ctx._room:
-                        dtmf_ev = SipDTMF(code=ord(digit) if digit else 0, digit=digit,
-                                          participant=ctx._room._remote)
-                        ctx._room.emit("sip_dtmf_received", dtmf_ev)
+                elif ev_type == "dtmf_received":
+                    # Route DTMF to both ctx listeners AND Room facade
+                    session_id = ev.get("session_id", -1)
+                    digit = ev.get("digit", "")
+                    logger.debug("DTMF '%s' on session %s", digit, session_id)
+                    ctx = self._session_contexts.get(session_id)
+                    if ctx:
+                        # Emit on ctx for simple ctx.on("dtmf_received") pattern
+                        ctx._emit("dtmf_received", digit)
+                        # Emit on Room facade for LiveKit GetDtmfTask compatibility
+                        # room.on("sip_dtmf_received", handler) receives SipDTMF(code, digit, participant)
+                        if ctx._room:
+                            dtmf_ev = SipDTMF(code=ord(digit) if digit else 0, digit=digit,
+                                              participant=ctx._room._remote)
+                            ctx._room.emit("sip_dtmf_received", dtmf_ev)
 
-            elif ev_type == "beep_detected":
-                session_id = ev.get("session_id", "")
-                freq = ev.get("frequency_hz", 0.0)
-                dur = ev.get("duration_ms", 0)
-                logger.info("Beep detected on session %s (freq=%.0fHz, dur=%dms)", session_id, freq, dur)
-                ctx = self._session_contexts.get(session_id)
-                if ctx:
-                    ctx._emit("beep_detected", freq, dur)
-                    if ctx._room:
-                        ctx._room.emit("beep_detected", {"frequency_hz": freq, "duration_ms": dur})
+                elif ev_type == "beep_detected":
+                    session_id = ev.get("session_id", "")
+                    freq = ev.get("frequency_hz", 0.0)
+                    dur = ev.get("duration_ms", 0)
+                    logger.info("Beep detected on session %s (freq=%.0fHz, dur=%dms)", session_id, freq, dur)
+                    ctx = self._session_contexts.get(session_id)
+                    if ctx:
+                        ctx._emit("beep_detected", freq, dur)
+                        if ctx._room:
+                            ctx._room.emit("beep_detected", {"frequency_hz": freq, "duration_ms": dur})
 
-            elif ev_type == "beep_timeout":
-                session_id = ev.get("session_id", "")
-                logger.debug("Beep timeout on session %s", session_id)
-                ctx = self._session_contexts.get(session_id)
-                if ctx:
-                    ctx._emit("beep_timeout")
-                    if ctx._room:
-                        ctx._room.emit("beep_timeout", {})
+                elif ev_type == "beep_timeout":
+                    session_id = ev.get("session_id", "")
+                    logger.debug("Beep timeout on session %s", session_id)
+                    ctx = self._session_contexts.get(session_id)
+                    if ctx:
+                        ctx._emit("beep_timeout")
+                        if ctx._room:
+                            ctx._room.emit("beep_timeout", {})
+            except Exception:
+                logger.exception("Error handling audio_stream event %r", ev.get("type") if isinstance(ev, dict) else ev)
 
     async def _start_session(self, session_id: str, plivo_call_uuid: str, stream_id: str, extra_headers: dict) -> None:
         session_ended = asyncio.Event()

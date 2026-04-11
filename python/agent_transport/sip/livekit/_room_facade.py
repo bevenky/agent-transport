@@ -118,13 +118,17 @@ class _TransportLocalParticipant:
         resamples to endpoint's pipeline rate, and forwards to ep.send_background_audio().
         Rust send loop mixes this with agent voice before encoding.
         """
+        sr = self._ep.input_sample_rate if self._ep is not None else 8000
         try:
-            sr = self._ep.input_sample_rate if self._ep is not None else 8000
             stream = rtc.AudioStream.from_track(
                 track=track, sample_rate=sr, num_channels=1)
-            logger.debug("Forwarding published track %s to background mixer", pub_sid)
-            frame_count = 0
+        except Exception:
+            logger.warning("Track forwarding: failed to create AudioStream for %s", pub_sid, exc_info=True)
+            return
 
+        logger.debug("Forwarding published track %s to background mixer", pub_sid)
+        frame_count = 0
+        try:
             async for event in stream:
                 frame = event.frame
                 frame_count += 1
@@ -142,12 +146,19 @@ class _TransportLocalParticipant:
                         )
                     except Exception:
                         break  # Session gone — forwarding task will be cancelled by _on_session_ended
-
-            await stream.aclose()
         except asyncio.CancelledError:
-            pass
+            raise
         except Exception:
-            logger.debug("Track forwarding ended for %s", pub_sid)
+            logger.debug("Track forwarding loop ended for %s", pub_sid, exc_info=True)
+        finally:
+            # Always close the native AudioStream on exit so the livekit-ffi
+            # reader task is released. Without this, an exception inside the
+            # send_background_audio path leaks a subscribed native reader that
+            # keeps accumulating frames until the process exits.
+            try:
+                await stream.aclose()
+            except Exception:
+                pass
 
     async def publish_transcription(self, transcription) -> None:
         pass  # Transcription goes through AudioOutput text chain
@@ -340,11 +351,16 @@ class TransportRoom(EventEmitter):
         the room fires participant_disconnected and RoomIO handles it).
         """
         self._connected = False
-        # Cancel background audio forwarding tasks (matches LiveKit's track unpublish on disconnect)
-        for task in self._track_forward_tasks.values():
-            if not task.done():
-                task.cancel()
-        self._track_forward_tasks.clear()
+        # Cancel background audio forwarding tasks owned by the local participant
+        # (matches LiveKit's track unpublish on disconnect). The tasks dict lives
+        # on the participant, not the room.
+        lp = self._local_participant
+        tasks = getattr(lp, "_track_forward_tasks", None)
+        if tasks:
+            for task in tasks.values():
+                if not task.done():
+                    task.cancel()
+            tasks.clear()
         # Stop Rust recording if active
         ep = self._ep
         session_id = self._sid

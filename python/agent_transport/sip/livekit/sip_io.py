@@ -123,7 +123,13 @@ class SipAudioInput(AudioInput):
                 if result is not None and self._attached:
                     ab, sr, nc = result
                     frame = _to_livekit_frame(bytes(ab), sr, nc)
-                    await self._data_ch.send(frame)
+                    try:
+                        await self._data_ch.send(frame)
+                    except Exception:
+                        # Chan closed mid-loop (aclose/session teardown).
+                        # Break so the finally-block silence push still runs.
+                        logger.debug("sip_io forward: data_ch send failed, exiting")
+                        break
                     frame_count += 1
                     if frame_count == 1:
                         logger.info("SipAudioInput: first frame received sr=%d samples=%d", sr, frame.samples_per_channel)
@@ -305,24 +311,24 @@ class SipAudioOutput(AudioOutput):
         super().pause()
         self._playback_enabled.clear()
         if not self._rust_paused:
-            self._rust_paused = True
             try:
                 self._ep.pause(self._cid)
+                self._rust_paused = True
                 logger.debug("SipAudioOutput.pause: Rust paused")
             except Exception:
-                pass
+                logger.warning("SipAudioOutput.pause failed for call %s", self._cid, exc_info=True)
 
     def resume(self) -> None:
         super().resume()
         self._playback_enabled.set()
         self._first_frame_event.clear()
         if self._rust_paused:
-            self._rust_paused = False
             try:
                 self._ep.resume(self._cid)
+                self._rust_paused = False
                 logger.debug("SipAudioOutput.resume: Rust resumed")
             except Exception:
-                pass
+                logger.warning("SipAudioOutput.resume failed for call %s", self._cid, exc_info=True)
 
     # -- _wait_for_playout: matches _ParticipantAudioOutput._wait_for_playout --
 
