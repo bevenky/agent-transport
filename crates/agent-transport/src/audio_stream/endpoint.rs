@@ -23,6 +23,7 @@ use crate::audio::AudioFrame;
 use crate::error::{EndpointError, Result};
 use crate::events::EndpointEvent;
 use crate::sip::audio_buffer::{AudioBuffer, CompletionCallback};
+use crate::sync::LockExt;
 use super::config::AudioStreamConfig;
 use super::protocol::{StreamEvent, StreamProtocol, WireEncoding};
 
@@ -43,7 +44,6 @@ struct StreamSession {
     encoding: WireEncoding,
     muted: Arc<AtomicBool>,
     paused: Arc<AtomicBool>,
-    playout_notify: Arc<(Mutex<bool>, Condvar)>,
     checkpoint_counter: AtomicU64,
     checkpoint_notify: Arc<(Mutex<Option<String>>, Condvar)>,
     send_loop_notify: Arc<tokio::sync::Notify>,
@@ -104,15 +104,22 @@ impl AudioStreamEndpoint {
 
     pub fn send_audio_with_callback(&self, session_id: &str, frame: &AudioFrame, on_complete: CompletionCallback) -> Result<()> {
         let (audio_buf, resampler) = {
-            let s = self.sessions.lock().unwrap();
+            let s = self.sessions.lock_or_recover();
             let sess = s.get(session_id).ok_or_else(|| EndpointError::CallNotActive(session_id.to_string()))?;
             (sess.audio_buf.clone(), sess.input_resampler.clone())
         };
         let target_rate = self.config.output_sample_rate;
         if frame.sample_rate != 0 && frame.sample_rate != target_rate {
-            // Resample incoming audio (e.g. 24kHz TTS → 8kHz wire rate)
-            let mut guard = resampler.lock().unwrap();
-            if guard.is_none() {
+            // Resample incoming audio (e.g. 24kHz TTS → 8kHz wire rate).
+            // Recreate the resampler if the source sample rate has changed
+            // (e.g. TTS switched from 24kHz to 16kHz) — otherwise speex filter
+            // state from the old rate produces corrupted output.
+            let mut guard = resampler.lock_or_recover();
+            let needs_new = match guard.as_ref() {
+                None => true,
+                Some(r) => r.from_rate() != frame.sample_rate,
+            };
+            if needs_new {
                 info!("send_audio: resampling {}Hz -> {}Hz", frame.sample_rate, target_rate);
                 *guard = crate::sip::resampler::Resampler::new_voip(frame.sample_rate, target_rate);
             }
@@ -136,7 +143,7 @@ impl AudioStreamEndpoint {
 
     pub fn send_background_audio(&self, session_id: &str, frame: &AudioFrame) -> Result<()> {
         let bg_buf = {
-            let s = self.sessions.lock().unwrap();
+            let s = self.sessions.lock_or_recover();
             let sess = s.get(session_id).ok_or_else(|| EndpointError::CallNotActive(session_id.to_string()))?;
             sess.bg_audio_buf.clone()
         };
@@ -145,14 +152,14 @@ impl AudioStreamEndpoint {
     }
 
     pub fn recv_audio(&self, session_id: &str) -> Result<Option<AudioFrame>> {
-        let s = self.sessions.lock().unwrap();
+        let s = self.sessions.lock_or_recover();
         let sess = s.get(session_id).ok_or_else(|| EndpointError::CallNotActive(session_id.to_string()))?;
         Ok(sess.incoming_rx.try_recv().ok())
     }
 
     pub fn recv_audio_blocking(&self, session_id: &str, timeout_ms: u64) -> Result<Option<AudioFrame>> {
         let rx = {
-            let s = self.sessions.lock().unwrap();
+            let s = self.sessions.lock_or_recover();
             s.get(session_id).ok_or_else(|| EndpointError::CallNotActive(session_id.to_string()))?.incoming_rx.clone()
         };
         Ok(rx.recv_timeout(std::time::Duration::from_millis(timeout_ms)).ok())
@@ -161,21 +168,21 @@ impl AudioStreamEndpoint {
     // ─── Playback control ────────────────────────────────────────────────
 
     pub fn mute(&self, session_id: &str) -> Result<()> {
-        let s = self.sessions.lock().unwrap();
+        let s = self.sessions.lock_or_recover();
         let sess = s.get(session_id).ok_or_else(|| EndpointError::CallNotActive(session_id.to_string()))?;
-        sess.muted.store(true, Ordering::Relaxed); Ok(())
+        sess.muted.store(true, Ordering::Release); Ok(())
     }
 
     pub fn unmute(&self, session_id: &str) -> Result<()> {
-        let s = self.sessions.lock().unwrap();
+        let s = self.sessions.lock_or_recover();
         let sess = s.get(session_id).ok_or_else(|| EndpointError::CallNotActive(session_id.to_string()))?;
-        sess.muted.store(false, Ordering::Relaxed); Ok(())
+        sess.muted.store(false, Ordering::Release); Ok(())
     }
 
     pub fn pause(&self, session_id: &str) -> Result<()> {
-        let s = self.sessions.lock().unwrap();
+        let s = self.sessions.lock_or_recover();
         let sess = s.get(session_id).ok_or_else(|| EndpointError::CallNotActive(session_id.to_string()))?;
-        sess.paused.store(true, Ordering::Relaxed);
+        sess.paused.store(true, Ordering::Release);
         // Send clearAudio to immediately stop playback on Plivo's side.
         // Plivo doesn't support muteStream — clearAudio is the only way to stop playback.
         // The Rust AudioBuffer retains queued audio for resume (send loop skips drain while paused).
@@ -186,9 +193,9 @@ impl AudioStreamEndpoint {
     }
 
     pub fn resume(&self, session_id: &str) -> Result<()> {
-        let s = self.sessions.lock().unwrap();
+        let s = self.sessions.lock_or_recover();
         let sess = s.get(session_id).ok_or_else(|| EndpointError::CallNotActive(session_id.to_string()))?;
-        sess.paused.store(false, Ordering::Relaxed);
+        sess.paused.store(false, Ordering::Release);
         // No unmute needed — send loop will resume sending audio from the Rust buffer.
         debug!("Resumed session {}", session_id);
         Ok(())
@@ -199,23 +206,23 @@ impl AudioStreamEndpoint {
     /// Clear buffered audio — drains local AudioBuffer AND sends clear command to provider.
     /// Any audio already in the WS send queue will be overridden by the provider's clear.
     pub fn clear_buffer(&self, session_id: &str) -> Result<()> {
-        let s = self.sessions.lock().unwrap();
+        let s = self.sessions.lock_or_recover();
         let sess = s.get(session_id).ok_or_else(|| EndpointError::CallNotActive(session_id.to_string()))?;
         sess.audio_buf.clear();
         // Reset resampler to prevent stale filter artifacts on next speech
-        *sess.input_resampler.lock().unwrap() = None;
+        *sess.input_resampler.lock_or_recover() = None;
         // Cancel any pending flush checkpoint — interrupt overrides playout
-        *sess.pending_flush.lock().unwrap() = None;
+        *sess.pending_flush.lock_or_recover() = None;
         // Clear awaiting_checkpoint so late Plivo confirmations are ignored
-        *sess.awaiting_checkpoint.lock().unwrap() = None;
+        *sess.awaiting_checkpoint.lock_or_recover() = None;
         // Wake any blocked wait_for_playout so executor thread returns immediately
         {
             let (lock, cvar) = &*sess.checkpoint_notify;
-            *lock.lock().unwrap() = Some("_cleared".into());
+            *lock.lock_or_recover() = Some("_cleared".into());
             cvar.notify_all();
         }
         // Only send clearAudio if not already paused (pause already sent clearAudio)
-        if !sess.paused.load(Ordering::Relaxed) {
+        if !sess.paused.load(Ordering::Acquire) {
             let json = self.protocol.build_clear_audio(&sess.stream_id);
             sess.ws_tx.send(Message::Text(json)).map_err(|_| EndpointError::Other("WS send failed".into()))?;
         }
@@ -223,7 +230,7 @@ impl AudioStreamEndpoint {
     }
 
     pub fn checkpoint(&self, session_id: &str, name: Option<&str>) -> Result<String> {
-        let s = self.sessions.lock().unwrap();
+        let s = self.sessions.lock_or_recover();
         let sess = s.get(session_id).ok_or_else(|| EndpointError::CallNotActive(session_id.to_string()))?;
         let cp_name = name.map(String::from).unwrap_or_else(|| {
             format!("cp-{}", sess.checkpoint_counter.fetch_add(1, Ordering::Relaxed))
@@ -238,31 +245,44 @@ impl AudioStreamEndpoint {
     /// This ensures the checkpoint is ordered AFTER all playAudio messages,
     /// so Plivo's playedStream confirms when ALL audio has actually been played.
     pub fn flush(&self, session_id: &str) -> Result<()> {
-        let s = self.sessions.lock().unwrap();
+        let s = self.sessions.lock_or_recover();
         let sess = s.get(session_id).ok_or_else(|| EndpointError::CallNotActive(session_id.to_string()))?;
         let cp_name = format!("cp-{}", sess.checkpoint_counter.fetch_add(1, Ordering::Relaxed));
-        *sess.pending_flush.lock().unwrap() = Some(cp_name.clone());
+        *sess.pending_flush.lock_or_recover() = Some(cp_name.clone());
         debug!("Flush: checkpoint '{}' queued for session {} (send loop will send after drain)", cp_name, session_id);
         Ok(())
     }
 
     pub fn wait_for_playout(&self, session_id: &str, timeout_ms: u64) -> Result<bool> {
         let notify = {
-            let s = self.sessions.lock().unwrap();
+            let s = self.sessions.lock_or_recover();
             let sess = s.get(session_id).ok_or_else(|| EndpointError::CallNotActive(session_id.to_string()))?;
             sess.checkpoint_notify.clone()
         };
         let (lock, cvar) = &*notify;
-        let mut guard = lock.lock().unwrap();
-        let (ref mut guard, timeout) = cvar.wait_timeout_while(guard, std::time::Duration::from_millis(timeout_ms), |cp| cp.is_none()).unwrap();
-        **guard = None;
+        let guard = lock.lock_or_recover();
+        // wait_timeout_while returns PoisonError if the mutex becomes poisoned
+        // mid-wait — recover the guard the same way lock_or_recover does so one
+        // panicking task can't hang every subsequent wait_for_playout caller.
+        let (mut guard, timeout) = match cvar.wait_timeout_while(
+            guard,
+            std::time::Duration::from_millis(timeout_ms),
+            |cp| cp.is_none(),
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                warn!("wait_for_playout: checkpoint_notify poisoned, recovering");
+                e.into_inner()
+            }
+        };
+        *guard = None;
         Ok(!timeout.timed_out())
     }
 
     // ─── DTMF ────────────────────────────────────────────────────────────
 
     pub fn send_dtmf(&self, session_id: &str, digits: &str) -> Result<()> {
-        let s = self.sessions.lock().unwrap();
+        let s = self.sessions.lock_or_recover();
         let sess = s.get(session_id).ok_or_else(|| EndpointError::CallNotActive(session_id.to_string()))?;
         let json = self.protocol.build_send_dtmf(digits);
         sess.ws_tx.send(Message::Text(json)).map_err(|_| EndpointError::Other("WS send failed".into()))?;
@@ -276,17 +296,17 @@ impl AudioStreamEndpoint {
         let mode = if stereo { crate::recorder::RecordingMode::Stereo } else { crate::recorder::RecordingMode::Mono };
         let sample_rate = self.config.output_sample_rate;
         let rec = self.recording_mgr.start(session_id, path, mode, sample_rate);
-        let s = self.sessions.lock().unwrap();
+        let s = self.sessions.lock_or_recover();
         if let Some(sess) = s.get(session_id) {
-            *sess.recorder.lock().unwrap() = Some(rec);
+            *sess.recorder.lock_or_recover() = Some(rec);
         }
         Ok(())
     }
 
     pub fn stop_recording(&self, session_id: &str) -> Result<()> {
         self.recording_mgr.stop(session_id);
-        if let Some(sess) = self.sessions.lock().unwrap().get(session_id) {
-            *sess.recorder.lock().unwrap() = None;
+        if let Some(sess) = self.sessions.lock_or_recover().get(session_id) {
+            *sess.recorder.lock_or_recover() = None;
         }
         Ok(())
     }
@@ -294,16 +314,16 @@ impl AudioStreamEndpoint {
     // ─── Beep detection ──────────────────────────────────────────────────
 
     pub fn detect_beep(&self, session_id: &str, config: BeepDetectorConfig) -> Result<()> {
-        let s = self.sessions.lock().unwrap();
+        let s = self.sessions.lock_or_recover();
         let sess = s.get(session_id).ok_or_else(|| EndpointError::CallNotActive(session_id.to_string()))?;
-        *sess.beep_detector.lock().unwrap() = Some(BeepDetector::new(config));
+        *sess.beep_detector.lock_or_recover() = Some(BeepDetector::new(config));
         Ok(())
     }
 
     pub fn cancel_beep_detection(&self, session_id: &str) -> Result<()> {
-        let s = self.sessions.lock().unwrap();
+        let s = self.sessions.lock_or_recover();
         let sess = s.get(session_id).ok_or_else(|| EndpointError::CallNotActive(session_id.to_string()))?;
-        *sess.beep_detector.lock().unwrap() = None;
+        *sess.beep_detector.lock_or_recover() = None;
         Ok(())
     }
 
@@ -311,7 +331,7 @@ impl AudioStreamEndpoint {
 
     pub fn hangup(&self, session_id: &str) -> Result<()> {
         let call_id = {
-            let sess = self.sessions.lock().unwrap().remove(session_id);
+            let sess = self.sessions.lock_or_recover().remove(session_id);
             match sess { Some(s) => { cleanup_session(session_id, &s, &self.recording_mgr); s.call_id.clone() }, None => return Ok(()) }
         };
         self.protocol.hangup(&call_id, &self.runtime);
@@ -319,7 +339,7 @@ impl AudioStreamEndpoint {
     }
 
     pub fn send_raw_message(&self, session_id: &str, message: &str) -> Result<()> {
-        let s = self.sessions.lock().unwrap();
+        let s = self.sessions.lock_or_recover();
         let sess = s.get(session_id).ok_or_else(|| EndpointError::CallNotActive(session_id.to_string()))?;
         sess.ws_tx.send(Message::Text(message.to_string())).map_err(|_| EndpointError::Other("WS send failed".into()))
     }
@@ -327,33 +347,33 @@ impl AudioStreamEndpoint {
     // ─── Accessors ───────────────────────────────────────────────────────
 
     pub fn incoming_rx(&self, session_id: &str) -> Result<Receiver<AudioFrame>> {
-        let s = self.sessions.lock().unwrap();
+        let s = self.sessions.lock_or_recover();
         let sess = s.get(session_id).ok_or_else(|| EndpointError::CallNotActive(session_id.to_string()))?;
         Ok(sess.incoming_rx.clone())
     }
 
     pub fn checkpoint_notify(&self, session_id: &str) -> Result<Arc<(Mutex<Option<String>>, Condvar)>> {
-        let s = self.sessions.lock().unwrap();
+        let s = self.sessions.lock_or_recover();
         let sess = s.get(session_id).ok_or_else(|| EndpointError::CallNotActive(session_id.to_string()))?;
         Ok(sess.checkpoint_notify.clone())
     }
 
     pub fn queued_frames(&self, session_id: &str) -> Result<usize> {
         let spf = (self.config.output_sample_rate * 20 / 1000) as usize;
-        let s = self.sessions.lock().unwrap();
+        let s = self.sessions.lock_or_recover();
         let sess = s.get(session_id).ok_or_else(|| EndpointError::CallNotActive(session_id.to_string()))?;
         Ok(sess.audio_buf.len() / spf)
     }
 
     pub fn queued_duration_ms(&self, session_id: &str) -> Result<f64> {
-        let s = self.sessions.lock().unwrap();
+        let s = self.sessions.lock_or_recover();
         let sess = s.get(session_id).ok_or_else(|| EndpointError::CallNotActive(session_id.to_string()))?;
         Ok(sess.audio_buf.queued_duration_ms(self.config.output_sample_rate))
     }
 
     pub fn wait_for_playout_notify(&self, session_id: &str, on_complete: crate::sip::audio_buffer::CompletionCallback) -> Result<()> {
         let audio_buf = {
-            let s = self.sessions.lock().unwrap();
+            let s = self.sessions.lock_or_recover();
             let sess = s.get(session_id).ok_or_else(|| EndpointError::CallNotActive(session_id.to_string()))?;
             sess.audio_buf.clone()
         };
@@ -369,7 +389,7 @@ impl AudioStreamEndpoint {
         if self.cancel.is_cancelled() { return Ok(()); }
         self.cancel.cancel();
         if self.config.auto_hangup {
-            let ids: Vec<String> = self.sessions.lock().unwrap().keys().cloned().collect();
+            let ids: Vec<String> = self.sessions.lock_or_recover().keys().cloned().collect();
             for id in ids { let _ = self.hangup(&id); }
         }
         info!("Audio streaming shut down");
@@ -493,7 +513,6 @@ async fn handle_ws(
                         let bg_audio_buf = Arc::new(AudioBuffer::with_queue_size(200, output_sample_rate));
                         let muted = Arc::new(AtomicBool::new(false));
                         let paused = Arc::new(AtomicBool::new(false));
-                        let playout_notify = Arc::new((Mutex::new(false), Condvar::new()));
                         let cp_notify = Arc::new((Mutex::new(None), Condvar::new()));
                         let send_loop_notify = Arc::new(tokio::sync::Notify::new());
                         let session_recorder: Arc<Mutex<Option<Arc<crate::recorder::CallRecorder>>>> = Arc::new(Mutex::new(None));
@@ -507,7 +526,7 @@ async fn handle_ws(
                         let ab = audio_buf.clone();
                         let bg = bg_audio_buf.clone();
                         let rec_send = session_recorder.clone();
-                        let (m, p, pn) = (muted.clone(), paused.clone(), playout_notify.clone());
+                        let (m, p) = (muted.clone(), paused.clone());
                         let pf = pending_flush.clone();
                         let aw = awaiting_checkpoint.clone();
                         let sc = session_cancel.clone();
@@ -524,6 +543,21 @@ async fn handle_ws(
                             let mut interval = tokio::time::interval(Duration::from_millis(20));
                             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+                            // H3: exit the loop the first time a WS send fails.
+                            // If the writer task has died (sink closed, peer RST),
+                            // continuing to enqueue would accumulate an unbounded
+                            // backlog in the MPSC channel for the rest of the
+                            // session. Breaking stops the leak and lets cleanup_session
+                            // finish the session cleanly.
+                            macro_rules! ws_send_or_break {
+                                ($msg:expr) => {
+                                    if wstx.send($msg).is_err() {
+                                        debug!("Send loop: ws_tx closed, exiting");
+                                        break;
+                                    }
+                                };
+                            }
+
                             loop {
                                 tokio::select! {
                                     _ = sc.cancelled() => break,
@@ -532,20 +566,35 @@ async fn handle_ws(
 
                                 // Drain background audio regardless of pause state
                                 let bg_samples = bg.drain(chunk_spf);
+                                // M1: Acquire load so we see all prior Release writes
+                                // to the control flags before processing this tick.
+                                let muted = m.load(Ordering::Acquire);
 
-                                if p.load(Ordering::Relaxed) {
-                                    // Paused: send background audio only (no agent voice)
-                                    if !bg_samples.is_empty() {
+                                if p.load(Ordering::Acquire) {
+                                    // Paused: send background audio only (no agent voice).
+                                    // Record what the caller hears — bg audio (or silence if muted/no bg).
+                                    let audible_bg = !bg_samples.is_empty() && !muted;
+                                    if audible_bg {
                                         let encoded = send_enc.encode(&bg_samples, &mut resampler);
                                         let play_msg = send_proto.build_play_audio(&encoded, send_enc, &stream_id_for_loop);
-                                        let _ = wstx.send(Message::Text(play_msg));
+                                        ws_send_or_break!(Message::Text(play_msg));
+                                    }
+                                    {
+                                        let guard = rec_send.lock_or_recover();
+                                        if let Some(ref rec) = *guard {
+                                            if audible_bg {
+                                                rec.write_agent_samples(&bg_samples);
+                                            } else {
+                                                rec.write_agent_samples(&vec![0i16; chunk_spf]);
+                                            }
+                                        }
                                     }
                                     // If agent buffer already drained before pause, send pending checkpoint
                                     if ab.is_empty() {
-                                        if let Some(cp_name) = pf.lock().unwrap().take() {
-                                            *aw.lock().unwrap() = Some(cp_name.clone());
+                                        if let Some(cp_name) = pf.lock_or_recover().take() {
+                                            *aw.lock_or_recover() = Some(cp_name.clone());
                                             let cp_msg = send_proto.build_checkpoint(&stream_id_for_loop, &cp_name);
-                                            let _ = wstx.send(Message::Text(cp_msg));
+                                            ws_send_or_break!(Message::Text(cp_msg));
                                             debug!("Send loop: flush checkpoint '{}' sent (paused, buffer empty)", cp_name);
                                         }
                                     }
@@ -553,64 +602,56 @@ async fn handle_ws(
                                 }
 
                                 let voice = ab.drain(chunk_spf);
-
                                 let has_voice = !voice.is_empty();
                                 let has_bg = !bg_samples.is_empty();
 
-                                // Record agent audio — always write to keep in sync with user channel
-                                if let Ok(guard) = rec_send.lock() {
+                                // Mix voice + bg once — used for both sending and recording.
+                                let mixed: Vec<i16> = if has_voice && has_bg {
+                                    let len = voice.len().max(bg_samples.len());
+                                    let mut out = Vec::with_capacity(len);
+                                    for i in 0..len {
+                                        let v = if i < voice.len() { voice[i] as i32 } else { 0 };
+                                        let b = if i < bg_samples.len() { bg_samples[i] as i32 } else { 0 };
+                                        out.push((v + b).clamp(-32768, 32767) as i16);
+                                    }
+                                    out
+                                } else if has_voice {
+                                    voice
+                                } else {
+                                    bg_samples
+                                };
+
+                                // Send to Plivo (skipped when muted — caller hears nothing).
+                                let audible = !mixed.is_empty() && !muted;
+                                if audible {
+                                    let encoded = send_enc.encode(&mixed, &mut resampler);
+                                    let play_msg = send_proto.build_play_audio(&encoded, send_enc, &stream_id_for_loop);
+                                    ws_send_or_break!(Message::Text(play_msg));
+                                }
+
+                                // Record what the caller actually hears — muted = silence.
+                                {
+                                    let guard = rec_send.lock_or_recover();
                                     if let Some(ref rec) = *guard {
-                                        if has_voice || has_bg {
-                                            let mixed_for_rec = if has_voice && has_bg {
-                                                let len = voice.len().max(bg_samples.len());
-                                                let mut out = Vec::with_capacity(len);
-                                                for i in 0..len {
-                                                    let v = if i < voice.len() { voice[i] as i32 } else { 0 };
-                                                    let b = if i < bg_samples.len() { bg_samples[i] as i32 } else { 0 };
-                                                    out.push((v + b).clamp(-32768, 32767) as i16);
-                                                }
-                                                out
-                                            } else if has_voice { voice.clone() } else { bg_samples.clone() };
-                                            rec.write_agent_samples(&mixed_for_rec);
+                                        if audible {
+                                            rec.write_agent_samples(&mixed);
                                         } else {
                                             rec.write_agent_samples(&vec![0i16; chunk_spf]);
                                         }
                                     }
                                 }
 
-                                if has_voice || has_bg {
-                                    let mixed = if has_voice && has_bg {
-                                        let len = voice.len().max(bg_samples.len());
-                                        let mut out = Vec::with_capacity(len);
-                                        for i in 0..len {
-                                            let v = if i < voice.len() { voice[i] as i32 } else { 0 };
-                                            let b = if i < bg_samples.len() { bg_samples[i] as i32 } else { 0 };
-                                            out.push((v + b).clamp(-32768, 32767) as i16);
-                                        }
-                                        out
-                                    } else if has_voice {
-                                        voice
-                                    } else {
-                                        bg_samples
-                                    };
-
-                                    if !m.load(Ordering::Relaxed) {
-                                        let encoded = send_enc.encode(&mixed, &mut resampler);
-                                        let play_msg = send_proto.build_play_audio(&encoded, send_enc, &stream_id_for_loop);
-                                        let _ = wstx.send(Message::Text(play_msg));
-                                    }
-                                } else {
-                                    // Buffer empty — send queued flush checkpoint if any.
-                                    // This guarantees checkpoint is AFTER all playAudio messages,
-                                    // so Plivo's playedStream confirms actual playout completion.
-                                    if let Some(cp_name) = pf.lock().unwrap().take() {
-                                        *aw.lock().unwrap() = Some(cp_name.clone());
+                                // After draining voice: if voice buffer is now empty, send the queued
+                                // flush checkpoint. This is independent of background audio — the
+                                // checkpoint tracks voice playout completion only.
+                                // Checkpoint is ordered AFTER the last playAudio message, so Plivo's
+                                // playedStream confirms that all voice audio has actually been played.
+                                if ab.is_empty() {
+                                    if let Some(cp_name) = pf.lock_or_recover().take() {
+                                        *aw.lock_or_recover() = Some(cp_name.clone());
                                         let cp_msg = send_proto.build_checkpoint(&stream_id_for_loop, &cp_name);
-                                        let _ = wstx.send(Message::Text(cp_msg));
+                                        ws_send_or_break!(Message::Text(cp_msg));
                                         debug!("Send loop: flush checkpoint '{}' sent (buffer drained)", cp_name);
-                                    }
-                                    if ab.is_empty() {
-                                        if let Ok(mut d) = pn.0.lock() { *d = true; pn.1.notify_all(); }
                                     }
                                 }
                             }
@@ -619,13 +660,13 @@ async fn handle_ws(
                         media_recorder = Some(session_recorder.clone());
                         media_beep_det = Some(session_beep_detector.clone());
 
-                        sessions.lock().unwrap().insert(sid.clone(), StreamSession {
+                        sessions.lock_or_recover().insert(sid.clone(), StreamSession {
                             call_id: call_id.clone(), stream_id: stream_id.clone(),
                             ws_tx: ws_tx.clone(), incoming_tx: itx.clone(), incoming_rx: irx.clone(),
                             audio_buf, bg_audio_buf,
                             input_resampler: Arc::new(Mutex::new(None)),
                             extra_headers: headers.clone(), encoding,
-                            muted, paused, playout_notify,
+                            muted, paused,
                             checkpoint_counter: AtomicU64::new(0), checkpoint_notify: cp_notify,
                             send_loop_notify, pending_flush, awaiting_checkpoint,
                             recorder: session_recorder,
@@ -699,18 +740,18 @@ async fn handle_ws(
 
                     StreamEvent::CheckpointAck { name } => {
                         debug!("Checkpoint '{}' confirmed on session {}", name, sid);
-                        if let Some(sess) = sessions.lock().unwrap().get(sid.as_str()) {
+                        if let Some(sess) = sessions.lock_or_recover().get(sid.as_str()) {
                             // Only accept if this matches the checkpoint we're waiting for.
                             // Prevents stale confirmations (from cancelled flushes) from
                             // polluting the condvar for the next flush cycle.
-                            let matches = sess.awaiting_checkpoint.lock().unwrap()
+                            let matches = sess.awaiting_checkpoint.lock_or_recover()
                                 .as_ref()
                                 .map(|expected| *expected == name)
                                 .unwrap_or(false);
                             if matches {
-                                *sess.awaiting_checkpoint.lock().unwrap() = None;
+                                *sess.awaiting_checkpoint.lock_or_recover() = None;
                                 let (lock, cvar) = &*sess.checkpoint_notify;
-                                *lock.lock().unwrap() = Some(name);
+                                *lock.lock_or_recover() = Some(name);
                                 cvar.notify_all();
                             } else {
                                 debug!("Ignoring stale checkpoint '{}' on session {} (not awaiting)", name, sid);
@@ -725,14 +766,14 @@ async fn handle_ws(
                     StreamEvent::PlayFailed { reason } => {
                         warn!("Playback failed on session {}: {}", sid, reason);
                         // Clear stale audio to prevent accumulation after failure
-                        if let Some(sess) = sessions.lock().unwrap().get(&sid) {
+                        if let Some(sess) = sessions.lock_or_recover().get(&sid) {
                             sess.audio_buf.clear();
                         }
                     }
 
                     StreamEvent::StreamError { reason } => {
                         warn!("Stream error on session {}: {}", sid, reason);
-                        if let Some(sess) = sessions.lock().unwrap().remove(&sid) {
+                        if let Some(sess) = sessions.lock_or_recover().remove(&sid) {
                             cleanup_session(&sid, &sess, &recording_mgr);
                             let session = crate::sip::call::CallSession::new(sid.clone(), crate::sip::call::CallDirection::Inbound);
                             let _ = etx.try_send(EndpointEvent::CallTerminated { session, reason: format!("stream error: {}", reason) });
@@ -742,21 +783,21 @@ async fn handle_ws(
 
                     StreamEvent::MuteStream => {
                         info!("Session {} muted by provider", sid);
-                        if let Some(sess) = sessions.lock().unwrap().get(&sid) {
-                            sess.muted.store(true, std::sync::atomic::Ordering::Relaxed);
+                        if let Some(sess) = sessions.lock_or_recover().get(&sid) {
+                            sess.muted.store(true, std::sync::atomic::Ordering::Release);
                         }
                     }
 
                     StreamEvent::UnmuteStream => {
                         info!("Session {} unmuted by provider", sid);
-                        if let Some(sess) = sessions.lock().unwrap().get(&sid) {
-                            sess.muted.store(false, std::sync::atomic::Ordering::Relaxed);
+                        if let Some(sess) = sessions.lock_or_recover().get(&sid) {
+                            sess.muted.store(false, std::sync::atomic::Ordering::Release);
                         }
                     }
 
                     StreamEvent::Stop => {
                         info!("Session {} stopped", sid);
-                        if let Some(sess) = sessions.lock().unwrap().remove(&sid) {
+                        if let Some(sess) = sessions.lock_or_recover().remove(&sid) {
                             cleanup_session(&sid, &sess, &recording_mgr);
                             let session = crate::sip::call::CallSession::new(sid.clone(), crate::sip::call::CallDirection::Inbound);
                             let _ = etx.try_send(EndpointEvent::CallTerminated { session, reason: "stream stopped".into() });
@@ -769,7 +810,7 @@ async fn handle_ws(
     }
 
     // Cleanup on WS disconnect
-    if let Some(sess) = sessions.lock().unwrap().remove(&sid) {
+    if let Some(sess) = sessions.lock_or_recover().remove(&sid) {
         cleanup_session(&sid, &sess, &recording_mgr);
         let session = crate::sip::call::CallSession::new(sid.clone(), crate::sip::call::CallDirection::Inbound);
         let _ = etx.try_send(EndpointEvent::CallTerminated { session, reason: "ws disconnected".into() });
@@ -778,12 +819,25 @@ async fn handle_ws(
 }
 
 /// Clean up a session — cancel send loop and wake any blocked wait_for_playout.
+///
+/// H4: Before cancelling the send loop, clear any pending-flush checkpoint so the
+/// send loop doesn't exit with a queued-but-unsent checkpoint dangling. Any
+/// awaiting checkpoint is also cleared so the late `playedStream` confirmation
+/// from the provider (if it arrives after teardown) is ignored instead of
+/// resolving a stale waiter. Finally, wake any blocked `wait_for_playout`
+/// waiters with a sentinel so Python/Node executor threads return immediately.
 fn cleanup_session(session_id: &str, sess: &StreamSession, recording_mgr: &Arc<crate::recorder::RecordingManager>) {
+    // Clear pending_flush / awaiting_checkpoint so the send loop's drain
+    // path is a no-op on teardown and late provider confirms are dropped.
+    *sess.pending_flush.lock_or_recover() = None;
+    *sess.awaiting_checkpoint.lock_or_recover() = None;
+    // Clear the voice buffer so the send loop doesn't keep draining after cancel.
+    sess.audio_buf.clear();
     sess.cancel.cancel();
     // Stop recording — wakes encoder thread for immediate finalization
     recording_mgr.stop(session_id);
     // Wake blocked wait_for_playout so executor threads don't hang for 30s
     let (lock, cvar) = &*sess.checkpoint_notify;
-    *lock.lock().unwrap() = Some("_closed".into());
+    *lock.lock_or_recover() = Some("_closed".into());
     cvar.notify_all();
 }
