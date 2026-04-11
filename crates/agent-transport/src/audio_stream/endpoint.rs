@@ -392,6 +392,9 @@ impl AudioStreamEndpoint {
             let ids: Vec<String> = self.sessions.lock_or_recover().keys().cloned().collect();
             for id in ids { let _ = self.hangup(&id); }
         }
+        // Push a Shutdown sentinel so adapters blocked on wait_for_event
+        // wake immediately rather than waiting for the next poll timeout.
+        let _ = self.event_tx.try_send(EndpointEvent::Shutdown);
         info!("Audio streaming shut down");
         Ok(())
     }

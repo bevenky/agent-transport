@@ -46,6 +46,12 @@ pub enum EndpointEvent {
     BeepTimeout {
         call_id: String,
     },
+
+    /// Endpoint is shutting down. Pushed by `shutdown()` so any blocking
+    /// `wait_for_event` callers wake immediately instead of waiting for
+    /// the next poll timeout. Adapter event loops should treat this as a
+    /// signal to stop dispatching and exit cleanly.
+    Shutdown,
 }
 
 impl EndpointEvent {
@@ -62,6 +68,7 @@ impl EndpointEvent {
             EndpointEvent::DtmfReceived { .. } => "dtmf_received",
             EndpointEvent::BeepDetected { .. } => "beep_detected",
             EndpointEvent::BeepTimeout { .. } => "beep_timeout",
+            EndpointEvent::Shutdown => "shutdown",
         }
     }
 }

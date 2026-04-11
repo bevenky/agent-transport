@@ -172,16 +172,30 @@ fn spawn_dialog_watcher(
     st: Arc<Mutex<EndpointState>>,
     etx: Sender<EndpointEvent>,
     cc: CancellationToken,
+    global_cancel: CancellationToken,
 ) {
     tokio::spawn(async move {
-        while let Some(ds) = dr.recv().await {
-            if let DialogState::Terminated(_, reason) = ds {
-                let side = classify_termination(&reason, direction);
-                info!("Call {} terminated {}: {:?}", call_id, side, reason);
-                let sess = st.lock_or_recover().calls.remove(&call_id).map(|c| { c.cancel.cancel(); c.session });
-                if let Some(s) = sess { let _ = etx.try_send(EndpointEvent::CallTerminated { session: s, reason: format!("{:?}", reason) }); }
-                cc.cancel();
-                break;
+        loop {
+            tokio::select! {
+                _ = global_cancel.cancelled() => {
+                    debug!("Dialog watcher for {} exiting (global cancel)", call_id);
+                    break;
+                }
+                _ = cc.cancelled() => {
+                    debug!("Dialog watcher for {} exiting (per-call cancel)", call_id);
+                    break;
+                }
+                ds = dr.recv() => {
+                    let Some(ds) = ds else { break; };
+                    if let DialogState::Terminated(_, reason) = ds {
+                        let side = classify_termination(&reason, direction);
+                        info!("Call {} terminated {}: {:?}", call_id, side, reason);
+                        let sess = st.lock_or_recover().calls.remove(&call_id).map(|c| { c.cancel.cancel(); c.session });
+                        if let Some(s) = sess { let _ = etx.try_send(EndpointEvent::CallTerminated { session: s, reason: format!("{:?}", reason) }); }
+                        cc.cancel();
+                        break;
+                    }
+                }
             }
         }
     });
@@ -408,18 +422,33 @@ impl SipEndpoint {
             let cc2 = cc.clone();
             tokio::spawn(async move { tokio::select! { _ = ep.serve() => {}, _ = cc2.cancelled() => {} } });
 
-            // Incoming transaction handler
-            let (dl2, st2, etx3) = (dl.clone(), st.clone(), etx2.clone());
+            // Incoming transaction handler — must watch the cancel token
+            // explicitly. The `rx` receiver lives off `EndpointInner` which
+            // we hold via `dl` (Arc) inside EndpointState.dialog_layer, so the
+            // sender side is alive until SipEndpoint itself drops. Without
+            // the explicit `select!`, the task would only terminate when the
+            // tokio runtime is destroyed (forced kill of the parked task)
+            // instead of cooperating cleanly with shutdown().
+            let (dl2, st2, etx3, cc4) = (dl.clone(), st.clone(), etx2.clone(), cc.clone());
             let mut rx = rx;
             tokio::spawn(async move {
-                while let Some(mut tx) = rx.recv().await {
-                    if tx.original.method == rsip::Method::Invite {
-                        handle_incoming(&dl2, &st2, &etx3, tx, isr, osr).await;
-                    } else if let Some(dialog) = dl2.match_dialog(&tx) {
-                        match dialog {
-                            rsipstack::dialog::dialog::Dialog::ServerInvite(mut d) => { let _ = d.handle(&mut tx).await; }
-                            rsipstack::dialog::dialog::Dialog::ClientInvite(mut d) => { let _ = d.handle(&mut tx).await; }
-                            _ => {}
+                loop {
+                    tokio::select! {
+                        _ = cc4.cancelled() => {
+                            debug!("Incoming transaction handler exiting on cancel");
+                            break;
+                        }
+                        msg = rx.recv() => {
+                            let Some(mut tx) = msg else { break; };
+                            if tx.original.method == rsip::Method::Invite {
+                                handle_incoming(&dl2, &st2, &etx3, tx, cc4.clone(), isr, osr).await;
+                            } else if let Some(dialog) = dl2.match_dialog(&tx) {
+                                match dialog {
+                                    rsipstack::dialog::dialog::Dialog::ServerInvite(mut d) => { let _ = d.handle(&mut tx).await; }
+                                    rsipstack::dialog::dialog::Dialog::ClientInvite(mut d) => { let _ = d.handle(&mut tx).await; }
+                                    _ => {}
+                                }
+                            }
                         }
                     }
                 }
@@ -546,7 +575,7 @@ impl SipEndpoint {
     /// Make an outbound call with an optional From URI.
     /// If `from_uri` is None, uses the AOR (sip:user@domain) from registration.
     pub fn call_with_from(&self, dest_uri: &str, from_uri: Option<&str>, headers: Option<HashMap<String, String>>, external_call_id: Option<String>) -> Result<String> {
-        let (dest, cfg, st, etx) = (dest_uri.to_string(), self.config.clone(), self.state.clone(), self.event_tx.clone());
+        let (dest, cfg, st, etx, global_cancel) = (dest_uri.to_string(), self.config.clone(), self.state.clone(), self.event_tx.clone(), self.cancel.clone());
         let from_override = from_uri.map(|s| s.to_string());
         self.runtime.block_on(async {
             let (dl, cred, contact, aor, la, pa) = {
@@ -605,7 +634,7 @@ impl SipEndpoint {
             ctx.local_sdp = Some(sdp::build_offer(ip, rtp_port, &cfg.codecs));
 
             // Watch for remote BYE
-            spawn_dialog_watcher(dr, call_id.clone(), CallDirection::Outbound, st.clone(), etx.clone(), cc.clone());
+            spawn_dialog_watcher(dr, call_id.clone(), CallDirection::Outbound, st.clone(), etx.clone(), cc.clone(), global_cancel.clone());
 
             // Session timer
             let session_expires = parse_session_expires(&resp);
@@ -984,6 +1013,9 @@ impl SipEndpoint {
         self.cancel.cancel();
         let ids: Vec<String> = self.state.lock_or_recover().calls.keys().cloned().collect();
         for id in ids { let _ = self.hangup(&id); }
+        // Push a Shutdown sentinel so any thread blocked on wait_for_event
+        // wakes immediately instead of waiting for the next poll timeout.
+        let _ = self.event_tx.try_send(EndpointEvent::Shutdown);
         info!("Agent transport shut down");
         Ok(())
     }
@@ -993,7 +1025,7 @@ impl Drop for SipEndpoint { fn drop(&mut self) { let _ = self.shutdown(); } }
 
 // ─── Incoming call handler ───────────────────────────────────────────────────
 
-async fn handle_incoming(dl: &Arc<DialogLayer>, st: &Arc<Mutex<EndpointState>>, etx: &Sender<EndpointEvent>, tx: rsipstack::transaction::transaction::Transaction, _input_sample_rate: u32, output_sample_rate: u32) {
+async fn handle_incoming(dl: &Arc<DialogLayer>, st: &Arc<Mutex<EndpointState>>, etx: &Sender<EndpointEvent>, tx: rsipstack::transaction::transaction::Transaction, global_cancel: CancellationToken, _input_sample_rate: u32, output_sample_rate: u32) {
     let (ds, dr) = dl.new_dialog_state_channel();
     let cred = st.lock_or_recover().credential.clone();
     let contact = st.lock_or_recover().contact_uri.clone();
@@ -1033,5 +1065,5 @@ async fn handle_incoming(dl: &Arc<DialogLayer>, st: &Arc<Mutex<EndpointState>>, 
 
     // Watch dialog state for remote BYE (same helper as outbound).
     // Inbound calls — this side is the UAS.
-    spawn_dialog_watcher(dr, call_id.clone(), CallDirection::Inbound, st.clone(), etx.clone(), cc);
+    spawn_dialog_watcher(dr, call_id.clone(), CallDirection::Inbound, st.clone(), etx.clone(), cc, global_cancel);
 }
