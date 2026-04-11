@@ -336,6 +336,17 @@ fn event_to_info(event: &EndpointEvent) -> EventInfo {
             frequency_hz: None,
             duration_ms: None,
         },
+        EndpointEvent::Shutdown => EventInfo {
+            event_type: "shutdown".into(),
+            session_id: None,
+            session: None,
+            error: None,
+            reason: None,
+            digit: None,
+            method: None,
+            frequency_hz: None,
+            duration_ms: None,
+        },
     }
 }
 

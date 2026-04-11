@@ -233,6 +233,9 @@ fn event_to_dict<'py>(py: Python<'py>, event: &EndpointEvent) -> PyResult<Bound<
             dict.set_item("type", "beep_timeout")?;
             dict.set_item("session_id", call_id)?;
         }
+        EndpointEvent::Shutdown => {
+            dict.set_item("type", "shutdown")?;
+        }
     }
     Ok(dict)
 }
