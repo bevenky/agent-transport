@@ -150,7 +150,10 @@ class AudioStreamInputTransport(BaseInputTransport):
             except Exception as e:
                 logger.debug("AudioStreamInputTransport event_loop error: {}", e)
                 break
-            await self._handle_event(event)
+            try:
+                await self._handle_event(event)
+            except Exception:
+                logger.exception("AudioStreamInputTransport handler failed for event %r", event.get("type") if isinstance(event, dict) else event)
 
     async def _event_loop_from_endpoint(self):
         """Poll events directly from endpoint (standalone, no server)."""
@@ -165,7 +168,10 @@ class AudioStreamInputTransport(BaseInputTransport):
                 break
             if event is None:
                 continue
-            await self._handle_event(event)
+            try:
+                await self._handle_event(event)
+            except Exception:
+                logger.exception("AudioStreamInputTransport handler failed for event %r", event.get("type") if isinstance(event, dict) else event)
 
     async def _handle_event(self, event):
         """Process a single event."""

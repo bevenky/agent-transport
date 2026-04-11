@@ -149,7 +149,10 @@ class SipInputTransport(BaseInputTransport):
             except Exception as e:
                 logger.debug("SipInputTransport event_loop error: {}", e)
                 break
-            await self._handle_event(event)
+            try:
+                await self._handle_event(event)
+            except Exception:
+                logger.exception("SipInputTransport handler failed for event %r", event.get("type") if isinstance(event, dict) else event)
 
     async def _event_loop_from_endpoint(self):
         """Poll events directly from endpoint (standalone, no server)."""
@@ -164,7 +167,10 @@ class SipInputTransport(BaseInputTransport):
                 break
             if event is None:
                 continue
-            await self._handle_event(event)
+            try:
+                await self._handle_event(event)
+            except Exception:
+                logger.exception("SipInputTransport handler failed for event %r", event.get("type") if isinstance(event, dict) else event)
 
     async def _handle_event(self, event):
         """Process a single event."""
@@ -293,15 +299,20 @@ class SipOutputTransport(BaseOutputTransport):
             logger.warning("send_message via SIP INFO failed: {}", e)
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
-        """Handle InterruptionFrame — clear Rust buffer + pause RTP, then let base class handle pipeline."""
-        await super().process_frame(frame, direction)
+        """Handle InterruptionFrame → clear Rust buffer BEFORE base class processing.
 
+        The base class cancels and restarts the MediaSender audio task. Clearing
+        the Rust buffer first ensures the new task doesn't race against stale
+        audio queued in Rust.
+        """
         if isinstance(frame, InterruptionFrame):
             logger.debug(f"InterruptionFrame: clearing buffer for {self._cid}")
             try:
                 self._ep.clear_buffer(self._cid)
             except Exception as e:
                 logger.warning(f"clear_buffer on interruption failed: {e}")
+
+        await super().process_frame(frame, direction)
 
     async def stop(self, frame: EndFrame):
         loop = asyncio.get_running_loop()
