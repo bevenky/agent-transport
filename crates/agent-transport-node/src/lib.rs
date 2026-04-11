@@ -27,6 +27,17 @@ fn napi_err(e: impl std::fmt::Display) -> napi::Error {
 
 use napi::Task;
 
+/// Lock a Mutex and recover from poisoning instead of panicking. The
+/// AsyncTask threads run on napi's thread pool — a panic from a poisoned
+/// mutex would propagate as an unhandled error to JS callers and could
+/// take down adjacent tasks. Recovery is strictly safer.
+fn lock_or_recover<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    match m.lock() {
+        Ok(g) => g,
+        Err(e) => e.into_inner(),
+    }
+}
+
 pub struct RecvAudioTask {
     rx: crossbeam_channel::Receiver<agent_transport_core::AudioFrame>,
     timeout_ms: u64,
@@ -53,8 +64,15 @@ impl Task for WaitForPlayoutTask {
     type JsValue = bool;
     fn compute(&mut self) -> Result<Self::Output> {
         let (lock, cvar) = &*self.notify;
-        let guard = lock.lock().unwrap();
-        let result = cvar.wait_timeout_while(guard, std::time::Duration::from_millis(self.timeout_ms), |cp| cp.is_none()).unwrap();
+        let guard = lock_or_recover(lock);
+        let result = match cvar.wait_timeout_while(
+            guard,
+            std::time::Duration::from_millis(self.timeout_ms),
+            |cp| cp.is_none(),
+        ) {
+            Ok(r) => r,
+            Err(e) => e.into_inner(),
+        };
         Ok(!result.1.timed_out())
     }
     fn resolve(&mut self, _env: Env, output: Self::Output) -> Result<Self::JsValue> {
@@ -72,9 +90,38 @@ impl Task for SipWaitForPlayoutTask {
     type JsValue = bool;
     fn compute(&mut self) -> Result<Self::Output> {
         let (lock, cvar) = &*self.notify;
-        let guard = lock.lock().unwrap();
-        let result = cvar.wait_timeout_while(guard, std::time::Duration::from_millis(self.timeout_ms), |done| !*done).unwrap();
+        let guard = lock_or_recover(lock);
+        let result = match cvar.wait_timeout_while(
+            guard,
+            std::time::Duration::from_millis(self.timeout_ms),
+            |done| !*done,
+        ) {
+            Ok(r) => r,
+            Err(e) => e.into_inner(),
+        };
         Ok(!result.1.timed_out())
+    }
+    fn resolve(&mut self, _env: Env, output: Self::Output) -> Result<Self::JsValue> {
+        Ok(output)
+    }
+}
+
+/// Blocking wait for the next endpoint event. Used by `waitForEvent()` —
+/// the napi equivalent of Python's `wait_for_event()`. Releases the JS
+/// event loop while waiting (runs on napi's thread pool).
+pub struct WaitForEventTask {
+    rx: crossbeam_channel::Receiver<EndpointEvent>,
+    timeout_ms: u64,
+}
+
+impl Task for WaitForEventTask {
+    type Output = Option<EventInfo>;
+    type JsValue = Option<EventInfo>;
+    fn compute(&mut self) -> Result<Self::Output> {
+        match self.rx.recv_timeout(std::time::Duration::from_millis(self.timeout_ms)) {
+            Ok(event) => Ok(Some(event_to_info(&event))),
+            Err(_) => Ok(None),
+        }
     }
     fn resolve(&mut self, _env: Env, output: Self::Output) -> Result<Self::JsValue> {
         Ok(output)
@@ -374,9 +421,7 @@ impl SipEndpoint {
                 Ok(vec![ctx.value])
             })?;
 
-        self.callbacks
-            .lock()
-            .unwrap()
+        lock_or_recover(&self.callbacks)
             .entry(event_name)
             .or_default()
             .push(tsfn);
@@ -710,6 +755,17 @@ impl SipEndpoint {
         }
     }
 
+    /// Block waiting for the next endpoint event up to `timeout_ms`. Returns
+    /// `null` on timeout. Mirrors Python's `wait_for_event()`. Runs on
+    /// napi's thread pool so the JS event loop is not blocked.
+    #[napi(ts_return_type = "Promise<EventInfo | null>")]
+    pub fn wait_for_event(&self, timeout_ms: u32) -> AsyncTask<WaitForEventTask> {
+        AsyncTask::new(WaitForEventTask {
+            rx: self.inner.events(),
+            timeout_ms: timeout_ms as u64,
+        })
+    }
+
     /// Shut down the endpoint. Stops event dispatch and tears down SIP stack.
     #[napi]
     pub fn shutdown(&self) -> Result<()> {
@@ -737,14 +793,19 @@ impl SipEndpoint {
                         let name = event.callback_name();
                         let info = event_to_info(&event);
 
-                        let cbs = callbacks.lock().unwrap();
-                        if let Some(handlers) = cbs.get(name) {
-                            for tsfn in handlers {
-                                tsfn.call(
-                                    Ok(info.clone()),
-                                    ThreadsafeFunctionCallMode::NonBlocking,
-                                );
-                            }
+                        // Clone tsfns under the lock, then release before invoking.
+                        // tsfn.call(NonBlocking) is non-blocking today, but holding
+                        // the mutex across any JS-bound call invites deadlock if a
+                        // callback tries to register a new handler via ep.on().
+                        let handlers: Vec<_> = {
+                            let cbs = lock_or_recover(&callbacks);
+                            cbs.get(name).cloned().unwrap_or_default()
+                        };
+                        for tsfn in &handlers {
+                            tsfn.call(
+                                Ok(info.clone()),
+                                ThreadsafeFunctionCallMode::NonBlocking,
+                            );
                         }
                     }
                     Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
@@ -961,6 +1022,16 @@ impl AudioStreamEndpoint {
         }
     }
 
+    /// Block waiting for the next event up to `timeout_ms`. Returns null
+    /// on timeout. Mirrors Python's `wait_for_event()`.
+    #[napi(ts_return_type = "Promise<EventInfo | null>")]
+    pub fn wait_for_event(&self, timeout_ms: u32) -> AsyncTask<WaitForEventTask> {
+        AsyncTask::new(WaitForEventTask {
+            rx: self.inner.events(),
+            timeout_ms: timeout_ms as u64,
+        })
+    }
+
     #[napi(getter)]
     pub fn input_sample_rate(&self) -> u32 { self.inner.input_sample_rate() }
 
@@ -972,4 +1043,45 @@ impl AudioStreamEndpoint {
 
     #[napi]
     pub fn shutdown(&self) -> Result<()> { self.inner.shutdown().map_err(napi_err) }
+}
+
+// ─── Logging ────────────────────────────────────────────────────────────────
+
+/// Initialize Rust tracing with the given log level filter.
+///
+/// Call this once, before creating any endpoints, to see Rust-level logs
+/// (SIP signaling, RTP pacing, audio buffer state, etc.) on stderr. Without
+/// this, `RUST_LOG` has no effect from Node because no tracing subscriber
+/// is installed by default.
+///
+/// Examples:
+///   initLogging("debug")                                      # agent-transport debug, rsipstack core info
+///   initLogging("trace")                                      # everything including rsipstack
+///   initLogging("agent_transport=debug,rsipstack=debug")      # both at debug
+///   initLogging("info")                                       # default
+///
+/// `RUST_LOG` env var overrides the `filter` argument when set.
+///
+/// Calling more than once returns an error (tracing can only be
+/// initialized once per process).
+#[napi(js_name = "initLogging")]
+pub fn init_logging(filter: Option<String>) -> Result<()> {
+    use tracing_subscriber::EnvFilter;
+    let filter = filter.unwrap_or_else(|| "info".to_string());
+    let raw = std::env::var("RUST_LOG").unwrap_or(filter);
+    // Expand shorthand levels to filtered versions that skip DNS/transport noise,
+    // matching the Python binding's init_logging behavior so logs look the same
+    // across both bindings.
+    let f = match raw.as_str() {
+        "debug" => "agent_transport=debug,rsipstack::transport::stream=debug,rsipstack::transport::tcp=debug,rsipstack::dialog=debug,rsipstack::transaction::transaction=debug,rsipstack=warn,hickory=warn".to_string(),
+        "trace" => "agent_transport=trace,rsipstack=debug,hickory=warn".to_string(),
+        other => other.to_string(),
+    };
+    tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::new(f))
+        .with_target(true)
+        .with_thread_ids(false)
+        .with_file(false)
+        .try_init()
+        .map_err(|e| Error::from_reason(format!("tracing already initialized: {}", e)))
 }
