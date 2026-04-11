@@ -674,11 +674,15 @@ class AudioStreamServer:
         session_ended = asyncio.Event()
         self._session_ended_events[session_id] = session_ended
 
-        # Create Room facade BEFORE handler runs — ctx.room is available immediately
+        # Create Room facade BEFORE handler runs — ctx.room is available immediately.
+        # remote_kind=0 (STANDARD) because Plivo audio_stream is a WebSocket
+        # transport, not SIP — `participant.kind` should reflect that for any
+        # agent code that inspects it.
         room = TransportRoom(
             self._ep, session_id,
             agent_name=self._agent_name,
             caller_identity=plivo_call_uuid,
+            remote_kind=0,
         )
         # Set on JobContext so get_job_context().room works inside handler
         job_stub, job_ctx_token = create_transport_context(

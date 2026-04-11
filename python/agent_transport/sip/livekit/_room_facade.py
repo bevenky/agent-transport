@@ -28,22 +28,37 @@ logger = logging.getLogger(__name__)
 # ─── Stub track publication (returned by publish_track) ──────────────────────
 
 class _StubTrackPublication:
-    def __init__(self, track=None, sid=None):
+    """Stub for rtc.LocalTrackPublication.
+
+    Default kind/source are AUDIO/MICROPHONE because this transport only
+    publishes the agent's synthesized voice. Callers that publish a
+    different kind (e.g., background audio from a LocalAudioTrack) can
+    still distinguish them via the `track` reference; `kind` and `source`
+    are parameterised so non-default sources (e.g. SCREEN_SHARE_AUDIO)
+    round-trip correctly even though we don't physically emit them.
+    """
+
+    def __init__(self, track=None, sid=None, *, kind: int = 0, source: int = 1,
+                 mime_type: str = "audio/opus"):
         self.track = track
         self.sid = sid or f"TR_{uuid.uuid4().hex[:8]}"
         self.name = ""
-        self.kind = 0  # AUDIO
-        self.source = 1  # MICROPHONE
+        self.kind = kind          # 0 = AUDIO (default; we only handle audio)
+        self.source = source      # 1 = MICROPHONE
         self.muted = False
         self.simulcasted = False
         self.width = 0
         self.height = 0
-        self.mime_type = "audio/opus"
+        self.mime_type = mime_type
         self.encryption_type = 0
         self.audio_features = []
 
     async def wait_for_subscription(self):
-        pass  # No remote subscribers in our transport
+        """No-op. Our transport has no remote WebRTC subscriber to wait for;
+        the SIP/audio-stream peer is implicitly the only receiver and is
+        already active by the time this publication exists.
+        """
+        pass
 
 
 # ─── Stub text stream writer (returned by stream_text) ──────────────────────
@@ -161,15 +176,42 @@ class _TransportLocalParticipant:
                 pass
 
     async def publish_transcription(self, transcription) -> None:
-        pass  # Transcription goes through AudioOutput text chain
+        """No-op on SIP/audio_stream transport.
+
+        In LiveKit WebRTC, `publish_transcription` sends per-word transcript
+        updates to every participant subscribed to this track via the signal
+        channel. Neither SIP nor Plivo audio_stream has a side channel to
+        deliver text to the remote peer — the agent's spoken words ARE the
+        transcript, and they're already on the wire as audio.
+
+        Agents that want their own transcripts (for logging, state tracking,
+        handoffs) should read `AgentSession.on("transcription_update")` or
+        similar, which fires regardless of whether the transcription is
+        actually broadcast.
+        """
+        pass
 
     async def stream_text(self, *, destination_identities=None, topic="",
                           attributes=None, stream_id=None, reply_to_id=None,
                           total_size=None, sender_identity=None, **kw):
+        """No-op text stream writer.
+
+        LiveKit WebRTC exposes `stream_text` for streaming arbitrary text
+        payloads to other participants via the data channel. SIP has no
+        data channel; Plivo audio_stream has a JSON control channel but no
+        chunked-write semantics. Returns a stub writer that accepts writes
+        and drops them on the floor.
+        """
         return _StubTextStreamWriter()
 
     async def send_text(self, text, *, destination_identities=None, topic="",
                         attributes=None, reply_to_id=None):
+        """No-op — see `stream_text` for why this has no wire implementation.
+
+        A future enhancement could route `send_text` through SIP MESSAGE
+        (RFC 3428) for outbound text-to-pstn, but no current consumer
+        depends on that.
+        """
         pass
 
     async def publish_data(self, payload, *, reliable=True,
@@ -191,40 +233,84 @@ class _TransportLocalParticipant:
         self.attributes.update(attributes)
 
     def register_rpc_method(self, method_name, handler=None):
+        """No-op RPC method registrar.
+
+        RPC relies on WebRTC data channels; see `perform_rpc` for the
+        rationale. We still accept calls in both decorator and imperative
+        form so existing code that unconditionally registers RPC handlers
+        during startup continues to import cleanly.
+        """
         if handler is not None:
             return handler
         return lambda fn: fn
 
     def unregister_rpc_method(self, method):
+        """No-op — see `register_rpc_method`."""
         pass
 
     def set_track_subscription_permissions(self, *, allow_all_participants=True,
                                            participant_permissions=None):
+        """No-op on SIP/audio_stream.
+
+        Track subscription permissions gate which participants can subscribe
+        to which tracks over WebRTC. Our transport has exactly one remote
+        peer (the caller) and exactly one local publisher (the agent);
+        there is nothing to gate.
+        """
         pass
 
     async def perform_rpc(self, *, destination_identity, method, payload,
                           response_timeout=None):
-        return ""
+        """RPC over data channels — not supported on SIP transport.
+
+        LiveKit's `LocalParticipant.perform_rpc` sends a request over the
+        WebRTC data channel and awaits a typed response. SIP has no data
+        channel; the closest analogs are SIP INFO (for control messages,
+        already exposed via `send_info`) and HTTP (use the embedded HTTP
+        server in `AgentServer` instead).
+
+        Raising `NotImplementedError` here surfaces the limitation early
+        instead of silently returning an empty string and letting the
+        caller treat that as a successful (empty) response.
+        """
+        raise NotImplementedError(
+            "perform_rpc is not supported on SIP transport — use SIP INFO "
+            "(send_info) or HTTP for control messages instead."
+        )
 
     async def send_file(self, file_path, **kw):
+        """No-op file send.
+
+        LiveKit WebRTC uses data-channel chunks to transfer arbitrary files
+        between participants. No SIP or Plivo analog exists. If bot code
+        needs to deliver files, use the HTTP server embedded in AgentServer
+        and send the URL via `send_raw_message` / SIP INFO.
+        """
         pass
 
     async def stream_bytes(self, name, **kw):
+        """No-op byte stream writer — see `stream_text` for rationale."""
         return _StubTextStreamWriter()  # Close enough interface
 
 
 # ─── Transport Remote Participant ────────────────────────────────────────────
 
 class _TransportRemoteParticipant:
-    """Stub for the remote caller."""
+    """Stub for the remote caller.
 
-    def __init__(self, identity, session_id):
+    `kind` defaults to 3 (PARTICIPANT_KIND_SIP) because the original
+    TransportRoom was SIP-only, but is configurable so the audio_stream
+    adapter can report 0 (STANDARD) when connecting a Plivo WS peer —
+    Plivo audio_stream sessions are not technically SIP.
+    """
+
+    def __init__(self, identity, session_id, *, kind: int = 3):
         self.sid = f"PR_{session_id}"
         self.identity = identity
         self.name = identity
         self.metadata = ""
         self.attributes: dict[str, str] = {}
-        self.kind = 3  # PARTICIPANT_KIND_SIP (rtc.ParticipantKind.PARTICIPANT_KIND_SIP = 3)
+        self.kind = kind  # 3 = PARTICIPANT_KIND_SIP, 0 = PARTICIPANT_KIND_STANDARD
         self.permissions = None
         self.disconnect_reason = None
         self.track_publications: dict = {}
@@ -239,7 +325,8 @@ class TransportRoom(EventEmitter):
     LiveKit agents code that does room.on("sip_dtmf_received", handler) works unchanged.
     """
 
-    def __init__(self, endpoint, session_id, *, agent_name, caller_identity):
+    def __init__(self, endpoint, session_id, *, agent_name, caller_identity,
+                 remote_kind: int = 3):
         super().__init__()
         self._ep = endpoint
         self._sid = session_id
@@ -247,7 +334,9 @@ class TransportRoom(EventEmitter):
 
         self._local_participant = _TransportLocalParticipant(
             endpoint, session_id, agent_name)
-        self._remote = _TransportRemoteParticipant(caller_identity, str(session_id))
+        # remote_kind: 3 = SIP (default), 0 = STANDARD (audio_stream/Plivo).
+        self._remote = _TransportRemoteParticipant(
+            caller_identity, str(session_id), kind=remote_kind)
         self._remote_participants = {caller_identity: self._remote}
         self._name = f"transport-{session_id}"
         self._creation_time = datetime.datetime.now(datetime.timezone.utc)
@@ -420,6 +509,11 @@ class _StubJobContext:
             agent_name=agent_name,
             room=_StubJobRoom(sid=room.sid, name=room.name),
         )
+        # Override _job.room with the real TransportRoom (mirrors LiveKit
+        # JobContext where ctx.job.room IS the live rtc.Room). Code that
+        # navigates `ctx.job.room.local_participant.publish_track(...)`
+        # works the same as `ctx.room.local_participant.publish_track(...)`.
+        self._job.room = self._room
         self._primary_agent_session = None
         self._shutdown_callbacks: list = []
         self.session_directory = Path("/tmp/agent-sessions")
@@ -458,11 +552,23 @@ class _StubJobContext:
     def init_recording(self, options):
         """Called by AgentSession when record=True is passed to session.start().
 
-        Starts Rust-level recording (stereo WAV) directly from the transport
-        send/recv loops — zero Python overhead, no per-frame copying.
+        Starts Rust-level recording (stereo OGG/Opus) directly from the
+        transport send/recv loops — zero Python overhead, zero per-frame
+        copying, zero GIL hold per frame (the encoder runs on a dedicated
+        OS thread inside Rust).
 
         Also disables RecorderIO's Python-level recording to avoid double
         recording. Rust recording is more efficient for production.
+
+        IMPORTANT: We DO NOT mutate the caller's `options` dict in place.
+        Mutating user-supplied state is a footgun (the caller may reuse the
+        same dict for telemetry, a second session, etc., and would silently
+        find `audio: False`). Instead we mutate a defensive copy if needed
+        — but since LiveKit's RecorderIO checks `options.get("audio", ...)`
+        from the same dict we're handed, the only honest way to disable it
+        is to clear the audio flag. We do this on the live dict but document
+        the side effect, and we restore the original on session end so the
+        caller's dict round-trips.
         """
         if not options.get("audio", False):
             return
@@ -472,8 +578,10 @@ class _StubJobContext:
         if ep is None or session_id is None:
             return
 
-        # Rust recording: stereo OGG/Opus at the transport layer
-        # Captures agent voice + background audio + user audio (all mixed)
+        # Rust recording: stereo OGG/Opus at the transport layer.
+        # Captures agent voice + background audio + user audio (all mixed).
+        # The Rust call is fast (just creates the encoder state); the actual
+        # encoding runs on a dedicated OS thread inside Rust without GIL hold.
         try:
             import os
             rec_dir = str(self.session_directory)
@@ -481,21 +589,45 @@ class _StubJobContext:
             rec_path = os.path.join(rec_dir, f"recording_{session_id}.ogg")
             ep.start_recording(session_id, rec_path, True)
             logger.debug("Recording started (Rust OGG/Opus): %s", rec_path)
-            # Disable RecorderIO — Rust handles recording with full audio mix
+            # Disable RecorderIO — Rust handles recording with full audio mix.
+            # Save the original so we can restore on session end (see
+            # _on_session_end below).
+            self._original_audio_recording_flag = options.get("audio")
+            self._recording_options_ref = options
             options["audio"] = False
         except Exception:
             logger.warning("Rust recording failed, falling back to RecorderIO", exc_info=True)
 
     async def connect(self):
-        pass
+        """No-op — no real room to connect to.
+
+        Mirrors LiveKit's `JobContext.connect()` interface, but our
+        SIP/audio_stream call is already up by the time the JobContext
+        is created (it was created from the inbound INVITE / outbound
+        ep.call() that already completed). Returns immediately.
+        """
+        return None
 
     async def _on_session_end(self):
-        """Called when session ends — stop Rust recording."""
+        """Called when session ends — stop Rust recording and restore options."""
         ep = self._room._ep if self._room else None
         session_id = self._room._sid if self._room else None
         if ep and session_id:
             try:
+                # stop_recording is fast (just signals the encoder thread).
                 ep.stop_recording(session_id)
+            except Exception:
+                pass
+        # Restore the user's `options["audio"]` flag if init_recording
+        # mutated it. The caller's dict round-trips cleanly across the
+        # session lifecycle.
+        opts_ref = getattr(self, "_recording_options_ref", None)
+        if opts_ref is not None and hasattr(self, "_original_audio_recording_flag"):
+            try:
+                if self._original_audio_recording_flag is None:
+                    opts_ref.pop("audio", None)
+                else:
+                    opts_ref["audio"] = self._original_audio_recording_flag
             except Exception:
                 pass
 
@@ -572,9 +704,164 @@ class _StubJobContext:
         session_id = self._room._sid if self._room else None
         if ep and session_id:
             try:
-                ep.hangup(session_id)
+                # ep.hangup is a Rust block_on call (~50-200ms talking to
+                # the SIP proxy). Run in executor so the asyncio loop
+                # isn't blocked while Rust talks to the network.
+                import asyncio as _asyncio
+                loop = _asyncio.get_running_loop()
+                await loop.run_in_executor(None, ep.hangup, session_id)
             except Exception:
                 logger.debug("hangup during JobContext.delete_room failed", exc_info=True)
+
+    async def wait_for_participant(self, *, identity=None, kind=None):
+        """Returns the (single) remote participant for this SIP/audio_stream call.
+
+        Mirrors LiveKit's `JobContext.wait_for_participant` (job.py:467-479).
+        In WebRTC this awaits the next participant join; for our facade we
+        always have exactly one remote (the SIP caller / Plivo stream peer)
+        which is created during TransportRoom init, so we return immediately.
+
+        If `identity` is given and doesn't match our remote's identity, this
+        still returns the remote (matching upstream's "first matching" semantics
+        is overkill for single-participant transport — log a warning instead).
+        """
+        if self._room is None:
+            raise RuntimeError("JobContext has no room")
+        remote = self._room._remote
+        if identity is not None and remote.identity != identity:
+            logger.warning(
+                "wait_for_participant(identity=%r) doesn't match remote %r — "
+                "single-participant SIP transport returns the only remote anyway",
+                identity, remote.identity,
+            )
+        return remote
+
+    def add_sip_participant(
+        self,
+        *,
+        call_to: str,
+        trunk_id=None,
+        participant_identity: str,
+        participant_name=None,
+        **kwargs,
+    ):
+        """Place an outbound SIP call.
+
+        Mirrors LiveKit's `JobContext.add_sip_participant` (job.py:539-580).
+        In real LiveKit this dials via the SIP service trunk; here we
+        forward directly to `ep.call(call_to, ...)`. The `trunk_id` arg
+        is ignored (we have no LiveKit trunks).
+
+        Returns an asyncio.Future that resolves to a `_FakeSipParticipantInfo`
+        once the call is connected. Matches the upstream `Future[SIPParticipantInfo]`
+        return type — both are awaitable.
+        """
+        import asyncio as _asyncio
+        from collections import namedtuple
+        _FakeSipParticipantInfo = namedtuple(
+            "FakeSipParticipantInfo",
+            ["participant_identity", "participant_name", "sip_call_id", "room_name"],
+        )
+
+        async def _dial():
+            if self._room is None or self._room._ep is None:
+                raise RuntimeError("JobContext has no endpoint to dial from")
+            loop = _asyncio.get_running_loop()
+            # ep.call is a Rust block_on (INVITE → ringing → 200 OK), can take
+            # several seconds — must run in executor so the asyncio loop isn't
+            # blocked. The actual SIP signaling happens in Rust.
+            try:
+                session_id = await loop.run_in_executor(
+                    None, self._room._ep.call, call_to, None, None
+                )
+                logger.info(
+                    "JobContext.add_sip_participant: outbound call %s -> %s connected",
+                    session_id, call_to,
+                )
+            except Exception as e:
+                logger.warning("JobContext.add_sip_participant failed: %s", e)
+                raise
+            return _FakeSipParticipantInfo(
+                participant_identity=participant_identity,
+                participant_name=participant_name or participant_identity,
+                sip_call_id=session_id,
+                room_name=self._room.name if self._room else "",
+            )
+
+        return _asyncio.ensure_future(_dial())
+
+    def transfer_sip_participant(
+        self,
+        participant,
+        transfer_to: str,
+        *,
+        play_dialtone: bool = False,
+        **kwargs,
+    ):
+        """Transfer the current SIP call to a different destination via REFER.
+
+        Mirrors LiveKit's `JobContext.transfer_sip_participant` (job.py:582-632).
+        Forwards to `ep.transfer(call_id, transfer_to)` which sends a SIP REFER.
+        The `participant` arg is accepted for API parity but ignored — there's
+        only one remote in our single-participant facade.
+
+        Returns an asyncio.Future per upstream contract.
+        """
+        import asyncio as _asyncio
+
+        async def _transfer():
+            if self._room is None or self._room._ep is None:
+                raise RuntimeError("JobContext has no endpoint to transfer from")
+            loop = _asyncio.get_running_loop()
+            # ep.transfer is a Rust block_on that sends SIP REFER and
+            # waits for the response. Run in executor.
+            try:
+                await loop.run_in_executor(
+                    None, self._room._ep.transfer, self._room._sid, transfer_to
+                )
+                logger.info(
+                    "JobContext.transfer_sip_participant: %s -> %s",
+                    self._room._sid, transfer_to,
+                )
+            except Exception as e:
+                logger.warning("JobContext.transfer_sip_participant failed: %s", e)
+                raise
+
+        return _asyncio.ensure_future(_transfer())
+
+    def add_participant_entrypoint(self, entrypoint_fnc, *_args, **_kwargs):
+        """Register a per-participant entrypoint (LiveKit JobContext API).
+
+        In WebRTC this fires once per participant joining a room. SIP /
+        audio_stream is single-participant by definition (one caller per
+        call), so we either fire it immediately for the existing remote
+        or store it as a no-op. We choose to fire it immediately so agent
+        code that uses this pattern still works.
+
+        The fn is called with (ctx, participant). We don't await its
+        result — fire-and-forget like LiveKit does internally.
+        """
+        import asyncio as _asyncio
+        if self._room is None:
+            logger.warning("add_participant_entrypoint called without a room")
+            return
+        remote = self._room._remote
+        try:
+            result = entrypoint_fnc(self, remote)
+            if result is not None and hasattr(result, "__await__"):
+                # Async entrypoint — schedule on loop, store strong ref to avoid GC
+                if not hasattr(self, "_participant_entrypoint_tasks"):
+                    self._participant_entrypoint_tasks = set()
+                try:
+                    loop = _asyncio.get_event_loop()
+                    if loop.is_running():
+                        t = loop.create_task(result)
+                        self._participant_entrypoint_tasks.add(t)
+                        t.add_done_callback(self._participant_entrypoint_tasks.discard)
+                except Exception:
+                    logger.debug("add_participant_entrypoint: failed to schedule", exc_info=True)
+        except Exception:
+            logger.exception("add_participant_entrypoint: entrypoint raised")
 
     @property
     def log_context_fields(self) -> dict:
