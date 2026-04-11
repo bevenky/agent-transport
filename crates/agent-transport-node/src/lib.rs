@@ -251,8 +251,8 @@ fn event_to_info(event: &EndpointEvent) -> EventInfo {
             frequency_hz: None,
             duration_ms: None,
         },
-        EndpointEvent::IncomingCall { session } => EventInfo {
-            event_type: "incoming_call".into(),
+        EndpointEvent::CallRinging { session } => EventInfo {
+            event_type: "call_ringing".into(),
             session_id: Some(session.session_id.clone()),
             session: Some(session.clone().into()),
             error: None,
@@ -273,10 +273,10 @@ fn event_to_info(event: &EndpointEvent) -> EventInfo {
             frequency_hz: None,
             duration_ms: None,
         },
-        EndpointEvent::CallMediaActive { call_id } => EventInfo {
-            event_type: "call_media_active".into(),
-            session_id: Some(call_id.clone()),
-            session: None,
+        EndpointEvent::CallAnswered { session } => EventInfo {
+            event_type: "call_answered".into(),
+            session_id: Some(session.session_id.clone()),
+            session: Some(session.clone().into()),
             error: None,
             reason: None,
             digit: None,
@@ -414,13 +414,18 @@ impl SipEndpoint {
     }
 
     /// Register an event listener. Events: registered, registration_failed,
-    /// unregistered, incoming_call, call_state, call_media_active,
-    /// call_terminated, dtmf_received, beep_detected, beep_timeout
+    /// unregistered, call_ringing, call_state, call_answered,
+    /// call_terminated, dtmf_received, beep_detected, beep_timeout, shutdown
     ///
     /// ```js
-    /// ep.on('incoming_call', (event) => {
-    ///   console.log(event.session.remoteUri);
-    ///   ep.answer(event.sessionId);
+    /// // Observational pre-answer hook. Rust auto-answers right after.
+    /// ep.on('call_ringing', (event) => {
+    ///   console.log('Incoming call from', event.session.remoteUri);
+    /// });
+    ///
+    /// // Fires when call is answered and media is flowing. Start agent here.
+    /// ep.on('call_answered', (event) => {
+    ///   startAgent(event.session);
     /// });
     /// ```
     #[napi(

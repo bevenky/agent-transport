@@ -157,9 +157,15 @@ impl From<RustCallSession> for CallSession {
 /// Returned by `ep.on("event_name")` — usable as a decorator.
 ///
 /// ```python
-/// @ep.on("incoming_call")
-/// def handler(session):
-///     ep.answer(session.session_id)
+/// @ep.on("call_ringing")
+/// def on_ringing(session):
+///     # Observational: Rust auto-answers. Use for logging / metrics.
+///     print(f"Incoming call from {session.remote_uri}")
+///
+/// @ep.on("call_answered")
+/// def on_answered(session):
+///     # Call is now active and media is flowing — safe to start the agent.
+///     ...
 /// ```
 #[pyclass]
 struct EventDecorator {
@@ -192,17 +198,20 @@ fn event_to_dict<'py>(py: Python<'py>, event: &EndpointEvent) -> PyResult<Bound<
         EndpointEvent::Unregistered => {
             dict.set_item("type", "unregistered")?;
         }
-        EndpointEvent::IncomingCall { session } => {
-            dict.set_item("type", "incoming_call")?;
+        EndpointEvent::CallRinging { session } => {
+            dict.set_item("type", "call_ringing")?;
             dict.set_item("session", CallSession::from(session.clone()).into_pyobject(py)?)?;
         }
         EndpointEvent::CallStateChanged { session } => {
             dict.set_item("type", "call_state")?;
             dict.set_item("session", CallSession::from(session.clone()).into_pyobject(py)?)?;
         }
-        EndpointEvent::CallMediaActive { call_id } => {
-            dict.set_item("type", "call_media_active")?;
-            dict.set_item("session_id", call_id)?;
+        EndpointEvent::CallAnswered { session } => {
+            dict.set_item("type", "call_answered")?;
+            // session_id kept for backwards compat with adapters that
+            // previously read it from the `call_media_active` event.
+            dict.set_item("session_id", &session.session_id)?;
+            dict.set_item("session", CallSession::from(session.clone()).into_pyobject(py)?)?;
         }
         EndpointEvent::CallTerminated { session, reason } => {
             dict.set_item("type", "call_terminated")?;
@@ -343,10 +352,15 @@ impl SipEndpoint {
     /// Register an event callback. Can be used as a decorator:
     ///
     /// ```python
-    /// @ep.on("incoming_call")
-    /// def handler(event):
+    /// @ep.on("call_ringing")
+    /// def on_ringing(event):
+    ///     # Pre-answer, observational. Rust auto-answers right after.
     ///     print(event["session"].remote_uri)
-    ///     ep.answer(event["session"].session_id)
+    ///
+    /// @ep.on("call_answered")
+    /// def on_answered(event):
+    ///     # Call is answered and media is active. Create your agent here.
+    ///     start_agent(event["session"])
     /// ```
     ///
     /// Or with a direct callback:
@@ -356,8 +370,8 @@ impl SipEndpoint {
     /// ```
     ///
     /// Event names: registered, registration_failed, unregistered,
-    /// incoming_call, call_state, call_media_active, call_terminated,
-    /// dtmf_received, beep_detected, beep_timeout
+    /// call_ringing, call_state, call_answered, call_terminated,
+    /// dtmf_received, beep_detected, beep_timeout, shutdown
     #[pyo3(signature = (event_name, callback=None))]
     fn on(
         &self,
