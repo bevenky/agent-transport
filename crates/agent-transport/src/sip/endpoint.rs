@@ -405,90 +405,6 @@ fn start_session_timer(
     });
 }
 
-/// Build a SIP Contact URI and matching HostWithPort from a STUN-discovered
-/// public address. Extracted so both the initial registration path and the
-/// re-registration refresh path use identical formatting.
-fn contact_from_public_addr(
-    user: &str,
-    public: SocketAddr,
-) -> Result<(rsip::Uri, rsip::HostWithPort)> {
-    let ip_str = public.ip().to_string();
-    let port = public.port();
-    let uri: rsip::Uri = format!("sip:{}@{}:{};transport=tcp", user, ip_str, port)
-        .try_into()
-        .map_err(|e| err(format!("contact_uri: {:?}", e)))?;
-    let hp: rsip::HostWithPort = format!("{}:{}", ip_str, port)
-        .try_into()
-        .map_err(|e| err(format!("contact_hp: {:?}", e)))?;
-    Ok((uri, hp))
-}
-
-/// Result of a public-address refresh on the re-registration path.
-#[derive(Debug)]
-pub(crate) enum PublicAddrRefresh {
-    /// STUN confirmed the current public address is unchanged.
-    Unchanged,
-    /// Public address changed — caller should rebuild Contact + state.
-    Changed {
-        new_contact: rsip::typed::Contact,
-        new_hp: rsip::HostWithPort,
-        new_sa: SocketAddr,
-    },
-    /// STUN failed — keep the cached public address. (Transient network
-    /// blip shouldn't break the re-registration cycle.)
-    StunFailed,
-}
-
-/// Re-run STUN and return how the public address has changed relative to
-/// `current`. Used by the re-registration loop so that Contact is kept in
-/// sync with the current public IP across WiFi/ISP switches.
-///
-/// This function performs the blocking STUN request inside
-/// `tokio::task::spawn_blocking` so it doesn't stall the Tokio runtime,
-/// and the result is a pure value that the caller applies to its local
-/// state — no shared mutable state touched here.
-pub(crate) async fn detect_public_ip_change(
-    stun_server: &str,
-    current_public: Option<rsip::HostWithPort>,
-    user: &str,
-) -> PublicAddrRefresh {
-    let stun_server_owned = stun_server.to_string();
-    let new_pa = match tokio::task::spawn_blocking(move || sdp::stun_binding(&stun_server_owned))
-        .await
-    {
-        Ok(Ok(a)) => a,
-        Ok(Err(_)) | Err(_) => return PublicAddrRefresh::StunFailed,
-    };
-
-    // Compare ip:port against the cached HostWithPort. A host-only match
-    // isn't enough because the NAT-translated port can change even when
-    // the public IP stays the same (NAT rebind on the same uplink).
-    let current_host = current_public.as_ref().map(|hp| hp.host.to_string());
-    let current_port = current_public
-        .as_ref()
-        .and_then(|hp| hp.port.as_ref().map(|p| u16::from(*p)));
-    let same_ip = current_host.as_deref() == Some(&new_pa.ip().to_string());
-    let same_port = current_port == Some(new_pa.port());
-    if same_ip && same_port {
-        return PublicAddrRefresh::Unchanged;
-    }
-
-    let (new_uri, new_hp) = match contact_from_public_addr(user, new_pa) {
-        Ok(v) => v,
-        Err(_) => return PublicAddrRefresh::StunFailed,
-    };
-    let new_contact = rsip::typed::Contact {
-        display_name: None,
-        uri: new_uri,
-        params: vec![],
-    };
-    PublicAddrRefresh::Changed {
-        new_contact,
-        new_hp,
-        new_sa: new_pa,
-    }
-}
-
 fn new_call_context(call_id: &str, direction: CallDirection, cc: CancellationToken, output_sample_rate: u32) -> (CallContext, CallSession) {
     let session = CallSession::new(call_id.to_string(), direction);
     let (_itx, irx) = crossbeam_channel::unbounded();
@@ -644,17 +560,11 @@ impl SipEndpoint {
             let pa = sdp::stun_binding(&stun).ok();
             if let Some(a) = pa { info!("STUN: public {} (for RTP/SDP)", a); }
 
-            // Contact with transport=tcp — proxy sends INVITEs over our TCP connection.
-            // Fall back to the local address when STUN is unavailable.
-            let initial_public = pa.unwrap_or_else(|| {
-                let host = la.addr.host.to_string();
-                let port = la.addr.port.map(u16::from).unwrap_or(5060);
-                format!("{}:{}", host, port).parse().unwrap_or_else(|_| {
-                    SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), 5060)
-                })
-            });
-            let (contact_uri, stun_hp) = contact_from_public_addr(&user, initial_public)?;
+            // Contact with transport=tcp — proxy sends INVITEs over our TCP connection
+            let (ch, cp) = pa.map(|a| (a.ip().to_string(), a.port())).unwrap_or((la.addr.host.to_string(), la.addr.port.map(u16::from).unwrap_or(5060)));
+            let contact_uri: rsip::Uri = format!("sip:{}@{}:{};transport=tcp", user, ch, cp).try_into().map_err(|e| err(format!("{:?}", e)))?;
             let mut reg = Registration::new(ei, Some(cred.clone()));
+            let stun_hp: rsip::HostWithPort = format!("{}:{}", ch, cp).try_into().map_err(|e| err(format!("{:?}", e)))?;
             reg.public_address = Some(stun_hp);
             // Set explicit Contact with transport=tcp so it's preserved through 401 auth retry
             reg.contact = Some(rsip::typed::Contact {
@@ -685,43 +595,12 @@ impl SipEndpoint {
                 { let mut s = st.lock_or_recover(); s.registered = true; s.credential = Some(cred); s.contact_uri = Some(contact_uri.clone()); s.aor = Some(aor.clone()); s.public_addr = pa; }
                 let _ = etx.try_send(EndpointEvent::Registered);
 
-                // Re-registration loop (TCP keepalive is handled by the persistent connection).
-                //
-                // Fix for issue #50: on every re-registration tick, re-run STUN and
-                // rebuild the Contact URI if the public IP has moved (WiFi switch,
-                // ISP failover, NAT rebind). Without this the cached Contact points
-                // at a dead IP and Plivo routes incoming INVITEs into a black hole,
-                // returning 486 Busy Here to the caller.
+                // Re-registration loop (TCP keepalive is handled by the persistent connection)
                 let re = reg.expires().max(50) as u64;
                 let (st2, etx2) = (st.clone(), etx.clone());
-                let stun_server_for_refresh = stun.clone();
-                let user_for_refresh = user.clone();
                 tokio::spawn(async move {
                     loop {
                         tokio::select! { _ = cc.cancelled() => break, _ = tokio::time::sleep(std::time::Duration::from_secs(re)) => {} }
-
-                        // Re-run STUN and update Contact if the public address moved.
-                        let refresh = detect_public_ip_change(
-                            &stun_server_for_refresh,
-                            reg.public_address.clone(),
-                            &user_for_refresh,
-                        ).await;
-                        if let PublicAddrRefresh::Changed { new_contact, new_hp, new_sa } = refresh {
-                            let old_hp_str = reg.public_address.as_ref()
-                                .map(|hp| format!("{}", hp))
-                                .unwrap_or_else(|| "<none>".into());
-                            info!(
-                                "Public address changed: {} → {} — rebuilding Contact",
-                                old_hp_str, new_hp
-                            );
-                            let new_uri = new_contact.uri.clone();
-                            reg.contact = Some(new_contact);
-                            reg.public_address = Some(new_hp);
-                            let mut s = st2.lock_or_recover();
-                            s.contact_uri = Some(new_uri);
-                            s.public_addr = Some(new_sa);
-                        }
-
                         match reg.register(server_uri.clone(), Some(exp)).await {
                             Ok(r) if r.status_code == rsip::StatusCode::OK => debug!("Re-registered"),
                             Ok(r) => { st2.lock_or_recover().registered = false; let _ = etx2.try_send(EndpointEvent::RegistrationFailed { error: format!("{}", r.status_code) }); }
