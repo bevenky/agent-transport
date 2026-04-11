@@ -1,5 +1,12 @@
-/** Type declarations for the agent-transport native module (napi-rs). */
+/** Type declarations for the agent-transport native module (napi-rs).
+ *
+ * This shadows the d.ts shipped in the napi crate so the TS adapter can be
+ * type-checked from the source tree without depending on the published wheel.
+ * Keep in sync with crates/agent-transport-node/index.d.ts.
+ */
 declare module 'agent-transport' {
+  export function initLogging(filter?: string): void;
+
   export interface AudioFrame {
     data: number[];
     sampleRate: number;
@@ -55,8 +62,10 @@ declare module 'agent-transport' {
     on(eventName: string, callback: (event: EventInfo) => void): void;
     register(username: string, password: string): void;
     unregister(): void;
+    isRegistered(): boolean;
     call(destUri: string, fromUri?: string, headers?: Record<string, string>, sessionId?: string): string;
-    answer(sessionId: string): void;
+    answer(sessionId: string, code?: number): void;
+    reject(sessionId: string, code?: number): void;
     hangup(sessionId: string): void;
     sendAudio(sessionId: string, frame: AudioFrame): void;
     sendAudioBytes(sessionId: string, audio: Uint8Array, sampleRate: number, numChannels: number): void;
@@ -68,19 +77,32 @@ declare module 'agent-transport' {
     recvAudioBytesBlocking(sessionId: string, timeoutMs?: number): Uint8Array | null;
     recvAudioBytesAsync(sessionId: string, timeoutMs?: number): Promise<Buffer | null>;
     waitForPlayoutAsync(sessionId: string, timeoutMs?: number): Promise<boolean>;
+    waitForPlayoutNotify(sessionId: string, notifyFn: () => void): void;
     mute(sessionId: string): void;
     unmute(sessionId: string): void;
     pause(sessionId: string): void;
     resume(sessionId: string): void;
+    hold(sessionId: string): void;
+    unhold(sessionId: string): void;
     clearBuffer(sessionId: string): void;
     flush(sessionId: string): void;
     waitForPlayout(sessionId: string, timeoutMs?: number): boolean;
     checkpoint(sessionId: string, name?: string): string;
-    sendDtmf(sessionId: string, digits: string): void;
+    sendDtmf(sessionId: string, digits: string, method?: string): void;
+    sendInfo(sessionId: string, contentType: string, body: string): void;
+    transfer(sessionId: string, destUri: string): void;
+    transferAttended(sessionId: string, targetSessionId: string): void;
     sendRawMessage(sessionId: string, message: string): void;
     queuedFrames(sessionId: string): number;
     pollEvent(): EventInfo | null;
+    /**
+     * Block waiting for the next event up to `timeoutMs`. Resolves to `null`
+     * on timeout. Mirrors Python's `wait_for_event()`. Runs on napi's thread
+     * pool — does not block the JS event loop.
+     */
+    waitForEvent(timeoutMs: number): Promise<EventInfo | null>;
     detectBeep(sessionId: string, timeoutMs?: number, minDurationMs?: number, maxDurationMs?: number): void;
+    cancelBeepDetection(sessionId: string): void;
     startRecording(sessionId: string, path: string, stereo?: boolean): void;
     stopRecording(sessionId: string): void;
     get inputSampleRate(): number;
@@ -101,6 +123,7 @@ declare module 'agent-transport' {
     recvAudioBytesBlocking(sessionId: string, timeoutMs?: number): Uint8Array | null;
     recvAudioBytesAsync(sessionId: string, timeoutMs?: number): Promise<Buffer | null>;
     waitForPlayoutAsync(sessionId: string, timeoutMs?: number): Promise<boolean>;
+    waitForPlayoutNotify(sessionId: string, notifyFn: () => void): void;
     mute(sessionId: string): void;
     unmute(sessionId: string): void;
     pause(sessionId: string): void;
@@ -116,6 +139,11 @@ declare module 'agent-transport' {
     detectBeep(sessionId: string, timeoutMs?: number, minDurationMs?: number, maxDurationMs?: number): void;
     cancelBeepDetection(sessionId: string): void;
     pollEvent(): EventInfo | null;
+    /**
+     * Block waiting for the next event up to `timeoutMs`. Resolves to `null`
+     * on timeout. Mirrors Python's `wait_for_event()`.
+     */
+    waitForEvent(timeoutMs: number): Promise<EventInfo | null>;
     startRecording(sessionId: string, path: string, stereo?: boolean): void;
     stopRecording(sessionId: string): void;
     get inputSampleRate(): number;

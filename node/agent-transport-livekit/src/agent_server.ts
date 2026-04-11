@@ -103,6 +103,13 @@ export class AgentServer {
   private httpServer?: Server;
   private loadMonitor = new LoadMonitor();
   private inferenceExecutor: any = null;
+  // Cooperative shutdown flag for the SIP event loop. The loop polls this
+  // each iteration and breaks when set, so the run() promise can await the
+  // loop's exit before tearing down the endpoint. Without this, the loop
+  // would keep polling forever (its waitForEvent timeout fires every 1 s)
+  // and Node would never exit because the pending Promise pins the
+  // libuv event loop.
+  private shutdownRequested = false;
 
   // Prometheus-compatible metrics (in-memory, served as text)
   private sipCallsTotal = { inbound: 0, outbound: 0 };
@@ -270,13 +277,19 @@ export class AgentServer {
     this.startHttpServer();
     console.log(`HTTP server on http://${this.host}:${this.port}`);
 
-    // Start SIP event loop
-    this.sipEventLoop();
+    // Start SIP event loop. Track the promise so we can await its exit
+    // during shutdown — without this the infinite while loop would pin
+    // Node's event loop forever.
+    const eventLoopDone = this.sipEventLoop();
 
     // Wait for shutdown signal
     await new Promise<void>((resolve) => {
-      process.on('SIGINT', () => resolve());
-      process.on('SIGTERM', () => resolve());
+      const onSignal = () => {
+        this.shutdownRequested = true;
+        resolve();
+      };
+      process.on('SIGINT', onSignal);
+      process.on('SIGTERM', onSignal);
     });
 
     console.log('Shutting down...');
@@ -299,6 +312,10 @@ export class AgentServer {
     }
     this.httpServer?.close();
     this.ep?.shutdown();
+    // Wait for the event loop to actually exit so Node can release the
+    // libuv handle and the process can terminate. The shutdown sentinel
+    // pushed by ep.shutdown() above wakes the loop immediately.
+    await eventLoopDone;
   }
 
   /**
@@ -319,9 +336,15 @@ export class AgentServer {
   // pendingOutbound removed — outbound calls start session directly after ep.call()
 
   private async sipEventLoop(): Promise<void> {
-    while (true) {
+    while (!this.shutdownRequested) {
       const ev = await this.waitForEvent(1000);
       if (!ev) continue;
+
+      // Sentinel pushed by ep.shutdown() — wake immediately instead of
+      // waiting for the next 1 s waitForEvent timeout, then exit cleanly.
+      if (ev.eventType === 'shutdown') {
+        break;
+      }
 
       if (ev.eventType === 'incoming_call' && ev.session) {
         const sessionId = ev.session.sessionId;
@@ -650,21 +673,13 @@ export class AgentServer {
 
   // ─── Helpers ────────────────────────────────────────────────────
 
-  private waitForEvent(timeoutMs: number): Promise<ReturnType<SipEndpoint['pollEvent']> | null> {
-    return new Promise((resolve) => {
-      const start = Date.now();
-      const poll = () => {
-        const ev = this.ep?.pollEvent();
-        if (ev) {
-          resolve(ev);
-        } else if (Date.now() - start >= timeoutMs) {
-          resolve(null);
-        } else {
-          setTimeout(poll, 50);
-        }
-      };
-      poll();
-    });
+  private async waitForEvent(timeoutMs: number): Promise<ReturnType<SipEndpoint['pollEvent']> | null> {
+    // Use the napi blocking waitForEvent (runs on the napi thread pool, so
+    // the JS event loop is not blocked). This wakes immediately when
+    // ep.shutdown() pushes the Shutdown sentinel — much faster than the
+    // old setInterval-based polling and avoids burning CPU between polls.
+    if (!this.ep) return null;
+    return await this.ep.waitForEvent(timeoutMs);
   }
 
   private configureLogging(mode: string): void {

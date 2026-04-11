@@ -94,6 +94,11 @@ export class AudioStreamServer {
   private inferenceExecutor: any;
   private sessionCount = 0;
   private sessionDurations: number[] = [];
+  // Cooperative shutdown flag for the WS event loop. The loop checks this
+  // each iteration and breaks when set, so the run() promise can await the
+  // loop's exit before tearing down. Without this, the infinite poll loop
+  // would pin Node's libuv event loop forever.
+  private shutdownRequested = false;
 
   constructor(opts: AudioStreamServerOptions) {
     this.listenAddr = opts.listenAddr ?? process.env.AUDIO_STREAM_ADDR ?? '0.0.0.0:8765';
@@ -226,13 +231,15 @@ export class AudioStreamServer {
     this.startHttpServer();
     console.log(`HTTP server on http://${this.host}:${this.port}`);
 
-    // Start event loop
-    this.eventLoop();
+    // Start event loop. Track the promise so we can await its exit during
+    // shutdown — without this the infinite while loop pins libuv forever.
+    const eventLoopDone = this.eventLoop();
 
     // Wait for shutdown signal
     await new Promise<void>((resolve) => {
       const shutdown = async () => {
         console.log('Shutting down...');
+        this.shutdownRequested = true;
         // Drain active sessions with 10-second timeout
         if (this.activeSessions.size > 0) {
           console.log(`Draining ${this.activeSessions.size} active session(s)...`);
@@ -247,6 +254,10 @@ export class AudioStreamServer {
         this.loadMonitor.stop();
         if (this.httpServer) this.httpServer.close();
         if (this.ep) this.ep.shutdown();
+        // Wait for the event loop to actually exit so Node releases its
+        // libuv handle. ep.shutdown() pushes a Shutdown sentinel that wakes
+        // the loop immediately.
+        await eventLoopDone;
         resolve();
       };
       process.on('SIGINT', shutdown);
@@ -273,9 +284,14 @@ export class AudioStreamServer {
     // call_media_active (fired on first audio frame) starts the agent session.
     const pendingSessions = new Map<string, { callUuid: string; streamId: string; headers: Record<string, string> }>();
 
-    while (true) {
+    while (!this.shutdownRequested) {
       const ev = await this.waitForEvent(1000);
       if (!ev) continue;
+
+      // Sentinel pushed by ep.shutdown() — wake immediately and exit cleanly.
+      if (ev.eventType === 'shutdown') {
+        break;
+      }
 
       if (ev.eventType === 'incoming_call' && ev.session) {
         const sessionId = ev.session.sessionId;
@@ -473,14 +489,11 @@ export class AudioStreamServer {
   }
 
   private async waitForEvent(timeoutMs: number): Promise<any> {
-    return new Promise((resolve) => {
-      const check = () => {
-        if (!this.ep) { resolve(null); return; }
-        const ev = this.ep.pollEvent();
-        if (ev) { resolve(ev); return; }
-        setTimeout(check, Math.min(timeoutMs, 100));
-      };
-      check();
-    });
+    // Use the napi blocking waitForEvent (runs on the napi thread pool, so
+    // the JS event loop is not blocked). Wakes immediately when
+    // ep.shutdown() pushes the Shutdown sentinel — much faster than the
+    // old setTimeout-based polling and no CPU spin between polls.
+    if (!this.ep) return null;
+    return await this.ep.waitForEvent(timeoutMs);
   }
 }
