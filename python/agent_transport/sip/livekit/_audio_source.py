@@ -205,7 +205,14 @@ class AudioStreamAudioSource(SipAudioSource):
                         fut.set_result(None)
                     self._plivo_playout_fut = None
 
-            asyncio.create_task(_wait())
+            # Store a strong reference until the task completes — Python's
+            # event loop only holds weak references and the GC can collect
+            # an in-flight task otherwise.
+            t = asyncio.create_task(_wait())
+            if not hasattr(self, "_pending_playout_tasks"):
+                self._pending_playout_tasks: set[asyncio.Task] = set()
+            self._pending_playout_tasks.add(t)
+            t.add_done_callback(self._pending_playout_tasks.discard)
 
         await asyncio.shield(self._plivo_playout_fut)
 

@@ -135,11 +135,15 @@ class _LoadMonitor:
         self._avg = MovingAverage(5)
         self._cpu_monitor = get_cpu_monitor()
         self._lock = threading.Lock()
+        self._stop = threading.Event()
         self._thread = threading.Thread(target=self._sample_loop, daemon=True)
         self._thread.start()
 
     def _sample_loop(self) -> None:
-        while True:
+        # Cooperative shutdown via _stop event so the thread doesn't keep
+        # sampling CPU during process teardown. daemon=True still guarantees
+        # process exit, but a clean stop is friendlier to test harnesses.
+        while not self._stop.is_set():
             cpu = self._cpu_monitor.cpu_percent(interval=0.5)
             with self._lock:
                 self._avg.add_sample(cpu)
@@ -147,6 +151,11 @@ class _LoadMonitor:
     def get_load(self) -> float:
         with self._lock:
             return self._avg.get_avg()
+
+    def stop(self) -> None:
+        """Signal the sampler thread to exit and join briefly."""
+        self._stop.set()
+        self._thread.join(timeout=1.0)
 
 
 # ─── JobContext ───────────────────────────────────────────────────
@@ -290,9 +299,18 @@ class AudioStreamServer:
         self._proc = JobProcess()
         self._userdata: dict[str, Any] = {}
         self._ep: AudioStreamEndpoint | None = None
-        self._active_sessions: dict[int, asyncio.Task] = {}
-        self._session_ended_events: dict[int, asyncio.Event] = {}
-        self._session_contexts: dict[int, JobContext] = {}
+        # Session IDs are strings (Rust CallSession.session_id). Type hints
+        # were `int` previously — duck-typed at runtime, fixing the
+        # annotations so mypy/pyright agree with reality.
+        self._active_sessions: dict[str, asyncio.Task] = {}
+        self._session_ended_events: dict[str, asyncio.Event] = {}
+        self._session_contexts: dict[str, JobContext] = {}
+        # Strong-reference set for fire-and-forget asyncio tasks (session
+        # start dispatch). Python's event loop only holds weak references
+        # to tasks; without storing them here, the GC can collect a task
+        # mid-execution and emit "Task was destroyed but it is pending!"
+        # warnings.
+        self._background_tasks: set[asyncio.Task] = set()
         self._load_monitor = _LoadMonitor()
 
     @property
@@ -454,7 +472,10 @@ class AudioStreamServer:
         await runner.cleanup()
         if self._inference_executor:
             await self._inference_executor.aclose()
-        self._ep.shutdown()
+        self._load_monitor.stop()
+        # ep.shutdown() does block_on for cancel + per-session hangup. Wrap
+        # in run_in_executor so the asyncio loop isn't blocked during teardown.
+        await loop.run_in_executor(None, self._ep.shutdown)
 
     def _configure_logging(self, mode: str) -> None:
         if mode == "debug":
@@ -563,6 +584,12 @@ class AudioStreamServer:
             try:
                 ev_type = ev["type"]
 
+                if ev_type == "shutdown":
+                    # Sentinel pushed by ep.shutdown() — wake immediately
+                    # instead of waiting for the next 1s poll cycle.
+                    logger.debug("audio_stream event loop received shutdown sentinel")
+                    break
+
                 if ev_type == "incoming_call":
                     session = ev["session"]
                     session_id = session.session_id
@@ -577,9 +604,11 @@ class AudioStreamServer:
                     if session_id in pending_sessions:
                         plivo_call_uuid, stream_id, extra_headers = pending_sessions.pop(session_id)
                         logger.info("Audio stream session %s media active, starting agent", session_id)
-                        asyncio.create_task(
+                        t = asyncio.create_task(
                             self._start_session(session_id, plivo_call_uuid, stream_id, extra_headers)
                         )
+                        self._background_tasks.add(t)
+                        t.add_done_callback(self._background_tasks.discard)
 
                 elif ev_type == "call_terminated":
                     session_id = ev["session"].session_id

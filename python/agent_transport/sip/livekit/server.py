@@ -147,11 +147,16 @@ class _LoadMonitor:
         self._avg = MovingAverage(5)
         self._cpu_monitor = get_cpu_monitor()
         self._lock = threading.Lock()
+        self._stop = threading.Event()
         self._thread = threading.Thread(target=self._sample_loop, daemon=True)
         self._thread.start()
 
     def _sample_loop(self) -> None:
-        while True:
+        # Cooperative shutdown via _stop event so test harnesses and rapid
+        # start/stop cycles don't leak threads. The thread is daemon=True so
+        # process exit is unblocked regardless, but a clean stop avoids the
+        # 0.5s wasted-CPU window during shutdown.
+        while not self._stop.is_set():
             cpu = self._cpu_monitor.cpu_percent(interval=0.5)
             with self._lock:
                 self._avg.add_sample(cpu)
@@ -159,6 +164,13 @@ class _LoadMonitor:
     def get_load(self) -> float:
         with self._lock:
             return self._avg.get_avg()
+
+    def stop(self) -> None:
+        """Signal the sampler thread to exit and join with a short timeout."""
+        self._stop.set()
+        # cpu_percent's 0.5s sleep is uninterruptible, so we wait at most
+        # ~600ms for it to finish naturally.
+        self._thread.join(timeout=1.0)
 
 
 @dataclass
@@ -301,6 +313,12 @@ class AgentServer:
         self._active_calls: dict[str, asyncio.Task] = {}
         self._call_ended_events: dict[str, asyncio.Event] = {}
         self._call_contexts: dict[str, JobContext] = {}
+        # Strong-reference set for fire-and-forget asyncio tasks (outbound
+        # dial wrappers, inbound _start_call dispatch). Python's event loop
+        # only holds weak references to tasks; without storing them here,
+        # the GC can collect a task mid-execution and emit
+        # "Task was destroyed but it is pending!" warnings.
+        self._background_tasks: set[asyncio.Task] = set()
         # _pending_outbound removed — outbound calls start session directly after ep.call()
         self._load_monitor = _LoadMonitor()
 
@@ -478,7 +496,12 @@ class AgentServer:
         await runner.cleanup()
         if self._inference_executor:
             await self._inference_executor.aclose()
-        self._ep.shutdown()
+        # Stop background threads cleanly before exiting.
+        self._load_monitor.stop()
+        # ep.shutdown() does block_on for unregister + per-call hangup. Wrap
+        # in run_in_executor so the asyncio loop isn't blocked for the
+        # ~200ms it takes to talk to the proxy.
+        await loop.run_in_executor(None, self._ep.shutdown)
 
     def _configure_logging(self, mode: str) -> None:
         if mode == "debug":
@@ -603,7 +626,9 @@ class AgentServer:
                 return web.json_response({"error": str(e)}, status=500)
 
             logger.info("Outbound call %s to %s connected (from=%s)", session_id, destination, from_uri or "default")
-            asyncio.create_task(self._start_call(session_id, destination, direction="outbound"))
+            t = asyncio.create_task(self._start_call(session_id, destination, direction="outbound"))
+            self._background_tasks.add(t)
+            t.add_done_callback(self._background_tasks.discard)
             return web.json_response({
                 "session_id": session_id, "status": "connected",
                 "to": raw_to, "from": raw_from,
@@ -622,7 +647,9 @@ class AgentServer:
                 except Exception as e:
                     logger.warning("Outbound call %s to %s failed: %s", session_id, destination, e)
 
-            asyncio.create_task(_dial())
+            t = asyncio.create_task(_dial())
+            self._background_tasks.add(t)
+            t.add_done_callback(self._background_tasks.discard)
             return web.json_response({
                 "session_id": session_id, "status": "dialing",
                 "to": raw_to, "from": raw_from,
@@ -650,6 +677,13 @@ class AgentServer:
             try:
                 ev_type = ev["type"]
 
+                if ev_type == "shutdown":
+                    # Sentinel pushed by ep.shutdown() so this loop wakes
+                    # immediately instead of waiting for the next 1s poll
+                    # timeout. Exit cleanly.
+                    logger.debug("sip event loop received shutdown sentinel")
+                    break
+
                 if ev_type == "incoming_call":
                     session_id = ev["session"].session_id
                     remote_uri = ev["session"].remote_uri
@@ -666,9 +700,11 @@ class AgentServer:
 
                     if session_id in pending_inbound:
                         remote_uri = pending_inbound.pop(session_id)
-                        asyncio.create_task(
+                        t = asyncio.create_task(
                             self._start_call(session_id, remote_uri, direction="inbound")
                         )
+                        self._background_tasks.add(t)
+                        t.add_done_callback(self._background_tasks.discard)
 
                 elif ev_type == "call_terminated":
                     session_id = ev["session"].session_id
