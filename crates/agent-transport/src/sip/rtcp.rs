@@ -97,9 +97,103 @@ pub fn build_receiver_report(
     buf
 }
 
+/// Detect whether a packet received on an RTP-muxed socket is RTCP or RTP.
+///
+/// Per RFC 5761 §4, when RTP and RTCP share a single transport (a=rtcp-mux),
+/// peers distinguish them by looking at the payload-type field (byte 1 of
+/// the packet, with the marker bit masked off):
+///
+/// * `PT & 0x7F` in `64..=95` → RTCP
+/// * otherwise (0..=33 or 96..=127) → RTP
+///
+/// Returns `true` if the buffer looks like an RTCP packet and should be
+/// handed to an RTCP handler (or skipped) rather than parsed as RTP.
+///
+/// The 72..=76 values we saw in debug logs correspond to the seven-bit
+/// view of RTCP PTs 200 (SR), 201 (RR), 202 (SDES), 203 (BYE), 204 (APP):
+/// `200 & 0x7F = 72`, `201 & 0x7F = 73`, etc.
+pub fn is_rtcp(buf: &[u8]) -> bool {
+    if buf.len() < 2 { return false; }
+    let pt = buf[1] & 0x7F;
+    (64..=95).contains(&pt)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ─── is_rtcp (RFC 5761 RTP/RTCP de-mux) ──────────────────────────────
+
+    #[test]
+    fn rtp_pcmu_is_not_rtcp() {
+        // M=0, PT=0 (PCMU)
+        let buf = [0x80u8, 0x00, 0, 0];
+        assert!(!is_rtcp(&buf));
+    }
+
+    #[test]
+    fn rtp_dynamic_is_not_rtcp() {
+        // M=1, PT=101 (DTMF telephone-event)
+        let buf = [0x80u8, 0x80 | 101, 0, 0];
+        assert!(!is_rtcp(&buf));
+    }
+
+    #[test]
+    fn rtcp_sr_is_rtcp() {
+        // RTCP Sender Report: PT=200 (0xC8)
+        let buf = [0x80u8, 0xC8, 0, 0];
+        assert!(is_rtcp(&buf));
+    }
+
+    #[test]
+    fn rtcp_rr_is_rtcp() {
+        // RTCP Receiver Report: PT=201 (0xC9)
+        let buf = [0x81u8, 0xC9, 0, 0];
+        assert!(is_rtcp(&buf));
+    }
+
+    #[test]
+    fn rtcp_sdes_bye_app_are_rtcp() {
+        for pt in [202u8, 203, 204] {
+            let buf = [0x80u8, pt, 0, 0];
+            assert!(is_rtcp(&buf), "PT {} should be RTCP", pt);
+        }
+    }
+
+    #[test]
+    fn short_buffer_is_not_rtcp() {
+        // Too short to classify — treat as non-RTCP (caller will drop below 12 bytes).
+        assert!(!is_rtcp(&[]));
+        assert!(!is_rtcp(&[0x80]));
+    }
+
+    #[test]
+    fn rtp_pts_near_boundary_are_not_rtcp() {
+        // PT=33 is the last static RTP type; not RTCP.
+        let buf = [0x80u8, 33, 0, 0];
+        assert!(!is_rtcp(&buf));
+        // PT=96 is the first dynamic RTP type; not RTCP.
+        let buf = [0x80u8, 96, 0, 0];
+        assert!(!is_rtcp(&buf));
+    }
+
+    #[test]
+    fn rtcp_boundaries_are_rtcp() {
+        // 64 and 95 are the RFC 5761 RTCP boundary values.
+        let buf = [0x80u8, 64, 0, 0];
+        assert!(is_rtcp(&buf));
+        let buf = [0x80u8, 95, 0, 0];
+        assert!(is_rtcp(&buf));
+    }
+
+    #[test]
+    fn marker_bit_is_ignored() {
+        // M=1 on top of an RTCP PT (via 0x80 flag). Still RTCP.
+        let buf = [0x80u8, 0x80 | 72, 0, 0];
+        assert!(is_rtcp(&buf));
+    }
+
+    // ─── build_sender_report / build_receiver_report ─────────────────────
 
     #[test]
     fn test_sender_report_size() {
