@@ -16,6 +16,8 @@ use std::fs::File;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
+use crate::sync::LockExt;
+
 use opus::Encoder as OpusEncoder;
 use opus::{Application, Channels};
 use ogg::writing::PacketWriter;
@@ -77,14 +79,14 @@ impl CallRecorder {
     }
 
     fn drain(&self) -> (Vec<i16>, Vec<i16>, u32, RecordingMode) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock_or_recover();
         let user: Vec<i16> = inner.user_pending.drain(..).collect();
         let agent: Vec<i16> = inner.agent_pending.drain(..).collect();
         (user, agent, inner.sample_rate, inner.mode)
     }
 
     fn is_finalized(&self) -> bool {
-        self.inner.lock().unwrap().finalized
+        self.inner.lock_or_recover().finalized
     }
 
     fn mark_finalized(&self) {
@@ -267,11 +269,19 @@ impl RecordingManager {
             wake: Arc::new((Mutex::new(false), Condvar::new())),
         });
 
-        let mgr_ref = mgr.clone();
+        // Use a Weak reference in the encoder thread to break the Arc cycle.
+        // Without this, the thread would hold a strong Arc<Self> forever,
+        // preventing the RecordingManager from being dropped when the endpoint
+        // is dropped — leaking the thread, the OGG encoder state, and all the
+        // mutexes/condvars it holds.
+        let mgr_weak = Arc::downgrade(&mgr);
+        let wake_clone = mgr.wake.clone();
         std::thread::Builder::new()
             .name("recording-encoder".into())
             .spawn(move || {
-                if let Err(e) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| mgr_ref.encoder_loop())) {
+                if let Err(e) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    RecordingManager::encoder_loop_weak(mgr_weak, wake_clone)
+                })) {
                     tracing::error!("Recording encoder thread panicked: {:?}", e);
                 }
             })
@@ -280,50 +290,47 @@ impl RecordingManager {
         mgr
     }
 
-    pub fn start(&self, call_id: &str, path: &str, mode: RecordingMode, sample_rate: u32) -> Arc<CallRecorder> {
-        let rec = Arc::new(CallRecorder::new(sample_rate, mode));
-        self.recordings.lock().unwrap().insert(
-            call_id.to_string(), (rec.clone(), path.to_string()),
-        );
-        info!("Recording: {} → {} ({:?} {}Hz)", call_id, path, mode, sample_rate);
-        rec
-    }
-
-    pub fn stop(&self, call_id: &str) {
-        if let Some((rec, _)) = self.recordings.lock().unwrap().get(call_id) {
-            rec.mark_finalized();
-        }
-        // Wake encoder thread to do final drain + finalize immediately
-        let (lock, cvar) = &*self.wake;
-        *lock.lock().unwrap() = true;
-        cvar.notify_one();
-    }
-
-    pub fn shutdown(&self) {
-        *self.shutdown.lock().unwrap() = true;
-        let (lock, cvar) = &*self.wake;
-        *lock.lock().unwrap() = true;
-        cvar.notify_one();
-    }
-
-    fn encoder_loop(&self) {
+    /// Encoder loop that exits when the manager's strong refcount hits 0.
+    /// Upgrades the weak reference on each iteration; if upgrade fails,
+    /// the manager has been dropped and the thread exits cleanly.
+    fn encoder_loop_weak(
+        mgr_weak: std::sync::Weak<Self>,
+        wake: Arc<(Mutex<bool>, Condvar)>,
+    ) {
         let mut ogg_states: HashMap<String, OggState> = HashMap::new();
 
         loop {
             // Sleep up to BATCH_INTERVAL_MS, but wake immediately on stop/shutdown
             {
-                let (lock, cvar) = &*self.wake;
-                let mut woken = lock.lock().unwrap();
+                let (lock, cvar) = &*wake;
+                let mut woken = lock.lock_or_recover();
                 if !*woken {
-                    let (guard, _) = cvar.wait_timeout(woken, Duration::from_millis(BATCH_INTERVAL_MS)).unwrap();
+                    // If the mutex was poisoned mid-wait (another thread panicked
+                    // while holding the wake lock), recover the guard so the encoder
+                    // thread keeps running for the other active recordings.
+                    let guard = match cvar.wait_timeout(woken, Duration::from_millis(BATCH_INTERVAL_MS)) {
+                        Ok((g, _)) => g,
+                        Err(e) => {
+                            warn!("recorder wake cvar poisoned, recovering");
+                            e.into_inner().0
+                        }
+                    };
                     woken = guard;
                 }
                 *woken = false;
             }
 
-            let is_shutdown = *self.shutdown.lock().unwrap();
+            // Try to upgrade the weak reference. If this fails, the manager
+            // has been dropped (last strong Arc released) — finalize any
+            // remaining OGG state and exit the thread.
+            let Some(mgr) = mgr_weak.upgrade() else {
+                for (_, ogg) in ogg_states.drain() { ogg.finalize(); }
+                break;
+            };
+
+            let is_shutdown = *mgr.shutdown.lock_or_recover();
             let snapshot: Vec<(String, Arc<CallRecorder>, String)> = {
-                self.recordings.lock().unwrap()
+                mgr.recordings.lock_or_recover()
                     .iter()
                     .map(|(k, (r, p))| (k.clone(), r.clone(), p.clone()))
                     .collect()
@@ -355,8 +362,12 @@ impl RecordingManager {
 
             for id in &to_remove {
                 if let Some(ogg) = ogg_states.remove(id) { ogg.finalize(); }
-                self.recordings.lock().unwrap().remove(id);
+                mgr.recordings.lock_or_recover().remove(id);
             }
+
+            // Release the strong ref before sleeping so the manager can drop
+            // while we're waiting on the condvar.
+            drop(mgr);
 
             if is_shutdown {
                 for (_, ogg) in ogg_states.drain() { ogg.finalize(); }
@@ -364,6 +375,33 @@ impl RecordingManager {
             }
         }
     }
+
+    pub fn start(&self, call_id: &str, path: &str, mode: RecordingMode, sample_rate: u32) -> Arc<CallRecorder> {
+        let rec = Arc::new(CallRecorder::new(sample_rate, mode));
+        self.recordings.lock_or_recover().insert(
+            call_id.to_string(), (rec.clone(), path.to_string()),
+        );
+        info!("Recording: {} → {} ({:?} {}Hz)", call_id, path, mode, sample_rate);
+        rec
+    }
+
+    pub fn stop(&self, call_id: &str) {
+        if let Some((rec, _)) = self.recordings.lock_or_recover().get(call_id) {
+            rec.mark_finalized();
+        }
+        // Wake encoder thread to do final drain + finalize immediately
+        let (lock, cvar) = &*self.wake;
+        *lock.lock_or_recover() = true;
+        cvar.notify_one();
+    }
+
+    pub fn shutdown(&self) {
+        *self.shutdown.lock_or_recover() = true;
+        let (lock, cvar) = &*self.wake;
+        *lock.lock_or_recover() = true;
+        cvar.notify_one();
+    }
+
 }
 
 impl Drop for RecordingManager {
@@ -437,6 +475,26 @@ mod tests {
     }
 
     #[test]
+    fn test_recording_manager_drops_cleanly_without_explicit_shutdown() {
+        // Regression: RecordingManager previously held a strong Arc<Self> in
+        // its encoder thread, creating a cycle that prevented Drop from ever
+        // running. Verify the Weak refactor allows natural drop.
+        let mgr = RecordingManager::new();
+        let weak = Arc::downgrade(&mgr);
+        // Strong count: 1 (just us)
+        assert_eq!(Arc::strong_count(&mgr), 1, "encoder thread must hold Weak, not Arc");
+        drop(mgr);
+        // After drop, weak.upgrade() should return None within a reasonable
+        // time (the encoder thread wakes up on next tick and exits).
+        let mut upgraded = true;
+        for _ in 0..50 {
+            if weak.upgrade().is_none() { upgraded = false; break; }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert!(!upgraded, "RecordingManager Arc must be fully dropped (encoder thread exited)");
+    }
+
+    #[test]
     fn test_late_binding_recorder() {
         // Verify the Arc<Mutex<Option>> pattern works
         let recorder: Arc<Mutex<Option<Arc<CallRecorder>>>> = Arc::new(Mutex::new(None));
@@ -445,18 +503,18 @@ mod tests {
         let rec_ref = recorder.clone();
 
         // Initially empty
-        assert!(rec_ref.lock().unwrap().is_none());
+        assert!(rec_ref.lock_or_recover().is_none());
 
         // "start_recording" sets it later
         let mgr = RecordingManager::new();
         let call_rec = mgr.start("late-test", "/tmp/late_test.ogg", RecordingMode::Mono, 16000);
-        *recorder.lock().unwrap() = Some(call_rec);
+        *recorder.lock_or_recover() = Some(call_rec);
 
         // Now the "send loop" can see it
-        assert!(rec_ref.lock().unwrap().is_some());
+        assert!(rec_ref.lock_or_recover().is_some());
 
         // Write some samples through the shared reference
-        if let Some(ref rec) = *rec_ref.lock().unwrap() {
+        if let Some(ref rec) = *rec_ref.lock_or_recover() {
             rec.write_agent_samples(&[100, 200, 300]);
             rec.write_user_samples(&[400, 500, 600]);
         }

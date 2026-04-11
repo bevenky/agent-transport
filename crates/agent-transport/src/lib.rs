@@ -33,6 +33,7 @@ mod events;
 #[cfg(feature = "plc")]
 pub mod plc;
 mod recorder;
+mod sync;
 
 // Transport modules
 pub mod sip;
