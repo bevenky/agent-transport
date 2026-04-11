@@ -119,22 +119,31 @@ export class SipAudioOutput extends _AudioOutputBase {
   pause(): void {
     super.pause();
     if (!this.rustPaused) {
-      this.rustPaused = true;
+      // Update the flag AFTER the FFI call succeeds. If endpoint.pause()
+      // throws (e.g., session already closed), the flag must stay false
+      // so a subsequent pause() retries instead of being short-circuited
+      // by the guard — otherwise Rust keeps sending audio while the TS
+      // layer thinks it's paused.
       try {
         this.endpoint.pause(this.sessionId);
+        this.rustPaused = true;
         _log('SipAudioOutput.pause: Rust paused');
-      } catch { /* ignore */ }
+      } catch (e) {
+        _log(`SipAudioOutput.pause failed: ${(e as Error)?.message ?? e}`);
+      }
     }
   }
 
   resume(): void {
     super.resume();
     if (this.rustPaused) {
-      this.rustPaused = false;
       try {
         this.endpoint.resume(this.sessionId);
+        this.rustPaused = false;
         _log('SipAudioOutput.resume: Rust resumed');
-      } catch { /* ignore */ }
+      } catch (e) {
+        _log(`SipAudioOutput.resume failed: ${(e as Error)?.message ?? e}`);
+      }
     }
   }
 

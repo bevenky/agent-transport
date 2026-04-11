@@ -8,6 +8,7 @@
  *   npx tsx sip_agent.ts debug     # full debug
  */
 
+import { initLogging } from 'agent-transport';
 import { AgentServer, JobProcess, type JobContext } from 'agent-transport/livekit';
 import { voice, llm, metrics, getJobContext } from '@livekit/agents';
 import * as deepgram from '@livekit/agents-plugin-deepgram';
@@ -15,6 +16,12 @@ import * as openai from '@livekit/agents-plugin-openai';
 import * as silero from '@livekit/agents-plugin-silero';
 import * as livekit from '@livekit/agents-plugin-livekit';
 import { z } from 'zod';
+
+// Install Rust tracing subscriber so RUST_LOG debug/trace output from the
+// Rust core (SIP signaling, RTP pacing, audio buffer state) is visible on
+// stderr. Without this, the Node binding has no subscriber and RUST_LOG
+// has zero effect.
+initLogging(process.env.RUST_LOG ?? 'info');
 
 const server = new AgentServer({
   sipUsername: process.env.SIP_USERNAME!,
