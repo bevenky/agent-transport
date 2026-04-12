@@ -42,6 +42,7 @@ dependencies = [
  "napi",
  "napi-build",
  "napi-derive",
+ "tracing-subscriber",
 ]
 
 [[package]]

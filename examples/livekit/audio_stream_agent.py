@@ -45,7 +45,7 @@ from livekit.agents import Agent, AgentSession, RunContext, TurnHandlingOptions,
 from livekit.agents.llm import function_tool
 from livekit.agents.voice.background_audio import BackgroundAudioPlayer, BuiltinAudioClip
 from livekit.agents.job import get_job_context
-from livekit.agents.beta.tools import send_dtmf_events
+from livekit.agents.beta.tools import EndCallTool, send_dtmf_events
 from livekit.plugins import deepgram, openai, silero
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
 
@@ -82,8 +82,14 @@ class Assistant(Agent):
                 "Keep responses concise and conversational. "
                 "Do not use emojis, asterisks, markdown, or special formatting."
             ),
-            # LiveKit's built-in send_dtmf_events tool — works via Room facade
-            tools=[send_dtmf_events],
+            # LiveKit built-in tools:
+            # - send_dtmf_events: works via Room facade
+            # - EndCallTool: beta tool that ends the call when the user says
+            #   goodbye. Hooks into job_ctx.shutdown() + job_ctx.delete_room(),
+            #   both of which we implement on _StubJobContext. Uses
+            #   speech_handle.add_done_callback so the goodbye plays fully
+            #   before the session closes.
+            tools=[send_dtmf_events, EndCallTool()],
         )
 
     async def on_enter(self) -> None:
@@ -114,21 +120,6 @@ class Assistant(Agent):
         logger.info("Looking up weather for %s", location)
         return f"The weather in {location} is sunny with a temperature of 72 degrees."
 
-    @function_tool
-    async def end_call(self, context: RunContext) -> str:
-        """Ends the current call and disconnects.
-
-        Call when:
-        - The user clearly indicates they are done (e.g., "that's all, bye")
-        - The conversation is complete and should end
-
-        Do not call when:
-        - The user asks to pause, hold, or transfer
-        - Intent is unclear
-        """
-        logger.info("End call requested")
-        context.session.shutdown()
-        return "Say goodbye to the user."
 
 
 @server.audio_stream_session()

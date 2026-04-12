@@ -81,19 +81,24 @@ def main():
         print(f"Call initiated (session_id={session_id}). Waiting for answer...")
     else:
         print("Waiting for incoming call... (Ctrl+C to quit)")
+        # Rust auto-answers inbound calls, so we just wait for the
+        # call_ringing event to know one has arrived (pre-answer, for
+        # logging) and then for call_answered to proceed.
         while True:
             event = ep.wait_for_event(timeout_ms=1000)
-            if event and event["type"] == "incoming_call":
+            if event and event["type"] == "call_ringing":
                 session_id = event["session"]["session_id"]
-                print(f"Incoming call from {event['session']['remote_uri']}")
-                ep.answer(session_id)
+                print(f"Incoming call from {event['session']['remote_uri']} (ringing)")
                 break
 
+    # Wait for the call to be answered (media active). For inbound this
+    # happens automatically after Rust auto-answers; for outbound it
+    # happens when the callee picks up.
     while True:
         event = ep.wait_for_event(timeout_ms=500)
         if event is None:
             continue
-        if event["type"] == "call_media_active":
+        if event["type"] == "call_answered":
             break
         if event["type"] == "call_terminated":
             print(f"Call ended before connecting: {event.get('reason', '')}")

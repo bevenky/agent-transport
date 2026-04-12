@@ -57,8 +57,8 @@ fn main() -> anyhow::Result<()> {
 
     loop {
         match events.recv_timeout(Duration::from_millis(10)) {
-            Ok(EndpointEvent::CallMediaActive { .. }) => {
-                println!("Media active.");
+            Ok(EndpointEvent::CallAnswered { .. }) => {
+                println!("Call answered, media active.");
                 media_active = true;
             }
             Ok(EndpointEvent::CallTerminated { reason, .. }) => {

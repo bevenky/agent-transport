@@ -36,5 +36,5 @@ try {
   }
 }
 
-export const { SipEndpoint, AudioStreamEndpoint } = binding;
+export const { SipEndpoint, AudioStreamEndpoint, initLogging } = binding;
 export default binding;

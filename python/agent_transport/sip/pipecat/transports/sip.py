@@ -154,6 +154,15 @@ class SipServerTransport:
         self._session_start_times: Dict[str, float] = {}
         # Per-session event queues — server dispatches events to the right session
         self._session_event_queues: Dict[str, asyncio.Queue] = {}
+        # Strong-reference set for fire-and-forget asyncio tasks. Python's
+        # event loop only holds weak references to tasks; without storing
+        # them here, the GC can collect a task mid-execution.
+        self._background_tasks: set[asyncio.Task] = set()
+        # Outbound session ids owned by `SipServer.call()` — the event loop
+        # skips `call_answered` for these so the session isn't double-created.
+        self._outbound_session_ids: set[str] = set()
+        # Server-level event listeners (pre-answer hooks: "ringing", etc.)
+        self._server_listeners: Dict[str, list[Callable]] = {}
 
     @property
     def endpoint(self) -> Optional[SipEndpoint]:
@@ -194,6 +203,42 @@ class SipServerTransport:
             return fn
         return decorator
 
+    def on(self, event_name: str, callback: Optional[Callable] = None) -> Callable:
+        """Register a server-level event listener.
+
+        Server events fire before the per-session pipecat transport exists.
+        Currently the only pre-answer event is ``"ringing"`` — fired for
+        inbound SIP calls immediately after Rust has sent 180 Ringing.
+        Handler receives a ``CallSession`` with ``session_id``, ``remote_uri``,
+        ``call_uuid``, ``extra_headers``. Rust auto-answers right after.
+
+        Handlers may be sync or ``async def``.
+
+        Usage::
+
+            @server.on("ringing")
+            def on_ringing(session):
+                logger.info("Incoming call from %s", session.remote_uri)
+        """
+        def decorator(fn: Callable) -> Callable:
+            self._server_listeners.setdefault(event_name, []).append(fn)
+            return fn
+        if callback is not None:
+            return decorator(callback)
+        return decorator
+
+    def _emit_server_event(self, event_name: str, *args, **kwargs) -> None:
+        """Fire a server-level event to all registered listeners."""
+        for listener in self._server_listeners.get(event_name, []):
+            try:
+                result = listener(*args, **kwargs)
+                if asyncio.iscoroutine(result):
+                    t = asyncio.create_task(result)
+                    self._background_tasks.add(t)
+                    t.add_done_callback(self._background_tasks.discard)
+            except Exception:
+                logger.exception("Server event listener for {} failed", event_name)
+
     async def call(self, dest_uri: str, from_uri: Optional[str] = None, headers: Optional[Dict[str, str]] = None) -> Optional[str]:
         """Make an outbound SIP call.
 
@@ -204,6 +249,13 @@ class SipServerTransport:
             headers: Optional custom SIP headers.
 
         Returns session_id if successful, None otherwise.
+
+        **Implementation note:** After `ep.call()` returns with the session
+        id, we start the pipecat session DIRECTLY (matching LiveKit's
+        pattern). The event loop will later see a `call_answered` event
+        for this session id and skip it because we've registered the id
+        in `_outbound_session_ids`. This replaces the previous implicit
+        "unknown session = outbound" fallback branch in the event loop.
         """
         if not self._ep:
             raise RuntimeError("Server not started")
@@ -212,6 +264,20 @@ class SipServerTransport:
             session_id = await loop.run_in_executor(
                 None, lambda: self._ep.call(dest_uri, from_uri=from_uri, headers=headers)
             )
+            if not session_id:
+                return None
+            # Reserve the id so the event loop skips its `call_answered`
+            # handler for this session.
+            self._outbound_session_ids.add(session_id)
+            # Start the pipecat session directly — matches LiveKit server.
+            session_data = {
+                "session_id": session_id,
+                "remote_uri": dest_uri,
+                "call_uuid": session_id,
+                "direction": "Outbound",
+                "extra_headers": headers or {},
+            }
+            self._start_session(session_id, session_data)
             return session_id
         except Exception as e:
             logger.error("Outbound call failed: {}", e)
@@ -302,11 +368,17 @@ class SipServerTransport:
         """Single event dispatcher — reads ALL events, routes to correct session.
 
         Avoids event-stealing race between server loop and per-session loops.
-        Matches LiveKit AgentServer._sip_event_loop pattern.
+        With the post-answer event refactor, the flow is:
+
+        - `call_ringing`: pre-answer observational event. Fires server-level
+          `ringing` hook. Rust auto-answers immediately after.
+        - `call_answered`: call is active. Create the agent session.
+
+        Outbound calls are owned by `SipServer.call()` which reserves the
+        session id in `_outbound_session_ids` before the event loop sees
+        `call_answered`, so outbound sessions aren't double-created.
         """
         loop = asyncio.get_running_loop()
-        # Calls waiting for call_media_active after answer
-        pending_calls: dict[str, dict] = {}  # session_id → session_data
 
         while True:
             event = await loop.run_in_executor(
@@ -317,38 +389,35 @@ class SipServerTransport:
 
             ev_type = event["type"]
 
-            if ev_type == "incoming_call":
+            if ev_type == "shutdown":
+                logger.debug("pipecat sip event loop received shutdown sentinel")
+                break
+
+            if ev_type == "call_ringing":
                 session = event["session"]
                 session_id = session.session_id
-                session_data = _session_to_dict(session)
-                logger.info("Incoming call from {} (session_id={})", session_data["remote_uri"], session_id)
-                try:
-                    await loop.run_in_executor(None, lambda: self._ep.answer(session_id))
-                except Exception as e:
-                    logger.warning("Failed to answer call {}: {}", session_id, e)
-                    continue
-                pending_calls[session_id] = session_data
+                logger.info(
+                    "Incoming call {} ringing (from={}, call_uuid={})",
+                    session_id, session.remote_uri, session.call_uuid,
+                )
+                self._emit_server_event("ringing", session)
 
-            elif ev_type == "call_media_active":
-                session_id = event.get("session_id", "")
-                if session_id in pending_calls:
-                    session_data = pending_calls.pop(session_id)
-                    self._start_session(session_id, session_data)
-                elif session_id not in self._active_sessions:
-                    # Outbound call — no incoming_call event, media active directly
-                    session_data = {
-                        "session_id": session_id,
-                        "remote_uri": event.get("remote_uri", ""),
-                        "direction": "Outbound",
-                        "extra_headers": {},
-                    }
-                    logger.info("Outbound call {} media active", session_id)
-                    self._start_session(session_id, session_data)
+            elif ev_type == "call_answered":
+                session = event["session"]
+                session_id = session.session_id
+                if session_id in self._outbound_session_ids:
+                    # Owned by SipServer.call() — skip to avoid duplicate.
+                    self._outbound_session_ids.discard(session_id)
+                    continue
+                if session_id in self._active_sessions:
+                    continue
+                session_data = _session_to_dict(session)
+                self._start_session(session_id, session_data)
 
             elif ev_type == "call_terminated":
                 session = event["session"]
                 session_id = session.session_id
-                pending_calls.pop(session_id, None)
+                self._outbound_session_ids.discard(session_id)
                 q = self._session_event_queues.get(session_id)
                 if q:
                     await q.put(event)
@@ -501,7 +570,9 @@ class SipServerTransport:
                 except Exception as e:
                     logger.warning("Outbound call {} to {} failed: {}", session_id, dest, e)
 
-            asyncio.create_task(_dial())
+            t = asyncio.create_task(_dial())
+            self._background_tasks.add(t)
+            t.add_done_callback(self._background_tasks.discard)
             return web.json_response({
                 "session_id": session_id, "status": "dialing",
                 "to": raw_to, "from": raw_from,

@@ -23,6 +23,7 @@ use crate::sip::audio_buffer::AudioBuffer;
 use crate::sip::dtmf;
 use crate::sip::resampler::Resampler;
 use crate::events::EndpointEvent;
+use crate::sync::LockExt;
 
 pub(crate) const DEFAULT_DTMF_PT: u8 = 101;
 const MEDIA_TIMEOUT: Duration = Duration::from_secs(30);
@@ -45,7 +46,7 @@ impl RtpTransport {
         Self { socket, remote_addr: Mutex::new(remote), ssrc: rand::random(), codec, seq: AtomicU16::new(0), timestamp: AtomicU32::new(0), dtmf_pt, ptime_ms, cancel, input_sample_rate, output_sample_rate }
     }
 
-    fn remote(&self) -> SocketAddr { *self.remote_addr.lock().unwrap_or_else(|e| e.into_inner()) }
+    fn remote(&self) -> SocketAddr { *self.remote_addr.lock_or_recover() }
     fn spf(&self) -> u32 { self.codec.sample_rate() * self.ptime_ms / 1000 }
 
     async fn send(&self, pt: u8, ts: u32, marker: bool, payload: Vec<u8>) -> std::io::Result<()> {
@@ -90,6 +91,23 @@ impl RtpTransport {
             let output_rate = t.output_sample_rate;
             let mut downsampler = Resampler::new_voip(output_rate, t.codec.sample_rate());
 
+            // ── BG audio instrumentation (debug only) ───────────────────
+            // Counts per 5s RTCP window so we can observe whether the
+            // Python forwarder is starving bg_audio_buf (empty on drain)
+            // or keeping it healthy.
+            let mut bg_empty_ticks: u32 = 0;
+            let mut bg_partial_ticks: u32 = 0; // 1..output_spf-1 samples
+            let mut bg_full_ticks: u32 = 0;    // == output_spf samples
+            let mut bg_sample_sum: u64 = 0;    // total samples drained this window
+            let mut bg_buf_len_sum: u64 = 0;   // sum of bg_audio_buf.len() BEFORE drain
+            let mut bg_buf_len_max: usize = 0;
+            // Sample-energy counters so we can tell whether the frames
+            // contain real audio or zero-valued silence (underrun from
+            // LiveKit's native AudioSource).
+            let mut bg_silent_ticks: u32 = 0; // ticks where all samples were 0
+            let mut bg_loud_ticks: u32 = 0;   // ticks with any |sample| > 100
+            let mut bg_abs_sum: u64 = 0;      // sum of |sample| across all drained samples
+
             loop {
                 tokio::select! {
                     _ = t.cancel.cancelled() => break,
@@ -99,17 +117,105 @@ impl RtpTransport {
                         let _ = t.socket.send_to(&sr, t.remote()).await;
                         let buf_ms = (audio_buf.len() as u32 * 1000) / output_rate;
                         debug!("RTP TX: pkts={} octets={} buf={}ms codec={:?} remote={}", pkt_count, octet_count, buf_ms, t.codec, t.remote());
+
+                        // BG audio health report
+                        let total_ticks = bg_empty_ticks + bg_partial_ticks + bg_full_ticks;
+                        if total_ticks > 0 {
+                            let avg_before_drain = bg_buf_len_sum / total_ticks as u64;
+                            let avg_abs = if bg_sample_sum > 0 {
+                                bg_abs_sum / bg_sample_sum
+                            } else {
+                                0
+                            };
+                            debug!(
+                                "BG TX health (5s): ticks={} empty={} partial={} full={} drained={} avg_buf={}ms max_buf={}samples | silent_ticks={} loud_ticks={} avg_abs_sample={}",
+                                total_ticks,
+                                bg_empty_ticks,
+                                bg_partial_ticks,
+                                bg_full_ticks,
+                                bg_sample_sum,
+                                avg_before_drain * 1000 / output_rate as u64,
+                                bg_buf_len_max,
+                                bg_silent_ticks,
+                                bg_loud_ticks,
+                                avg_abs,
+                            );
+                        }
+                        bg_empty_ticks = 0;
+                        bg_partial_ticks = 0;
+                        bg_full_ticks = 0;
+                        bg_sample_sum = 0;
+                        bg_buf_len_sum = 0;
+                        bg_buf_len_max = 0;
+                        bg_silent_ticks = 0;
+                        bg_loud_ticks = 0;
+                        bg_abs_sum = 0;
                     }
                     _ = iv.tick() => {}
                 }
 
                 let ts = t.timestamp.fetch_add(spf, Ordering::Relaxed);
 
+                // Snapshot bg buffer length BEFORE drain so we can see if
+                // Python is filling it or if we're racing empty.
+                let bg_buf_len_before = bg_audio_buf.len();
+                bg_buf_len_sum += bg_buf_len_before as u64;
+                if bg_buf_len_before > bg_buf_len_max {
+                    bg_buf_len_max = bg_buf_len_before;
+                }
+
                 // Drain background audio regardless of pause state
                 let bg_samples = bg_audio_buf.drain(output_spf);
 
-                if paused.load(Ordering::Relaxed) {
-                    // Paused: send background audio only (no agent voice)
+                // Categorize this tick (occupancy)
+                let n = bg_samples.len();
+                bg_sample_sum += n as u64;
+                if n == 0 {
+                    bg_empty_ticks += 1;
+                } else if n < output_spf {
+                    bg_partial_ticks += 1;
+                } else {
+                    bg_full_ticks += 1;
+                }
+
+                // Categorize this tick (energy) — detects silent frames
+                // coming from LiveKit's native AudioSource underrun.
+                if n > 0 {
+                    let mut max_abs: i32 = 0;
+                    let mut sum_abs: u64 = 0;
+                    for &s in &bg_samples {
+                        let a = s.unsigned_abs() as i32;
+                        if a > max_abs {
+                            max_abs = a;
+                        }
+                        sum_abs += a as u64;
+                    }
+                    bg_abs_sum += sum_abs;
+                    if max_abs == 0 {
+                        bg_silent_ticks += 1;
+                    } else if max_abs > 100 {
+                        bg_loud_ticks += 1;
+                    }
+                }
+
+                if paused.load(Ordering::Acquire) {
+                    // Paused: send background audio only (no agent voice).
+                    // Record the SAME samples we're putting on the wire so the
+                    // agent channel stays time-aligned with the user channel
+                    // (which the recv loop keeps writing unconditionally).
+                    // Without this write the recorder's user/agent VecDeques
+                    // drift and interleave() pads trailing zeros that show up
+                    // as silent gaps straddling every pause/resume cycle.
+                    {
+                        let guard = recorder.lock_or_recover();
+                        if let Some(ref rec) = *guard {
+                            if !bg_samples.is_empty() {
+                                rec.write_agent_samples(&bg_samples);
+                            } else {
+                                rec.write_agent_samples(&vec![0i16; output_spf]);
+                            }
+                        }
+                    }
                     if !bg_samples.is_empty() {
                         let samples_8k = if let Some(ref mut ds) = downsampler {
                             ds.process(&bg_samples).to_vec()
@@ -147,7 +253,8 @@ impl RtpTransport {
                 };
 
                 // Record agent audio — always write to keep in sync with user channel
-                if let Ok(guard) = recorder.lock() {
+                {
+                    let guard = recorder.lock_or_recover();
                     if let Some(ref rec) = *guard {
                         if !samples.is_empty() {
                             rec.write_agent_samples(&samples);
@@ -159,7 +266,7 @@ impl RtpTransport {
                 }
 
                 if !samples.is_empty() {
-                    if !muted.load(Ordering::Relaxed) {
+                    if !muted.load(Ordering::Acquire) {
                         let m = first; first = false;
                         let samples_8k = if let Some(ref mut ds) = downsampler {
                             ds.process(&samples).to_vec()
@@ -175,13 +282,22 @@ impl RtpTransport {
                         pkt_count += 1; octet_count += spf;
                     }
                 } else {
-                    // No audio — send silence, notify playout completion
-                    if audio_buf.is_empty() {
-                        notify(&playout);
-                        first = true;
-                    }
+                    // No audio — send silence
                     let _ = t.send(t.codec.payload_type(), ts, false, vec![sil; spf as usize]).await;
                     pkt_count += 1; octet_count += spf;
+                }
+
+                // After draining voice: notify playout completion when voice buffer is empty.
+                // This is independent of background audio — bg doesn't block voice playout tracking.
+                // Without this, continuously flowing bg audio keeps `samples` non-empty and the
+                // playout condvar never fires, hanging wait_for_playout callers.
+                if audio_buf.is_empty() {
+                    notify(&playout);
+                    // Reset marker bit only when nothing (neither voice nor bg) is flowing,
+                    // so the next talk burst gets marker=1 (matches WebRTC behavior).
+                    if !has_voice && !has_bg {
+                        first = true;
+                    }
                 }
             }
         })
@@ -199,6 +315,13 @@ impl RtpTransport {
             // speexdsp resampler: codec rate → input rate (same approach as FreeSWITCH)
             let mut upsampler = Resampler::new_voip(t.codec.sample_rate(), input_rate);
 
+            // Symmetric-RTP hysteresis: only migrate the remote address after we
+            // see SYMMETRIC_RTP_CONFIRM consecutive packets from the same new
+            // source. Without this, a NAT that re-binds every few packets causes
+            // remote_addr to flap on every receive, producing audio instability.
+            const SYMMETRIC_RTP_CONFIRM: u32 = 3;
+            let mut pending_remote: Option<(SocketAddr, u32)> = None;
+
             loop {
                 tokio::select! {
                     _ = t.cancel.cancelled() => break,
@@ -206,11 +329,45 @@ impl RtpTransport {
                     r = t.socket.recv_from(&mut buf) => {
                         let (len, from) = match r { Ok(r) => r, Err(_) => continue };
                         if len < 12 { continue; }
+
+                        // RFC 5761 RTP/RTCP de-mux: when the peer negotiated
+                        // a=rtcp-mux, RTCP packets arrive on the same UDP
+                        // port as RTP. Detect and skip them before attempting
+                        // RTP parsing — otherwise rtp::Packet::unmarshal
+                        // misinterprets the RTCP SSRC as the media SSRC and
+                        // pollutes the SSRC tracker, producing flapping
+                        // "SSRC change" logs every ~4 seconds (one per
+                        // incoming Sender Report).
+                        if super::rtcp::is_rtcp(&buf[..len]) {
+                            // Still counts as the peer being alive — refresh
+                            // the media timeout, but don't touch SSRC or PT.
+                            // A future change can parse SR for RTT/jitter.
+                            last_rtp = Instant::now();
+                            continue;
+                        }
+
                         let pkt = match Packet::unmarshal(&mut &buf[..len]) { Ok(p) => p, Err(_) => continue };
                         if pkt.header.version != 2 { continue; }
 
-                        // Symmetric RTP
-                        if from != t.remote() { info!("Symmetric RTP: {} -> {}", t.remote(), from); *t.remote_addr.lock().unwrap() = from; }
+                        // Symmetric RTP with hysteresis: require N consecutive
+                        // packets from a new source before migrating. Prevents
+                        // remote_addr flapping under unstable NATs that re-bind
+                        // the external port every few packets.
+                        if from != t.remote() {
+                            pending_remote = match pending_remote {
+                                Some((addr, n)) if addr == from => Some((addr, n + 1)),
+                                _ => Some((from, 1)),
+                            };
+                            if let Some((addr, n)) = pending_remote {
+                                if n >= SYMMETRIC_RTP_CONFIRM {
+                                    info!("Symmetric RTP: {} -> {} (after {} consecutive)", t.remote(), addr, n);
+                                    *t.remote_addr.lock_or_recover() = addr;
+                                    pending_remote = None;
+                                }
+                            }
+                        } else {
+                            pending_remote = None;
+                        }
 
                         // SSRC tracking
                         let ss = pkt.header.ssrc;
@@ -221,20 +378,25 @@ impl RtpTransport {
                         // DTMF (RFC 4733) — dedup END retransmissions
                         if pkt.header.payload_type == t.dtmf_pt {
                             if let Some((ev, end, _vol, _dur)) = dtmf::decode_rfc4733(&pkt.payload) {
-                                if end {
-                                    // Only emit once per digit — dtmf_ev is Some during active event
-                                    if dtmf_ev.is_some() {
-                                        if let Some(d) = dtmf::event_to_digit(ev) {
+                                match dtmf::dtmf_transition(dtmf_ev, ev, end) {
+                                    dtmf::DtmfTransition::EndEmit { event } => {
+                                        if let Some(d) = dtmf::event_to_digit(event) {
                                             debug!("DTMF digit: {}", d);
                                             let _ = etx.try_send(EndpointEvent::DtmfReceived { call_id: cid.clone(), digit: d, method: "rfc2833".into() });
                                         }
                                         dtmf_ev = None;
                                         dtmf_timer = None;
                                     }
-                                    // else: END retransmission — already handled, ignore
-                                } else {
-                                    dtmf_ev = Some(ev);
-                                    if dtmf_timer.is_none() { dtmf_timer = Some(Instant::now()); }
+                                    dtmf::DtmfTransition::EndStale => {}
+                                    dtmf::DtmfTransition::StartOrChange { event } => {
+                                        // New digit (or first packet): reset both tracker and timer.
+                                        // If the previous digit's END was lost, the old timer baseline
+                                        // would otherwise leak into the new digit and fire a stale timeout.
+                                        dtmf_ev = Some(event);
+                                        dtmf_timer = Some(Instant::now());
+                                    }
+                                    dtmf::DtmfTransition::StartRetransmit => {}
+                                    dtmf::DtmfTransition::NoChange => {}
                                 }
                             }
                             continue;
@@ -256,16 +418,22 @@ impl RtpTransport {
                         };
 
                         // Record user audio (pipeline rate, after resample)
-                        if let Ok(guard) = recorder.lock() { if let Some(ref rec) = *guard { rec.write_user_samples(&pcm); } }
+                        {
+                            let guard = recorder.lock_or_recover();
+                            if let Some(ref rec) = *guard { rec.write_user_samples(&pcm); }
+                        }
 
                         // Beep detector
-                        if let Ok(mut g) = bd.lock() { if let Some(ref mut det) = *g {
-                            match det.process_frame(&pcm) {
-                                BeepDetectorResult::Detected(e) => { let _ = etx.try_send(EndpointEvent::BeepDetected { call_id: cid.clone(), frequency_hz: e.frequency_hz, duration_ms: e.duration_ms }); *g = None; }
-                                BeepDetectorResult::Timeout => { let _ = etx.try_send(EndpointEvent::BeepTimeout { call_id: cid.clone() }); *g = None; }
-                                _ => {}
+                        {
+                            let mut g = bd.lock_or_recover();
+                            if let Some(ref mut det) = *g {
+                                match det.process_frame(&pcm) {
+                                    BeepDetectorResult::Detected(e) => { let _ = etx.try_send(EndpointEvent::BeepDetected { call_id: cid.clone(), frequency_hz: e.frequency_hz, duration_ms: e.duration_ms }); *g = None; }
+                                    BeepDetectorResult::Timeout => { let _ = etx.try_send(EndpointEvent::BeepTimeout { call_id: cid.clone() }); *g = None; }
+                                    _ => {}
+                                }
                             }
-                        }}
+                        }
                         let n = pcm.len() as u32;
                         let _ = tx.try_send(AudioFrame { data: pcm, sample_rate: input_rate, num_channels: 1, samples_per_channel: n });
                         rx_pkts += 1;
@@ -276,7 +444,7 @@ impl RtpTransport {
                     }
                 }
                 // Skip media timeout check during SIP hold (remote is expected to stop sending)
-                if last_rtp.elapsed() > MEDIA_TIMEOUT && !held.load(Ordering::Relaxed) {
+                if last_rtp.elapsed() > MEDIA_TIMEOUT && !held.load(Ordering::Acquire) {
                     warn!("Media timeout call {} ({}s)", cid, MEDIA_TIMEOUT.as_secs());
                     let _ = etx.try_send(EndpointEvent::CallTerminated { session: crate::sip::call::CallSession::new(cid, direction), reason: "media timeout".into() });
                     break;
@@ -286,7 +454,11 @@ impl RtpTransport {
     }
 }
 
-fn notify(p: &Arc<(Mutex<bool>, Condvar)>) { if let Ok(mut d) = p.0.lock() { *d = true; p.1.notify_all(); } }
+fn notify(p: &Arc<(Mutex<bool>, Condvar)>) {
+    let mut d = p.0.lock_or_recover();
+    *d = true;
+    p.1.notify_all();
+}
 
 #[cfg(test)]
 mod tests {

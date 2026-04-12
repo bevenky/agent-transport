@@ -65,42 +65,62 @@ class AudioStreamInputTransport(BaseInputTransport):
                 audio_in_enabled=True,
                 audio_in_passthrough=True,
             )
+        # Propagate Rust endpoint's sample rate to pipecat's base input
+        # transport. BaseInputTransport.start() reads audio_in_sample_rate
+        # to configure VAD/turn-analyzers/audio-filters; leaving it None
+        # causes it to fall back to frame.audio_in_sample_rate from the
+        # synthesized StartFrame, which may not match Rust's output.
+        _ep_in = endpoint.input_sample_rate
+        if params.audio_in_sample_rate is None:
+            params.audio_in_sample_rate = _ep_in
+        elif params.audio_in_sample_rate != _ep_in:
+            logger.warning(
+                "AudioStreamInputTransport: params.audio_in_sample_rate={} does not "
+                "match endpoint.input_sample_rate={}. Rust emits at the endpoint rate; "
+                "reconfigure the endpoint at construction to match.",
+                params.audio_in_sample_rate, _ep_in,
+            )
         super().__init__(params, **kwargs)
         self._ep = endpoint
         self._sid = session_id
         self._transport = transport
         self._event_queue = event_queue  # per-session queue from server (avoids event-stealing)
-        self._running = False
+        # Started flag — distinct from _paused (the base-class pause flag).
+        # _started gates start()/stop() idempotency. The recv loop runs while
+        # the tasks exist; pause/resume are handled by the base class via
+        # `self._paused` which `push_audio_frame` already gates on.
+        self._started = False
         self._recv_task: Optional[asyncio.Task] = None
         self._event_task: Optional[asyncio.Task] = None
 
     async def start(self, frame: StartFrame):
-        if self._running:
+        if self._started:
             return
         await super().start(frame)
-        self._running = True
+        self._started = True
         await self.set_transport_ready(frame)
         self._recv_task = asyncio.create_task(self._recv_loop())
         self._event_task = asyncio.create_task(self._event_loop())
         await self._transport._call_event_handler("on_client_connected")
 
     async def stop(self, frame: EndFrame):
-        if not self._running:
+        if not self._started:
             await super().stop(frame)
             return
-        self._running = False
+        self._started = False
         await self._cancel_tasks()
         await super().stop(frame)
 
     async def cancel(self, frame: CancelFrame):
-        self._running = False
+        self._started = False
         await self._cancel_tasks()
         await super().cancel(frame)
 
-    async def pause(self, frame: StopFrame):
-        self._running = False
-        await self._cancel_tasks()
-        await super().pause(frame)
+    # NOTE: pause(StopFrame) intentionally not overridden — base-class
+    # pause sets `self._paused = True` which `push_audio_frame()` already
+    # gates on. The recv loop keeps running and frames are dropped at the
+    # base-class push site while paused. On resume the flag clears and
+    # frames flow again, no task recreation needed.
 
     async def _cancel_tasks(self):
         """Cancel and await background tasks."""
@@ -115,19 +135,26 @@ class AudioStreamInputTransport(BaseInputTransport):
     async def _recv_loop(self):
         """Receive audio from Rust endpoint via blocking call (GIL released)."""
         loop = asyncio.get_running_loop()
-        while self._running:
-            try:
-                result = await loop.run_in_executor(
-                    None, lambda: self._ep.recv_audio_bytes_blocking(self._sid, 20)
-                )
-            except Exception as e:
-                logger.debug("AudioStreamInputTransport recv_audio error: {}", e)
-                break
-            if result is not None:
-                audio_bytes, sample_rate, num_channels = result
-                await self.push_audio_frame(InputAudioRawFrame(
-                    audio=bytes(audio_bytes), sample_rate=sample_rate, num_channels=num_channels,
-                ))
+        try:
+            while self._started:
+                try:
+                    result = await loop.run_in_executor(
+                        None, lambda: self._ep.recv_audio_bytes_blocking(self._sid, 20)
+                    )
+                except Exception:
+                    # Session ended (remote close removed the session from
+                    # the Rust session map). Exit the recv loop cleanly —
+                    # the event loop fires on_client_disconnected.
+                    break
+                if result is not None:
+                    audio_bytes, sample_rate, num_channels = result
+                    # push_audio_frame() drops the frame if base-class
+                    # `_paused == True`, so no extra check needed here.
+                    await self.push_audio_frame(InputAudioRawFrame(
+                        audio=bytes(audio_bytes), sample_rate=sample_rate, num_channels=num_channels,
+                    ))
+        except asyncio.CancelledError:
+            raise
 
     async def _event_loop(self):
         """Poll for DTMF, call state, and lifecycle events.
@@ -142,7 +169,7 @@ class AudioStreamInputTransport(BaseInputTransport):
 
     async def _event_loop_from_queue(self):
         """Read events from per-session queue (dispatched by server)."""
-        while self._running:
+        while self._started:
             try:
                 event = await asyncio.wait_for(self._event_queue.get(), timeout=0.5)
             except asyncio.TimeoutError:
@@ -150,12 +177,15 @@ class AudioStreamInputTransport(BaseInputTransport):
             except Exception as e:
                 logger.debug("AudioStreamInputTransport event_loop error: {}", e)
                 break
-            await self._handle_event(event)
+            try:
+                await self._handle_event(event)
+            except Exception:
+                logger.exception("AudioStreamInputTransport handler failed for event %r", event.get("type") if isinstance(event, dict) else event)
 
     async def _event_loop_from_endpoint(self):
         """Poll events directly from endpoint (standalone, no server)."""
         loop = asyncio.get_running_loop()
-        while self._running:
+        while self._started:
             try:
                 event = await loop.run_in_executor(
                     None, lambda: self._ep.wait_for_event(timeout_ms=100)
@@ -165,7 +195,10 @@ class AudioStreamInputTransport(BaseInputTransport):
                 break
             if event is None:
                 continue
-            await self._handle_event(event)
+            try:
+                await self._handle_event(event)
+            except Exception:
+                logger.exception("AudioStreamInputTransport handler failed for event %r", event.get("type") if isinstance(event, dict) else event)
 
     async def _handle_event(self, event):
         """Process a single event."""
@@ -173,7 +206,7 @@ class AudioStreamInputTransport(BaseInputTransport):
         if event_type == "dtmf_received":
             await self.push_frame(InputDTMFFrame(button=KeypadEntry(event["digit"])))
         elif event_type == "call_terminated":
-            self._running = False
+            self._started = False
             await self._transport._call_event_handler("on_client_disconnected")
             await self.push_frame(EndFrame())
         elif event_type == "beep_detected":
@@ -208,6 +241,19 @@ class AudioStreamOutputTransport(BaseOutputTransport):
         if params is None:
             params = TransportParams(
                 audio_out_enabled=True,
+            )
+        # Match Rust endpoint's outbound sample rate so pipecat's MediaSender
+        # chunks/paces frames against the same rate the Rust RTP/WS send loop
+        # emits. Mismatch causes the chunker to over- or under-feed the wire.
+        _ep_out = endpoint.output_sample_rate
+        if params.audio_out_sample_rate is None:
+            params.audio_out_sample_rate = _ep_out
+        elif params.audio_out_sample_rate != _ep_out:
+            logger.warning(
+                "AudioStreamOutputTransport: params.audio_out_sample_rate={} does "
+                "not match endpoint.output_sample_rate={}. Reconfigure the endpoint "
+                "at construction to match.",
+                params.audio_out_sample_rate, _ep_out,
             )
         super().__init__(params, **kwargs)
         self._ep = endpoint

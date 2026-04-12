@@ -117,6 +117,42 @@ pub(crate) fn parse_answer(sdp_bytes: &[u8], offered_codecs: &[Codec]) -> Result
     Ok(SdpAnswer { remote_ip, remote_port, codec, payload_type: pt, dtmf_payload_type: dtmf_pt, ptime_ms, rtcp_mux })
 }
 
+/// Parse a STUN Binding Response buffer and return the XOR-MAPPED-ADDRESS
+/// if present. Returns None when the buffer is truncated, malformed, or
+/// contains no mapped address attribute.
+///
+/// Pulled out of `stun_binding` as a pure function so we can unit-test
+/// hostile / truncated inputs without needing real network I/O.
+fn parse_stun_xor_mapped_address(buf: &[u8]) -> Option<SocketAddr> {
+    if buf.len() < 20 { return None; }
+    let msg_len = u16::from_be_bytes([buf[2], buf[3]]) as usize;
+    let mut pos = 20usize;
+    let end = (20 + msg_len).min(buf.len());
+    while pos + 4 <= end {
+        let at = u16::from_be_bytes([buf[pos], buf[pos + 1]]);
+        let al = u16::from_be_bytes([buf[pos + 2], buf[pos + 3]]) as usize;
+        let s = pos + 4;
+        // Bounds check: the attribute body must fit entirely within `end`.
+        // A malicious or buggy STUN server can declare al > remaining bytes —
+        // without this guard, the XOR-MAPPED-ADDRESS read below would index
+        // past the received region (or past the underlying buffer and panic).
+        if s + al > end { break; }
+        // XOR-MAPPED-ADDRESS (RFC 5389 §15.2): needs 8 bytes (family + port + IPv4).
+        if at == 0x0020 && al >= 8 && buf[s + 1] == 0x01 {
+            let port = u16::from_be_bytes([buf[s + 2], buf[s + 3]]) ^ 0x2112;
+            let ip = u32::from_be_bytes([buf[s + 4], buf[s + 5], buf[s + 6], buf[s + 7]]) ^ 0x2112A442;
+            return Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::from(ip)), port));
+        }
+        // Advance by the 4-byte TLV header plus the padded attribute body.
+        let padded = (al + 3) & !3;
+        pos = match s.checked_add(padded) {
+            Some(p) => p,
+            None => break,
+        };
+    }
+    None
+}
+
 /// STUN Binding Request (RFC 5389) — discover public IP.
 pub(crate) fn stun_binding(stun_server: &str) -> Result<SocketAddr> {
     let addr = stun_server.to_socket_addrs().map_err(|e| EndpointError::Other(format!("STUN resolve: {}", e)))?
@@ -133,22 +169,9 @@ pub(crate) fn stun_binding(stun_server: &str) -> Result<SocketAddr> {
     sock.send_to(&req, addr).map_err(|e| EndpointError::Other(format!("STUN send: {}", e)))?;
     let mut resp = [0u8; 512];
     let len = sock.recv(&mut resp).map_err(|e| EndpointError::Other(format!("STUN recv: {}", e)))?;
-    if len < 20 { return Err(EndpointError::Other("STUN response too short".into())); }
-
-    let msg_len = u16::from_be_bytes([resp[2], resp[3]]) as usize;
-    let mut pos = 20;
-    let end = (20 + msg_len).min(len);
-    while pos + 4 <= end {
-        let at = u16::from_be_bytes([resp[pos], resp[pos + 1]]);
-        let al = u16::from_be_bytes([resp[pos + 2], resp[pos + 3]]) as usize;
-        let s = pos + 4;
-        if at == 0x0020 && al >= 8 && resp[s + 1] == 0x01 {
-            let port = u16::from_be_bytes([resp[s + 2], resp[s + 3]]) ^ 0x2112;
-            let ip = u32::from_be_bytes([resp[s + 4], resp[s + 5], resp[s + 6], resp[s + 7]]) ^ 0x2112A442;
-            debug!("STUN: public address {}:{}", Ipv4Addr::from(ip), port);
-            return Ok(SocketAddr::new(IpAddr::V4(Ipv4Addr::from(ip)), port));
-        }
-        pos = s + ((al + 3) & !3);
+    if let Some(mapped) = parse_stun_xor_mapped_address(&resp[..len]) {
+        debug!("STUN: public address {}", mapped);
+        return Ok(mapped);
     }
     warn!("STUN: no mapped address, using local");
     Ok(sock.local_addr().map_err(|e| EndpointError::Other(format!("local addr: {}", e)))?)
@@ -278,5 +301,111 @@ mod tests {
         // No rtcp-mux
         assert!(!sdp.contains("rtcp-mux"), "should not include rtcp-mux when not offered: {}", sdp);
         assert!(sdp.contains("a=ptime:20\r\n"), "should use ptime 20: {}", sdp);
+    }
+
+    // ─── STUN parser regression tests ────────────────────────────────────
+
+    /// Build a minimal STUN Binding Success Response with a single
+    /// XOR-MAPPED-ADDRESS attribute for the given IPv4:port.
+    fn build_stun_response_with_mapped(ip: Ipv4Addr, port: u16) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(32);
+        // Message type: Binding Success (0x0101)
+        buf.extend_from_slice(&[0x01, 0x01]);
+        // Message length: 12 bytes (1 attr: 4-byte header + 8-byte body)
+        buf.extend_from_slice(&[0x00, 0x0C]);
+        // Magic cookie
+        buf.extend_from_slice(&[0x21, 0x12, 0xA4, 0x42]);
+        // Transaction ID (12 bytes)
+        buf.extend_from_slice(&[0u8; 12]);
+        // XOR-MAPPED-ADDRESS attribute header: type 0x0020, length 8
+        buf.extend_from_slice(&[0x00, 0x20, 0x00, 0x08]);
+        // Attribute body: reserved + family (0x01=IPv4) + xor port + xor ip
+        buf.push(0x00);
+        buf.push(0x01);
+        let xor_port = port ^ 0x2112;
+        buf.extend_from_slice(&xor_port.to_be_bytes());
+        let ip_u32 = u32::from(ip) ^ 0x2112A442;
+        buf.extend_from_slice(&ip_u32.to_be_bytes());
+        buf
+    }
+
+    #[test]
+    fn test_stun_parse_well_formed() {
+        let buf = build_stun_response_with_mapped(Ipv4Addr::new(203, 0, 113, 5), 40001);
+        let got = parse_stun_xor_mapped_address(&buf).expect("should parse");
+        assert_eq!(got.ip(), IpAddr::V4(Ipv4Addr::new(203, 0, 113, 5)));
+        assert_eq!(got.port(), 40001);
+    }
+
+    #[test]
+    fn test_stun_parse_truncated_header_returns_none() {
+        // Less than 20 bytes: not a valid STUN message
+        let buf = [0u8; 10];
+        assert!(parse_stun_xor_mapped_address(&buf).is_none());
+    }
+
+    #[test]
+    fn test_stun_parse_attribute_body_extends_past_end_does_not_panic() {
+        // Regression: STUN header claims one attribute with length=8 but
+        // the body is TRUNCATED — only 2 bytes are actually present.
+        // The old parser accessed resp[s+7] without bounds checking and
+        // could index past the received region (or past the underlying
+        // 512-byte response array and panic).
+        let mut buf = Vec::new();
+        // Header: success, msg_len=12 (4-byte attr header + 8 body claimed)
+        buf.extend_from_slice(&[0x01, 0x01, 0x00, 0x0C]);
+        buf.extend_from_slice(&[0x21, 0x12, 0xA4, 0x42]);
+        buf.extend_from_slice(&[0u8; 12]);
+        // Attribute header: XOR-MAPPED-ADDRESS, claimed length 8
+        buf.extend_from_slice(&[0x00, 0x20, 0x00, 0x08]);
+        // Only 2 body bytes instead of 8 — truncated on the wire
+        buf.extend_from_slice(&[0x00, 0x01]);
+        // Parser must NOT panic and must return None
+        assert!(parse_stun_xor_mapped_address(&buf).is_none());
+    }
+
+    #[test]
+    fn test_stun_parse_oversized_attr_length_does_not_panic() {
+        // Regression: attacker sets al = 65535 (hugely larger than body).
+        // Old parser: `pos + 4 <= end` was the only guard; it then read
+        // resp[s + 7] which was out of bounds.
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&[0x01, 0x01, 0x00, 0x08]); // msg_len = 8
+        buf.extend_from_slice(&[0x21, 0x12, 0xA4, 0x42]);
+        buf.extend_from_slice(&[0u8; 12]);
+        // Attribute: XOR-MAPPED-ADDRESS, claimed length 0xFFFF
+        buf.extend_from_slice(&[0x00, 0x20, 0xFF, 0xFF]);
+        // Only 4 body bytes actually present
+        buf.extend_from_slice(&[0x00, 0x01, 0x12, 0x34]);
+        assert!(parse_stun_xor_mapped_address(&buf).is_none());
+    }
+
+    #[test]
+    fn test_stun_parse_ipv6_family_skipped() {
+        // Family 0x02 = IPv6. Parser should skip (it only handles IPv4).
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&[0x01, 0x01, 0x00, 0x18]); // msg_len = 24
+        buf.extend_from_slice(&[0x21, 0x12, 0xA4, 0x42]);
+        buf.extend_from_slice(&[0u8; 12]);
+        // Attribute: XOR-MAPPED-ADDRESS, length 20 (IPv6 has 16-byte address)
+        buf.extend_from_slice(&[0x00, 0x20, 0x00, 0x14]);
+        buf.push(0x00);
+        buf.push(0x02); // family = IPv6
+        buf.extend_from_slice(&[0u8; 18]);
+        // Not an IPv4 mapped-address, so parser should return None.
+        assert!(parse_stun_xor_mapped_address(&buf).is_none());
+    }
+
+    #[test]
+    fn test_stun_parse_fuzz_no_panic() {
+        // Throw random junk at the parser and ensure it never panics.
+        // This pins the bounds-check fix: if any input can panic, the
+        // whole STUN path can be DoS'd by a malicious server.
+        for seed in 0u32..64 {
+            let size = (seed * 7 + 3) as usize % 200;
+            let buf: Vec<u8> = (0..size).map(|i| (i as u8).wrapping_mul(seed as u8 + 1)).collect();
+            // Must return Option without panicking
+            let _ = parse_stun_xor_mapped_address(&buf);
+        }
     }
 }

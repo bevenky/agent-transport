@@ -268,22 +268,22 @@ class AudioStreamOutput(AudioOutput):
         super().pause()
         self._playback_enabled.clear()
         if not self._rust_paused:
-            self._rust_paused = True
             try:
                 self._ep.pause(self._sid)
+                self._rust_paused = True
             except Exception:
-                pass
+                logger.warning("AudioStreamOutput.pause failed for session %s", self._sid, exc_info=True)
 
     def resume(self) -> None:
         super().resume()
         self._playback_enabled.set()
         self._first_frame_event.clear()
         if self._rust_paused:
-            self._rust_paused = False
             try:
                 self._ep.resume(self._sid)
+                self._rust_paused = False
             except Exception:
-                pass
+                logger.warning("AudioStreamOutput.resume failed for session %s", self._sid, exc_info=True)
 
     async def _wait_for_playout(self) -> None:
         logger.debug("_wait_for_playout: starting (pushed=%.3fs)", self._pushed_duration)
@@ -335,8 +335,15 @@ class AudioStreamOutput(AudioOutput):
                 self._audio_source.clear_queue()
                 await self._playback_enabled.wait()
 
-            if self._interrupted_event.is_set():
-                if self._flush_task:
+            # Match upstream _ParticipantAudioOutput._forward_audio guard:
+            # also skip frames when `_pushed_duration == 0`. This protects
+            # against stale frames from a previous speech handle arriving
+            # after `_wait_for_playout` has already reset `_pushed_duration`
+            # and cleared `_interrupted_event`. Without this check, such a
+            # frame would be replayed erroneously because the interrupted
+            # flag has already been cleared by the previous turn's cleanup.
+            if self._interrupted_event.is_set() or self._pushed_duration == 0:
+                if self._interrupted_event.is_set() and self._flush_task:
                     await self._flush_task
 
                 continue

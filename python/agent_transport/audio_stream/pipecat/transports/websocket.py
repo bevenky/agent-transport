@@ -189,11 +189,21 @@ class WebsocketServerTransport:
                 "No handler registered. Use @server.handler() to define one."
             )
 
-        # Run setup once
+        # Run setup once — support both sync and async setup functions.
         if self._setup_fnc is not None:
-            result = self._setup_fnc()
-            if isinstance(result, dict):
-                self._userdata = result
+            try:
+                if inspect.iscoroutinefunction(self._setup_fnc):
+                    result = await self._setup_fnc()
+                else:
+                    result = self._setup_fnc()
+                    # Tolerate a sync function that returns an awaitable.
+                    if inspect.isawaitable(result):
+                        result = await result
+                if isinstance(result, dict):
+                    self._userdata = result
+            except Exception:
+                logger.exception("Setup function failed")
+                raise
             logger.info("Setup complete: {}", list(self._userdata.keys()) or "(no userdata)")
 
         self._ep = AudioStreamEndpoint(
@@ -235,58 +245,64 @@ class WebsocketServerTransport:
     async def _event_loop(self) -> None:
         """Single event dispatcher — reads ALL events, routes to correct session.
 
-        Avoids event-stealing race between server loop and per-session loops.
-        Matches LiveKit AgentServer._sip_event_loop pattern.
+        With the post-answer event refactor, Plivo's WebSocket `start` maps
+        directly to Rust's `call_answered` — create the session immediately.
+        No pending map, no wait-for-first-media gate.
         """
         loop = asyncio.get_running_loop()
-        # Sessions waiting for call_media_active after incoming_call
-        pending_sessions: dict[str, dict] = {}  # session_id → session_data
 
         while True:
-            event = await loop.run_in_executor(
-                None, lambda: self._ep.wait_for_event(timeout_ms=1000)
-            )
+            try:
+                event = await loop.run_in_executor(
+                    None, lambda: self._ep.wait_for_event(timeout_ms=1000)
+                )
+            except Exception:
+                logger.exception("wait_for_event failed")
+                break
+
             if not event:
                 continue
 
-            ev_type = event["type"]
+            try:
+                ev_type = event["type"]
 
-            if ev_type == "incoming_call":
-                session = event["session"]
-                session_id = session.session_id
-                session_data = _session_to_dict(session)
-                logger.info("Session {} connected (call_uuid={})",
-                            session_id, session_data.get("call_uuid", ""))
-                pending_sessions[session_id] = session_data
+                if ev_type == "shutdown":
+                    logger.debug("pipecat audio_stream event loop received shutdown sentinel")
+                    break
 
-            elif ev_type == "call_media_active":
-                session_id = event.get("session_id", "")
-                if session_id in pending_sessions:
-                    session_data = pending_sessions.pop(session_id)
+                if ev_type == "call_answered":
+                    session = event["session"]
+                    session_id = session.session_id
+                    if session_id in self._active_sessions:
+                        continue
+                    session_data = _session_to_dict(session)
+                    logger.info("Session {} connected (call_uuid={})",
+                                session_id, session_data.get("call_uuid", ""))
                     self._start_session(session_id, session_data)
 
-            elif ev_type == "call_terminated":
-                session = event["session"]
-                session_id = session.session_id
-                pending_sessions.pop(session_id, None)
-                # Route to per-session queue
-                q = self._session_event_queues.get(session_id)
-                if q:
-                    await q.put(event)
+                elif ev_type == "call_terminated":
+                    session = event["session"]
+                    session_id = session.session_id
+                    # Route to per-session queue
+                    q = self._session_event_queues.get(session_id)
+                    if q:
+                        await q.put(event)
 
-            elif ev_type == "dtmf_received":
-                session_id = event.get("session_id", "")
-                q = self._session_event_queues.get(session_id)
-                if q:
-                    await q.put(event)
+                elif ev_type == "dtmf_received":
+                    session_id = event.get("session_id", "")
+                    q = self._session_event_queues.get(session_id)
+                    if q:
+                        await q.put(event)
 
-            elif ev_type in ("beep_detected", "beep_timeout"):
-                session_id = event.get("session_id", "")
-                q = self._session_event_queues.get(session_id)
-                if q:
-                    await q.put(event)
-                else:
-                    logger.warning("No session queue for {} event on session {} (session not yet started?)", ev_type, session_id)
+                elif ev_type in ("beep_detected", "beep_timeout"):
+                    session_id = event.get("session_id", "")
+                    q = self._session_event_queues.get(session_id)
+                    if q:
+                        await q.put(event)
+                    else:
+                        logger.warning("No session queue for {} event on session {} (session not yet started?)", ev_type, session_id)
+            except Exception:
+                logger.exception("Error handling WS event %r", event.get("type") if isinstance(event, dict) else event)
 
     def _start_session(self, session_id: str, session_data: dict) -> None:
         """Create transport and spawn session handler task."""

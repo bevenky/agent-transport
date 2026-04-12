@@ -13,7 +13,6 @@
  * like LiveKit WebRTC.
  */
 
-import { writeSync } from 'node:fs';
 import type { SipEndpoint } from 'agent-transport';
 import { SipAudioInput } from './sip_audio_input.js';
 import { SipAudioOutput } from './sip_audio_output.js';
@@ -74,6 +73,12 @@ export class JobContext {
    * directly — matches LiveKit WebRTC pattern exactly.
    */
   set session(session: any) {
+    if (session == null) {
+      throw new TypeError(
+        "JobContext.session cannot be set to null/undefined. Assign a "
+        + "valid voice.AgentSession instance (or use ctx.session to read)."
+      );
+    }
     this._session = session;
 
     // Wire SIP audio I/O before session.start() is called
@@ -100,18 +105,10 @@ export class JobContext {
         const tts = (session as any).tts;
         if (tts?.setMaxListeners) {
           tts.setMaxListeners(100);
-          writeSync(2, `[SessionContext] TTS maxListeners set to 100 on ${tts?.constructor?.name}\n`);
-        } else {
-          writeSync(2, `[SessionContext] WARNING: TTS not found on session (tts=${tts})\n`);
         }
-      } catch (e: any) {
-        writeSync(2, `[SessionContext] TTS maxListeners failed: ${e?.message}\n`);
+      } catch {
+        /* best-effort */
       }
-      // Verify audio I/O survived session.start()
-      console.log(`[SessionContext] post-start input.audio:`, session.input.audio?.constructor?.name);
-      console.log(`[SessionContext] post-start output.audio:`, session.output.audio?.constructor?.name);
-      console.log(`[SessionContext] post-start input.audioEnabled:`, session.input.audioEnabled);
-      console.log(`[SessionContext] post-start started:`, session.started);
     };
 
     // Listen to session close event — handles agent-initiated shutdown
@@ -127,6 +124,61 @@ export class JobContext {
 
   addShutdownCallback(callback: () => void | Promise<void>): void {
     this._shutdownCallbacks.push(callback);
+  }
+
+  /**
+   * Terminate the agent job and drop the underlying SIP/audio_stream call.
+   *
+   * Matches the Python `JobContext.shutdown(reason)` contract and the
+   * `AgentSession.shutdown()` flow in TS LiveKit Agents. Idempotent — Rust
+   * `endpoint.hangup` is a no-op once the session is gone.
+   *
+   * User-visible behavior:
+   *   1. Fires all registered shutdown callbacks (fire-and-forget on the
+   *      event loop; exceptions from user callbacks are swallowed).
+   *   2. Calls `endpoint.hangup(sessionId)` to drop the SIP call.
+   *   3. Resolves the internal `callEnded` promise so the server's
+   *      entrypoint runner proceeds to cleanup.
+   */
+  shutdown(reason: string = ''): void {
+    console.log(`Call ${this.sessionId} JobContext.shutdown(reason=${JSON.stringify(reason)})`);
+    // Fire user callbacks — fire-and-forget (shutdown() is sync for
+    // API parity with LiveKit's JobContext).
+    for (const cb of this._shutdownCallbacks) {
+      try {
+        const r = cb();
+        if (r && typeof (r as any).then === 'function') {
+          (r as Promise<unknown>).catch(() => {});
+        }
+      } catch {
+        /* best-effort */
+      }
+    }
+    try {
+      this.endpoint.hangup(this.sessionId);
+    } catch {
+      /* session already gone */
+    }
+    try {
+      this._resolveCallEnded();
+    } catch {
+      /* already resolved */
+    }
+  }
+
+  /**
+   * Async equivalent of shutdown — matches Python `JobContext.delete_room`.
+   *
+   * LiveKit's real `delete_room` returns a Future/Promise; our stub maps
+   * it directly to `endpoint.hangup`. Safe to call multiple times; safe
+   * to call before or after `shutdown()`.
+   */
+  async deleteRoom(_roomName: string = ''): Promise<void> {
+    try {
+      this.endpoint.hangup(this.sessionId);
+    } catch {
+      /* already gone */
+    }
   }
 
   /** @internal Wait for call to end — called by server after entrypoint returns */

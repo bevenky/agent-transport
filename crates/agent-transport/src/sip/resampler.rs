@@ -274,4 +274,17 @@ mod tests {
             assert!(r.is_some(), "Quality {} failed", q);
         }
     }
+
+    #[test]
+    fn test_from_rate_accessor() {
+        // Regression: endpoint.send_audio_with_callback uses from_rate() to
+        // detect sample-rate changes mid-call and recreate the resampler.
+        // If from_rate() lies, stale filter state corrupts the output.
+        let r = Resampler::new_voip(24000, 8000).unwrap();
+        assert_eq!(r.from_rate(), 24000);
+        assert_eq!(r.to_rate(), 8000);
+
+        let r2 = Resampler::new_voip(16000, 8000).unwrap();
+        assert_eq!(r2.from_rate(), 16000);
+    }
 }

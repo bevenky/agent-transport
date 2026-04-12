@@ -19,7 +19,6 @@
  *   await session.start({ agent: myAgent, room });
  */
 
-import { writeSync } from 'node:fs';
 import { SipAudioInput } from './sip_audio_input.js';
 import { SipAudioOutput } from './sip_audio_output.js';
 
@@ -57,6 +56,7 @@ export interface TransportEndpoint {
   sendAudioBytes(sessionId: string, audio: Uint8Array, sampleRate: number, numChannels: number): void;
   sendBackgroundAudio(sessionId: string, audio: Uint8Array, sampleRate: number, numChannels: number): void;
   sendDtmf(sessionId: string, digits: string): void;
+  sendDtmfAsync(sessionId: string, digits: string, method?: string): Promise<void>;
   sendRawMessage(sessionId: string, message: string): void;
   recvAudioBytesBlocking(sessionId: string, timeoutMs?: number): Uint8Array | null;
   recvAudioBytesAsync(sessionId: string, timeoutMs?: number): Promise<Buffer | null>;
@@ -122,14 +122,28 @@ export class TransportRemoteParticipant {
   name: string;
   metadata = '';
   attributes: Record<string, string> = {};
-  kind = 3; // PARTICIPANT_KIND_SIP
+  kind = 3; // PARTICIPANT_KIND_SIP (top-level for LiveKit's older API)
   disconnect_reason: number | null = null;
   trackPublications: Record<string, any> = {};
+
+  // LiveKit's RoomIO.onParticipantConnected reads `participant.info.kind`
+  // (matching @livekit/rtc-node's ParticipantInfo shape). Without this
+  // property, the handler throws `TypeError: Cannot read properties of
+  // undefined (reading 'kind')` during RoomIO.init, which surfaces as an
+  // unhandled rejection when the session closes.
+  info: { kind: number; sid: string; identity: string; name: string; metadata: string };
 
   constructor(identity: string, sessionId: string) {
     this.sid = `PR_${sessionId}`;
     this.identity = identity;
     this.name = identity;
+    this.info = {
+      kind: this.kind,
+      sid: this.sid,
+      identity: this.identity,
+      name: this.name,
+      metadata: this.metadata,
+    };
   }
 }
 
@@ -157,7 +171,15 @@ export class TransportLocalParticipant {
   }
 
   async publishDtmf({ code, digit }: { code: number; digit: string }): Promise<void> {
-    this._endpoint.sendDtmf(this._sessionId, digit);
+    // Use the async napi variant — the sync version blocks the Node
+    // event loop for ~280 ms per digit (1 start + 10 continue + 3 end
+    // RFC 4733 RTP packets × 20 ms ptime). The async variant runs the
+    // pacing on a napi worker thread, freeing the main loop to keep
+    // processing audio/LLM/TTS frames. `code` is accepted for LiveKit
+    // API compatibility but we don't need it — Rust encodes the digit
+    // via its own digit→event mapping.
+    void code;
+    await this._endpoint.sendDtmfAsync(this._sessionId, digit);
   }
 
   async publishTrack(track: any, options?: any): Promise<StubTrackPublication> {
@@ -192,7 +214,6 @@ export class TransportLocalParticipant {
       const sr = (this._endpoint as any).inputSampleRate ?? 8000;
       const stream = new AudioStream(track, sr, 1);
       const reader = stream.getReader();
-      let frameCount = 0;
 
       while (!signal.aborted) {
         const { value: frame, done } = await reader.read();
@@ -201,12 +222,6 @@ export class TransportLocalParticipant {
           try {
             this._endpoint.sendBackgroundAudio(
               this._sessionId, Buffer.from(frame.data.buffer), frame.sampleRate, frame.channels);
-            frameCount++;
-            if (frameCount === 1) {
-              writeSync(2, `Background audio: first frame sr=${frame.sampleRate} samples=${frame.samplesPerChannel}\n`);
-            } else if (frameCount % 500 === 0) {
-              writeSync(2, `Background audio: ${frameCount} frames forwarded\n`);
-            }
           } catch {
             break; // Session gone
           }

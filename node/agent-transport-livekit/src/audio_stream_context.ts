@@ -110,6 +110,60 @@ export class AudioStreamJobContext {
     this._shutdownCallbacks.push(callback);
   }
 
+  /**
+   * Terminate the agent job and drop the underlying audio_stream call.
+   *
+   * Matches the Python `JobContext.shutdown(reason)` contract and
+   * mirrors `JobContext.shutdown` in `session_context.ts` (SIP variant).
+   * Idempotent — `endpoint.hangup` is a no-op once the session is gone.
+   *
+   * Behavior:
+   *   1. Fires all registered shutdown callbacks (fire-and-forget on
+   *      the event loop; exceptions from user callbacks are swallowed).
+   *   2. Calls `endpoint.hangup(sessionId)` to drop the Plivo WS session.
+   *   3. Resolves the internal `callEnded` promise so the server's
+   *      entrypoint runner proceeds to cleanup.
+   */
+  shutdown(reason: string = ''): void {
+    console.log(`Session ${this.sessionId} JobContext.shutdown(reason=${JSON.stringify(reason)})`);
+    for (const cb of this._shutdownCallbacks) {
+      try {
+        const r = cb();
+        if (r && typeof (r as any).then === 'function') {
+          (r as Promise<unknown>).catch(() => {});
+        }
+      } catch {
+        /* best-effort */
+      }
+    }
+    try {
+      (this.endpoint as any).hangup(this.sessionId);
+    } catch {
+      /* session already gone */
+    }
+    try {
+      this._resolveCallEnded();
+    } catch {
+      /* already resolved */
+    }
+  }
+
+  /**
+   * Async equivalent of shutdown — matches Python `JobContext.delete_room`.
+   *
+   * LiveKit's real `delete_room` returns a Future/Promise; our stub maps
+   * it directly to `endpoint.hangup`. Safe to call multiple times; safe
+   * to call before or after `shutdown()`. This is the method
+   * `EndCallTool` calls via its shutdown callback when `deleteRoom: true`.
+   */
+  async deleteRoom(_roomName: string = ''): Promise<void> {
+    try {
+      (this.endpoint as any).hangup(this.sessionId);
+    } catch {
+      /* already gone */
+    }
+  }
+
   /** @internal */
   get callEnded(): Promise<void> {
     return this._callEnded;

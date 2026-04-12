@@ -1,7 +1,19 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
+
+/// Lock a Mutex and recover from poisoning instead of panicking. The
+/// PyO3 binding runs across multiple threads (Python event loop, tokio
+/// callback thread, dispatch thread), and a panic that poisons the
+/// callbacks map would otherwise propagate to every subsequent dispatch
+/// and bring down the event loop.
+fn lock_or_recover<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    match m.lock() {
+        Ok(g) => g,
+        Err(e) => e.into_inner(),
+    }
+}
 
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
@@ -37,18 +49,36 @@ struct AudioFrame {
 #[pymethods]
 impl AudioFrame {
     #[new]
-    fn new(data: Vec<i16>, sample_rate: u32, num_channels: u32) -> Self {
-        let samples_per_channel = if num_channels > 0 {
-            data.len() as u32 / num_channels
-        } else {
-            0
-        };
-        Self {
+    fn new(data: Vec<i16>, sample_rate: u32, num_channels: u32) -> PyResult<Self> {
+        // M2: validate that data length matches a whole number of samples per
+        // channel. Without this, callers passing unbalanced buffers (e.g.
+        // 5 samples for 2 channels) would silently truncate to 2 samples per
+        // channel and lose the trailing sample, producing audio glitches that
+        // are very hard to debug downstream.
+        if num_channels == 0 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "num_channels must be > 0",
+            ));
+        }
+        if sample_rate == 0 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "sample_rate must be > 0",
+            ));
+        }
+        if data.len() % (num_channels as usize) != 0 {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "AudioFrame data length ({}) is not a multiple of num_channels ({})",
+                data.len(),
+                num_channels
+            )));
+        }
+        let samples_per_channel = data.len() as u32 / num_channels;
+        Ok(Self {
             data,
             sample_rate,
             num_channels,
             samples_per_channel,
-        }
+        })
     }
 
     #[staticmethod]
@@ -127,9 +157,15 @@ impl From<RustCallSession> for CallSession {
 /// Returned by `ep.on("event_name")` — usable as a decorator.
 ///
 /// ```python
-/// @ep.on("incoming_call")
-/// def handler(session):
-///     ep.answer(session.session_id)
+/// @ep.on("call_ringing")
+/// def on_ringing(session):
+///     # Observational: Rust auto-answers. Use for logging / metrics.
+///     print(f"Incoming call from {session.remote_uri}")
+///
+/// @ep.on("call_answered")
+/// def on_answered(session):
+///     # Call is now active and media is flowing — safe to start the agent.
+///     ...
 /// ```
 #[pyclass]
 struct EventDecorator {
@@ -140,9 +176,7 @@ struct EventDecorator {
 #[pymethods]
 impl EventDecorator {
     fn __call__(&self, py: Python, func: Py<PyAny>) -> PyResult<Py<PyAny>> {
-        self.callbacks
-            .lock()
-            .unwrap()
+        lock_or_recover(&self.callbacks)
             .entry(self.event_name.clone())
             .or_default()
             .push(func.clone_ref(py));
@@ -164,17 +198,20 @@ fn event_to_dict<'py>(py: Python<'py>, event: &EndpointEvent) -> PyResult<Bound<
         EndpointEvent::Unregistered => {
             dict.set_item("type", "unregistered")?;
         }
-        EndpointEvent::IncomingCall { session } => {
-            dict.set_item("type", "incoming_call")?;
+        EndpointEvent::CallRinging { session } => {
+            dict.set_item("type", "call_ringing")?;
             dict.set_item("session", CallSession::from(session.clone()).into_pyobject(py)?)?;
         }
         EndpointEvent::CallStateChanged { session } => {
             dict.set_item("type", "call_state")?;
             dict.set_item("session", CallSession::from(session.clone()).into_pyobject(py)?)?;
         }
-        EndpointEvent::CallMediaActive { call_id } => {
-            dict.set_item("type", "call_media_active")?;
-            dict.set_item("session_id", call_id)?;
+        EndpointEvent::CallAnswered { session } => {
+            dict.set_item("type", "call_answered")?;
+            // session_id kept for backwards compat with adapters that
+            // previously read it from the `call_media_active` event.
+            dict.set_item("session_id", &session.session_id)?;
+            dict.set_item("session", CallSession::from(session.clone()).into_pyobject(py)?)?;
         }
         EndpointEvent::CallTerminated { session, reason } => {
             dict.set_item("type", "call_terminated")?;
@@ -205,20 +242,34 @@ fn event_to_dict<'py>(py: Python<'py>, event: &EndpointEvent) -> PyResult<Bound<
             dict.set_item("type", "beep_timeout")?;
             dict.set_item("session_id", call_id)?;
         }
+        EndpointEvent::Shutdown => {
+            dict.set_item("type", "shutdown")?;
+        }
     }
     Ok(dict)
 }
 
 /// Dispatch an event to registered Python callbacks.
+///
+/// IMPORTANT: We clone the handlers list and release the lock BEFORE invoking
+/// the callbacks. Holding the Mutex across `handler.call1()` would deadlock
+/// if the callback tries to register a new handler via `ep.on(...)` (which
+/// also locks this Mutex).
 fn dispatch_event(
     py: Python,
     callbacks: &Arc<Mutex<HashMap<String, Vec<Py<PyAny>>>>>,
     event: &EndpointEvent,
 ) {
     let name = event.callback_name();
-    let cbs = callbacks.lock().unwrap();
-    let Some(handlers) = cbs.get(name) else {
-        return;
+    // Clone the handlers under the lock, then release before dispatching.
+    // Use lock_or_recover so a panicked dispatch can't poison the mutex
+    // and break every subsequent event delivery.
+    let handlers: Vec<Py<PyAny>> = {
+        let cbs = lock_or_recover(callbacks);
+        match cbs.get(name) {
+            Some(hs) => hs.iter().map(|h| h.clone_ref(py)).collect(),
+            None => return,
+        }
     };
 
     let dict = match event_to_dict(py, event) {
@@ -226,7 +277,7 @@ fn dispatch_event(
         Err(_) => return,
     };
 
-    for handler in handlers {
+    for handler in &handlers {
         if let Err(e) = handler.call1(py, (&dict,)) {
             e.print(py);
         }
@@ -301,10 +352,15 @@ impl SipEndpoint {
     /// Register an event callback. Can be used as a decorator:
     ///
     /// ```python
-    /// @ep.on("incoming_call")
-    /// def handler(event):
+    /// @ep.on("call_ringing")
+    /// def on_ringing(event):
+    ///     # Pre-answer, observational. Rust auto-answers right after.
     ///     print(event["session"].remote_uri)
-    ///     ep.answer(event["session"].session_id)
+    ///
+    /// @ep.on("call_answered")
+    /// def on_answered(event):
+    ///     # Call is answered and media is active. Create your agent here.
+    ///     start_agent(event["session"])
     /// ```
     ///
     /// Or with a direct callback:
@@ -314,8 +370,8 @@ impl SipEndpoint {
     /// ```
     ///
     /// Event names: registered, registration_failed, unregistered,
-    /// incoming_call, call_state, call_media_active, call_terminated,
-    /// dtmf_received, beep_detected, beep_timeout
+    /// call_ringing, call_state, call_answered, call_terminated,
+    /// dtmf_received, beep_detected, beep_timeout, shutdown
     #[pyo3(signature = (event_name, callback=None))]
     fn on(
         &self,
@@ -325,9 +381,7 @@ impl SipEndpoint {
     ) -> PyResult<PyObject> {
         if let Some(cb) = callback {
             // Direct registration: ep.on("event", callback)
-            self.callbacks
-                .lock()
-                .unwrap()
+            lock_or_recover(&self.callbacks)
                 .entry(event_name)
                 .or_default()
                 .push(cb);

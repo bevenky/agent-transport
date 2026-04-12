@@ -64,42 +64,67 @@ class SipInputTransport(BaseInputTransport):
                 audio_in_enabled=True,
                 audio_in_passthrough=True,
             )
+        # Pipecat's BaseInputTransport.start() reads params.audio_in_sample_rate
+        # to set self._sample_rate. The Rust endpoint emits frames at its fixed
+        # configured rate; if the user didn't specify one, propagate the
+        # endpoint's rate so VAD/turn analyzers/audio-filters see matching Hz.
+        # If the user specified a mismatched rate, log a warning — the frames
+        # will still carry the endpoint's rate in their metadata but downstream
+        # processors may miscompute based on the transport's sample_rate.
+        _ep_in = endpoint.input_sample_rate
+        if params.audio_in_sample_rate is None:
+            params.audio_in_sample_rate = _ep_in
+        elif params.audio_in_sample_rate != _ep_in:
+            logger.warning(
+                "SipInputTransport: params.audio_in_sample_rate={} does not match "
+                "endpoint.input_sample_rate={}. Rust emits frames at the endpoint rate; "
+                "reconfigure the endpoint at construction to match.",
+                params.audio_in_sample_rate, _ep_in,
+            )
         super().__init__(params, **kwargs)
         self._ep = endpoint
         self._cid = session_id
         self._transport = transport
         self._event_queue = event_queue
-        self._running = False
+        # Started flag — distinct from _paused (the base-class pause flag).
+        # _started gates start()/stop() idempotency. The recv loop runs
+        # while the tasks exist; pause/resume are handled by the base class
+        # via `self._paused` which `push_audio_frame` already gates on.
+        self._started = False
         self._recv_task: Optional[asyncio.Task] = None
         self._event_task: Optional[asyncio.Task] = None
 
     async def start(self, frame: StartFrame):
-        if self._running:
+        if self._started:
             return
         await super().start(frame)
-        self._running = True
+        self._started = True
         await self.set_transport_ready(frame)
         self._recv_task = asyncio.create_task(self._recv_loop())
         self._event_task = asyncio.create_task(self._event_loop())
         await self._transport._call_event_handler("on_client_connected")
 
     async def stop(self, frame: EndFrame):
-        if not self._running:
+        if not self._started:
             await super().stop(frame)
             return
-        self._running = False
+        self._started = False
         await self._cancel_tasks()
         await super().stop(frame)
 
     async def cancel(self, frame: CancelFrame):
-        self._running = False
+        self._started = False
         await self._cancel_tasks()
         await super().cancel(frame)
 
-    async def pause(self, frame: StopFrame):
-        self._running = False
-        await self._cancel_tasks()
-        await super().pause(frame)
+    # NOTE: pause(StopFrame) is intentionally NOT overridden — we let the
+    # base class set `self._paused = True`, which `push_audio_frame()`
+    # already gates on (`pipecat/transports/base_input.py:319-326`).
+    # The recv loop keeps reading from Rust and producing frames, but the
+    # frames are dropped at `push_audio_frame` while paused. On resume the
+    # base class sets `self._paused = False` and frames flow again — no
+    # need to cancel + recreate tasks. This matches base-class semantics
+    # without requiring a custom restart mechanism.
 
     async def _cancel_tasks(self):
         """Cancel and await background tasks."""
@@ -114,19 +139,26 @@ class SipInputTransport(BaseInputTransport):
     async def _recv_loop(self):
         """Receive audio from Rust endpoint via blocking call (GIL released)."""
         loop = asyncio.get_running_loop()
-        while self._running:
-            try:
-                result = await loop.run_in_executor(
-                    None, lambda: self._ep.recv_audio_bytes_blocking(self._cid, 20)
-                )
-            except Exception as e:
-                logger.debug("SipInputTransport recv_audio error: {}", e)
-                break
-            if result is not None:
-                audio_bytes, sample_rate, num_channels = result
-                await self.push_audio_frame(InputAudioRawFrame(
-                    audio=bytes(audio_bytes), sample_rate=sample_rate, num_channels=num_channels,
-                ))
+        try:
+            while self._started:
+                try:
+                    result = await loop.run_in_executor(
+                        None, lambda: self._ep.recv_audio_bytes_blocking(self._cid, 20)
+                    )
+                except Exception:
+                    # Session ended (remote BYE removed the call from the
+                    # Rust call map). Exit the recv loop cleanly — the
+                    # event loop is responsible for firing on_client_disconnected.
+                    break
+                if result is not None:
+                    audio_bytes, sample_rate, num_channels = result
+                    # push_audio_frame() drops the frame if base class
+                    # `_paused == True`, so no extra check needed here.
+                    await self.push_audio_frame(InputAudioRawFrame(
+                        audio=bytes(audio_bytes), sample_rate=sample_rate, num_channels=num_channels,
+                    ))
+        except asyncio.CancelledError:
+            raise
 
     async def _event_loop(self):
         """Poll for DTMF, call state, and lifecycle events.
@@ -141,7 +173,7 @@ class SipInputTransport(BaseInputTransport):
 
     async def _event_loop_from_queue(self):
         """Read events from per-session queue (dispatched by server)."""
-        while self._running:
+        while self._started:
             try:
                 event = await asyncio.wait_for(self._event_queue.get(), timeout=0.5)
             except asyncio.TimeoutError:
@@ -149,12 +181,15 @@ class SipInputTransport(BaseInputTransport):
             except Exception as e:
                 logger.debug("SipInputTransport event_loop error: {}", e)
                 break
-            await self._handle_event(event)
+            try:
+                await self._handle_event(event)
+            except Exception:
+                logger.exception("SipInputTransport handler failed for event %r", event.get("type") if isinstance(event, dict) else event)
 
     async def _event_loop_from_endpoint(self):
         """Poll events directly from endpoint (standalone, no server)."""
         loop = asyncio.get_running_loop()
-        while self._running:
+        while self._started:
             try:
                 event = await loop.run_in_executor(
                     None, lambda: self._ep.wait_for_event(timeout_ms=100)
@@ -164,7 +199,10 @@ class SipInputTransport(BaseInputTransport):
                 break
             if event is None:
                 continue
-            await self._handle_event(event)
+            try:
+                await self._handle_event(event)
+            except Exception:
+                logger.exception("SipInputTransport handler failed for event %r", event.get("type") if isinstance(event, dict) else event)
 
     async def _handle_event(self, event):
         """Process a single event."""
@@ -172,7 +210,7 @@ class SipInputTransport(BaseInputTransport):
         if event_type == "dtmf_received":
             await self.push_frame(InputDTMFFrame(button=KeypadEntry(event["digit"])))
         elif event_type == "call_terminated":
-            self._running = False
+            self._started = False
             await self._transport._call_event_handler("on_client_disconnected")
             await self.push_frame(EndFrame())
         elif event_type == "beep_detected":
@@ -206,6 +244,20 @@ class SipOutputTransport(BaseOutputTransport):
         if params is None:
             params = TransportParams(
                 audio_out_enabled=True,
+            )
+        # Match Rust endpoint's outbound sample rate. Pipecat's MediaSender
+        # chunks/paces audio against `params.audio_out_sample_rate`; if the
+        # user leaves it unset, propagate the endpoint rate so the chunking
+        # math matches the rate actually sent on the wire.
+        _ep_out = endpoint.output_sample_rate
+        if params.audio_out_sample_rate is None:
+            params.audio_out_sample_rate = _ep_out
+        elif params.audio_out_sample_rate != _ep_out:
+            logger.warning(
+                "SipOutputTransport: params.audio_out_sample_rate={} does not match "
+                "endpoint.output_sample_rate={}. Rust resamples input but expects "
+                "frames carrying the native sample rate in frame.sample_rate.",
+                params.audio_out_sample_rate, _ep_out,
             )
         super().__init__(params, **kwargs)
         self._ep = endpoint
@@ -293,15 +345,19 @@ class SipOutputTransport(BaseOutputTransport):
             logger.warning("send_message via SIP INFO failed: {}", e)
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
-        """Handle InterruptionFrame — clear Rust buffer + pause RTP, then let base class handle pipeline."""
-        await super().process_frame(frame, direction)
+        """Handle InterruptionFrame → clear Rust buffer BEFORE base class processing.
 
+        The base class cancels and restarts the MediaSender audio task. Clearing
+        the Rust buffer first ensures the new task doesn't race against stale
+        audio queued in Rust.
+        """
         if isinstance(frame, InterruptionFrame):
-            logger.debug(f"InterruptionFrame: clearing buffer for {self._cid}")
             try:
                 self._ep.clear_buffer(self._cid)
             except Exception as e:
                 logger.warning(f"clear_buffer on interruption failed: {e}")
+
+        await super().process_frame(frame, direction)
 
     async def stop(self, frame: EndFrame):
         loop = asyncio.get_running_loop()

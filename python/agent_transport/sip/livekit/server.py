@@ -39,6 +39,7 @@ from livekit.agents.utils import MovingAverage
 from livekit.rtc.room import SipDTMF
 from .sip_io import SipAudioInput, SipAudioOutput
 from ._room_facade import TransportRoom, create_transport_context
+from ._aio_utils import call_setup as _call_setup
 
 logger = logging.getLogger("agent_transport.server")
 
@@ -146,11 +147,16 @@ class _LoadMonitor:
         self._avg = MovingAverage(5)
         self._cpu_monitor = get_cpu_monitor()
         self._lock = threading.Lock()
+        self._stop = threading.Event()
         self._thread = threading.Thread(target=self._sample_loop, daemon=True)
         self._thread.start()
 
     def _sample_loop(self) -> None:
-        while True:
+        # Cooperative shutdown via _stop event so test harnesses and rapid
+        # start/stop cycles don't leak threads. The thread is daemon=True so
+        # process exit is unblocked regardless, but a clean stop avoids the
+        # 0.5s wasted-CPU window during shutdown.
+        while not self._stop.is_set():
             cpu = self._cpu_monitor.cpu_percent(interval=0.5)
             with self._lock:
                 self._avg.add_sample(cpu)
@@ -158,6 +164,13 @@ class _LoadMonitor:
     def get_load(self) -> float:
         with self._lock:
             return self._avg.get_avg()
+
+    def stop(self) -> None:
+        """Signal the sampler thread to exit and join with a short timeout."""
+        self._stop.set()
+        # cpu_percent's 0.5s sleep is uninterruptible, so we wait at most
+        # ~600ms for it to finish naturally.
+        self._thread.join(timeout=1.0)
 
 
 @dataclass
@@ -294,11 +307,28 @@ class AgentServer:
         self._proc = JobProcess()
         self._userdata: dict[str, Any] = {}
         self._ep: SipEndpoint | None = None
-        self._active_calls: dict[int, asyncio.Task] = {}
-        self._call_ended_events: dict[int, asyncio.Event] = {}
-        self._call_contexts: dict[int, JobContext] = {}
-        # _pending_outbound removed — outbound calls start session directly after ep.call()
+        # Session IDs are strings (returned by Rust CallSession.session_id).
+        # The type hints used `int` before — purely cosmetic since Python dict
+        # keys are duck-typed, but fix them so mypy/pyright don't scream.
+        self._active_calls: dict[str, asyncio.Task] = {}
+        self._call_ended_events: dict[str, asyncio.Event] = {}
+        self._call_contexts: dict[str, JobContext] = {}
+        # Strong-reference set for fire-and-forget asyncio tasks (outbound
+        # dial wrappers, inbound _start_call dispatch). Python's event loop
+        # only holds weak references to tasks; without storing them here,
+        # the GC can collect a task mid-execution and emit
+        # "Task was destroyed but it is pending!" warnings.
+        self._background_tasks: set[asyncio.Task] = set()
+        # Outbound sessions whose `_start_call` task has been scheduled but
+        # may not yet be visible in `_active_calls`. The `call_answered`
+        # event handler checks this set to avoid racing against an outbound
+        # session that `_start_call` will create asynchronously.
+        self._outbound_session_ids: set[str] = set()
         self._load_monitor = _LoadMonitor()
+        # Server-level event listeners (distinct from per-JobContext events
+        # which only exist after session creation). Used for pre-answer
+        # hooks like `ringing` that fire before the JobContext exists.
+        self._server_listeners: dict[str, list[Callable]] = {}
 
     @property
     def setup_fnc(self):
@@ -331,6 +361,56 @@ class AgentServer:
             self._entrypoint_fnc = fn
             return fn
         return decorator
+
+    def on(self, event_name: str, callback: Callable | None = None) -> Callable:
+        """Register a server-level event listener.
+
+        Server events fire before a per-call :class:`JobContext` exists, so
+        they can't be attached to ``ctx``. Use these for pre-answer hooks
+        like call screening, logging, and metrics.
+
+        Available events:
+
+        - ``"ringing"`` — fires on inbound SIP calls immediately after Rust
+          has sent ``180 Ringing``. Handler receives a ``CallSession`` with
+          ``session_id``, ``remote_uri``, ``call_uuid``, and
+          ``extra_headers``. Rust auto-answers right after this event, so
+          the hook is currently observational only — return values are
+          ignored. Future enhancement: allow handlers to return
+          ``False``/raise to reject the call before auto-answer runs.
+
+        Handlers may be ``async def`` or plain functions. Async handlers
+        are scheduled as background tasks.
+
+        Usage::
+
+            @server.on("ringing")
+            def on_ringing(session):
+                logger.info("Incoming call from %s", session.remote_uri)
+
+            @server.on("ringing")
+            async def log_to_db(session):
+                await db.insert_call_record(session.call_uuid)
+        """
+        def decorator(fn: Callable) -> Callable:
+            self._server_listeners.setdefault(event_name, []).append(fn)
+            return fn
+        if callback is not None:
+            return decorator(callback)
+        return decorator
+
+    def _emit_server_event(self, event_name: str, *args, **kwargs) -> None:
+        """Fire a server-level event to all registered listeners."""
+        listeners = self._server_listeners.get(event_name, [])
+        for listener in listeners:
+            try:
+                result = listener(*args, **kwargs)
+                if asyncio.iscoroutine(result):
+                    task = asyncio.create_task(result)
+                    self._background_tasks.add(task)
+                    task.add_done_callback(self._background_tasks.discard)
+            except Exception:
+                logger.exception("Server event listener for %r failed", event_name)
 
     def run(self, port: int | None = None) -> None:
         """Build CLI and run — equivalent of cli.run_app(server)."""
@@ -423,11 +503,12 @@ class AgentServer:
             if self._inference_executor:
                 _set_inference_context(self._inference_executor)
             try:
-                self._setup_fnc(self._proc)  # New pattern: fn(proc)
-            except TypeError:
-                result = self._setup_fnc()  # Old pattern: fn() -> dict
-                if isinstance(result, dict):
-                    self._proc.userdata = result
+                await _call_setup(self._setup_fnc, self._proc)
+            except Exception:
+                logger.exception("Setup function failed")
+                if self._inference_executor:
+                    _clear_inference_context()
+                raise
             if self._inference_executor:
                 _clear_inference_context()
             self._userdata = self._proc.userdata
@@ -473,7 +554,12 @@ class AgentServer:
         await runner.cleanup()
         if self._inference_executor:
             await self._inference_executor.aclose()
-        self._ep.shutdown()
+        # Stop background threads cleanly before exiting.
+        self._load_monitor.stop()
+        # ep.shutdown() does block_on for unregister + per-call hangup. Wrap
+        # in run_in_executor so the asyncio loop isn't blocked for the
+        # ~200ms it takes to talk to the proxy.
+        await loop.run_in_executor(None, self._ep.shutdown)
 
     def _configure_logging(self, mode: str) -> None:
         if mode == "debug":
@@ -598,7 +684,12 @@ class AgentServer:
                 return web.json_response({"error": str(e)}, status=500)
 
             logger.info("Outbound call %s to %s connected (from=%s)", session_id, destination, from_uri or "default")
-            asyncio.create_task(self._start_call(session_id, destination, direction="outbound"))
+            # Mark synchronously so the event loop doesn't race-create a
+            # duplicate session when `call_answered` arrives.
+            self._outbound_session_ids.add(session_id)
+            t = asyncio.create_task(self._start_call(session_id, destination, direction="outbound"))
+            self._background_tasks.add(t)
+            t.add_done_callback(self._background_tasks.discard)
             return web.json_response({
                 "session_id": session_id, "status": "connected",
                 "to": raw_to, "from": raw_from,
@@ -606,6 +697,9 @@ class AgentServer:
         else:
             # Non-blocking (default): generate session_id upfront, dial in background
             session_id = "c" + uuid.uuid4().hex[:16]
+            # Reserve the session id up-front so call_answered knows it's
+            # an outbound call we're driving.
+            self._outbound_session_ids.add(session_id)
 
             async def _dial():
                 try:
@@ -616,8 +710,11 @@ class AgentServer:
                     await self._start_call(returned_id, destination, direction="outbound")
                 except Exception as e:
                     logger.warning("Outbound call %s to %s failed: %s", session_id, destination, e)
+                    self._outbound_session_ids.discard(session_id)
 
-            asyncio.create_task(_dial())
+            t = asyncio.create_task(_dial())
+            self._background_tasks.add(t)
+            t.add_done_callback(self._background_tasks.discard)
             return web.json_response({
                 "session_id": session_id, "status": "dialing",
                 "to": raw_to, "from": raw_from,
@@ -629,98 +726,134 @@ class AgentServer:
         Avoids multiple consumers racing on wait_for_event.
         """
         loop = asyncio.get_running_loop()
-        # Inbound calls waiting for call_media_active: {session_id: remote_uri}
-        pending_inbound: dict[int, str] = {}
 
         while True:
             try:
                 ev = await loop.run_in_executor(None, self._ep.wait_for_event, 1000)
             except Exception:
+                logger.exception("sip wait_for_event failed")
                 break
 
             if not ev:
                 continue
 
-            ev_type = ev["type"]
+            try:
+                ev_type = ev["type"]
 
-            if ev_type == "incoming_call":
-                session_id = ev["session"].session_id
-                remote_uri = ev["session"].remote_uri
-                logger.info("Incoming call %s from %s", session_id, remote_uri)
-                try:
-                    await loop.run_in_executor(None, self._ep.answer, session_id)
-                except Exception as e:
-                    logger.warning("Failed to answer call %s: %s", session_id, e)
-                    continue
-                pending_inbound[session_id] = remote_uri
+                if ev_type == "shutdown":
+                    # Sentinel pushed by ep.shutdown() so this loop wakes
+                    # immediately instead of waiting for the next 1s poll
+                    # timeout. Exit cleanly.
+                    logger.debug("sip event loop received shutdown sentinel")
+                    break
 
-            elif ev_type == "call_media_active":
-                session_id = ev["session_id"]
-
-                if session_id in pending_inbound:
-                    remote_uri = pending_inbound.pop(session_id)
-                    asyncio.create_task(
-                        self._start_call(session_id, remote_uri, direction="inbound")
+                if ev_type == "call_ringing":
+                    # Pre-answer hook. Rust has sent 180 Ringing and will
+                    # auto-answer immediately after this event. We don't
+                    # create the session yet — that happens on call_answered.
+                    # This is purely observational: fire server-level
+                    # "ringing" listeners for logging / screening.
+                    session = ev["session"]
+                    logger.info(
+                        "Incoming call %s ringing (from=%s, call_uuid=%s)",
+                        session.session_id, session.remote_uri, session.call_uuid,
                     )
+                    self._emit_server_event("ringing", session)
 
-            elif ev_type == "call_terminated":
-                session_id = ev["session"].session_id
-                reason = ev.get("reason", "unknown")
-                logger.info("Call %s terminated (reason=%s)", session_id, reason)
+                elif ev_type == "call_answered":
+                    # Call is answered and media is active — safe to create
+                    # the agent session. Fires for both inbound and outbound.
+                    # Outbound sessions are reserved synchronously by the
+                    # HTTP outbound path (via _outbound_session_ids), so we
+                    # skip the event for them.
+                    session = ev["session"]
+                    session_id = session.session_id
+                    if session_id in self._outbound_session_ids:
+                        # Outbound path owns session creation. Clear the
+                        # marker so a hypothetical session_id reuse after
+                        # this call ends doesn't keep matching.
+                        self._outbound_session_ids.discard(session_id)
+                        continue
+                    if session_id in self._active_calls:
+                        # Defensive: session already being driven (e.g.,
+                        # duplicate event, retry). Ignore.
+                        continue
+                    t = asyncio.create_task(
+                        self._start_call(session_id, session.remote_uri, direction="inbound")
+                    )
+                    self._background_tasks.add(t)
+                    t.add_done_callback(self._background_tasks.discard)
 
-                # Clear audio buffer immediately to abort any pending playout
-                # (prevents 5s "speech not done in time" timeout)
-                try:
-                    self._ep.clear_buffer(session_id)
-                except Exception:
-                    pass
+                elif ev_type == "call_terminated":
+                    session_id = ev["session"].session_id
+                    reason = ev.get("reason", "unknown")
+                    logger.info("Call %s terminated (reason=%s)", session_id, reason)
 
-                # Emit participant_disconnected on Room facade (matches LiveKit WebRTC)
-                # RoomIO._on_participant_disconnected will call _close_soon() → session closes
-                ctx = self._call_contexts.get(session_id)
-                if ctx and ctx._room:
-                    remote = ctx._room._remote
-                    remote.disconnect_reason = 1  # CLIENT_INITIATED
-                    ctx._room.emit("participant_disconnected", remote)
+                    # Clear audio buffer immediately to abort any pending playout
+                    # (prevents 5s "speech not done in time" timeout)
+                    try:
+                        self._ep.clear_buffer(session_id)
+                    except Exception:
+                        pass
 
-                # Clean up pending inbound if call died before media
-                pending_inbound.pop(session_id, None)
+                    # Emit participant_disconnected on Room facade (matches LiveKit WebRTC)
+                    # RoomIO._on_participant_disconnected will call _close_soon() → session closes
+                    ctx = self._call_contexts.get(session_id)
+                    if ctx and ctx._room:
+                        remote = ctx._room._remote
+                        remote.disconnect_reason = 1  # CLIENT_INITIATED
+                        ctx._room.emit("participant_disconnected", remote)
 
-                # Signal active call to end
-                if session_id in self._call_ended_events:
-                    self._call_ended_events[session_id].set()
+                    # Signal active call to end
+                    if session_id in self._call_ended_events:
+                        self._call_ended_events[session_id].set()
 
-            elif ev_type == "dtmf_received":
-                session_id = ev.get("session_id", -1)
-                digit = ev.get("digit", "")
-                logger.debug("DTMF '%s' on call %s", digit, session_id)
-                ctx = self._call_contexts.get(session_id)
-                if ctx:
-                    ctx._emit("dtmf_received", digit)
-                    if ctx._room:
-                        dtmf_ev = SipDTMF(code=ord(digit) if digit else 0, digit=digit,
-                                          participant=ctx._room._remote)
-                        ctx._room.emit("sip_dtmf_received", dtmf_ev)
+                elif ev_type == "dtmf_received":
+                    # Session ID is a string at every other call site; the old
+                    # `-1` default would produce a lookup miss and silently drop
+                    # a malformed DTMF event. Use None so the guard below logs
+                    # and skips explicitly.
+                    session_id = ev.get("session_id")
+                    digit = ev.get("digit", "")
+                    if not session_id:
+                        logger.warning("DTMF event missing session_id, dropping: %r", ev)
+                        continue
+                    logger.debug("DTMF '%s' on call %s", digit, session_id)
+                    ctx = self._call_contexts.get(session_id)
+                    if ctx:
+                        ctx._emit("dtmf_received", digit)
+                        if ctx._room:
+                            dtmf_ev = SipDTMF(code=ord(digit) if digit else 0, digit=digit,
+                                              participant=ctx._room._remote)
+                            ctx._room.emit("sip_dtmf_received", dtmf_ev)
 
-            elif ev_type == "beep_detected":
-                session_id = ev.get("session_id", "")
-                freq = ev.get("frequency_hz", 0.0)
-                dur = ev.get("duration_ms", 0)
-                logger.info("Beep detected on call %s (freq=%.0fHz, dur=%dms)", session_id, freq, dur)
-                ctx = self._call_contexts.get(session_id)
-                if ctx:
-                    ctx._emit("beep_detected", freq, dur)
-                    if ctx._room:
-                        ctx._room.emit("beep_detected", {"frequency_hz": freq, "duration_ms": dur})
+                elif ev_type == "beep_detected":
+                    session_id = ev.get("session_id")
+                    if not session_id:
+                        logger.warning("beep_detected event missing session_id, dropping: %r", ev)
+                        continue
+                    freq = ev.get("frequency_hz", 0.0)
+                    dur = ev.get("duration_ms", 0)
+                    logger.info("Beep detected on call %s (freq=%.0fHz, dur=%dms)", session_id, freq, dur)
+                    ctx = self._call_contexts.get(session_id)
+                    if ctx:
+                        ctx._emit("beep_detected", freq, dur)
+                        if ctx._room:
+                            ctx._room.emit("beep_detected", {"frequency_hz": freq, "duration_ms": dur})
 
-            elif ev_type == "beep_timeout":
-                session_id = ev.get("session_id", "")
-                logger.debug("Beep timeout on call %s", session_id)
-                ctx = self._call_contexts.get(session_id)
-                if ctx:
-                    ctx._emit("beep_timeout")
-                    if ctx._room:
-                        ctx._room.emit("beep_timeout", {})
+                elif ev_type == "beep_timeout":
+                    session_id = ev.get("session_id")
+                    if not session_id:
+                        logger.warning("beep_timeout event missing session_id, dropping: %r", ev)
+                        continue
+                    logger.debug("Beep timeout on call %s", session_id)
+                    ctx = self._call_contexts.get(session_id)
+                    if ctx:
+                        ctx._emit("beep_timeout")
+                        if ctx._room:
+                            ctx._room.emit("beep_timeout", {})
+            except Exception:
+                logger.exception("Error handling sip event %r", ev.get("type") if isinstance(ev, dict) else ev)
 
     async def _start_call(self, session_id: str, remote_uri: str, direction: str) -> None:
         call_ended = asyncio.Event()

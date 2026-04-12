@@ -13,6 +13,7 @@ agent_transport_core = { path = "../agent-transport", package = "agent-transport
 crossbeam-channel.workspace = true
 napi = { version = "2", features = ["default", "napi9"] }
 napi-derive = "2"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [build-dependencies]
 napi-build = "2"

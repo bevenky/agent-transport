@@ -11,6 +11,46 @@ declare module '@livekit/agents/dist/voice/io.js' {
   import type { ReadableStream } from 'node:stream/web';
   import { EventEmitter } from 'node:events';
 
+  // ── Pipeline node types (STT/LLM/TTS) ────────────────────────────
+  // Minimal shapes — downstream code usually treats these as opaque
+  // callables so we just declare the general call signature upstream
+  // uses. Upstream has richer generic parameters (ModelSettings,
+  // ChatContext, etc.) but those aren't needed here.
+  export type STTNode = (
+    audio: ReadableStream<AudioFrame>,
+    modelSettings: unknown,
+  ) => Promise<ReadableStream<unknown> | null>;
+
+  export type LLMNode = (
+    chatCtx: unknown,
+    toolCtx: unknown,
+    modelSettings: unknown,
+  ) => Promise<ReadableStream<unknown> | null>;
+
+  export type TTSNode = (
+    text: ReadableStream<string>,
+    modelSettings: unknown,
+  ) => Promise<ReadableStream<AudioFrame> | null>;
+
+  // ── TimedString — word-level transcript alignment ────────────────
+  export const TIMED_STRING_SYMBOL: unique symbol;
+  export interface TimedString {
+    readonly [TIMED_STRING_SYMBOL]: true;
+    text: string;
+    startTime?: number;
+    endTime?: number;
+    confidence?: number;
+    startTimeOffset?: number;
+  }
+  export function createTimedString(opts: {
+    text: string;
+    startTime?: number;
+    endTime?: number;
+    confidence?: number;
+    startTimeOffset?: number;
+  }): TimedString;
+  export function isTimedString(value: unknown): value is TimedString;
+
   export interface MultiInputStream<T> {
     get stream(): ReadableStream<T>;
     get inputCount(): number;
@@ -24,6 +64,15 @@ declare module '@livekit/agents/dist/voice/io.js' {
     protected multiStream: MultiInputStream<AudioFrame>;
     get stream(): ReadableStream<AudioFrame>;
     close(): Promise<void>;
+    onAttached(): void;
+    onDetached(): void;
+  }
+
+  export abstract class TextOutput {
+    protected readonly nextInChain?: TextOutput;
+    constructor(nextInChain?: TextOutput);
+    abstract captureText(text: string | TimedString): Promise<void>;
+    abstract flush(): void;
     onAttached(): void;
     onDetached(): void;
   }

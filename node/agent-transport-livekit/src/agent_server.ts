@@ -103,6 +103,20 @@ export class AgentServer {
   private httpServer?: Server;
   private loadMonitor = new LoadMonitor();
   private inferenceExecutor: any = null;
+  // Server-level event listeners. Used for pre-answer hooks like "ringing"
+  // that fire before the per-call JobContext exists.
+  private serverListeners = new Map<string, Array<(...args: any[]) => void | Promise<void>>>();
+  // Outbound session ids reserved synchronously by the /outbound_call HTTP
+  // handler. The event loop checks this set so `call_answered` events for
+  // outbound sessions don't race-create a duplicate agent session.
+  private outboundSessionIds = new Set<string>();
+  // Cooperative shutdown flag for the SIP event loop. The loop polls this
+  // each iteration and breaks when set, so the run() promise can await the
+  // loop's exit before tearing down the endpoint. Without this, the loop
+  // would keep polling forever (its waitForEvent timeout fires every 1 s)
+  // and Node would never exit because the pending Promise pins the
+  // libuv event loop.
+  private shutdownRequested = false;
 
   // Prometheus-compatible metrics (in-memory, served as text)
   private sipCallsTotal = { inbound: 0, outbound: 0 };
@@ -133,6 +147,51 @@ export class AgentServer {
    */
   set setupFnc(fn: (proc: JobProcess) => void | Record<string, unknown> | Promise<void | Record<string, unknown>>) {
     this.setupFn = fn as any;
+  }
+
+  /**
+   * Register a server-level event listener.
+   *
+   * Server events fire before a per-call JobContext exists, so they can't
+   * be attached to `ctx`. Use these for pre-answer hooks like call
+   * screening, logging, and metrics.
+   *
+   * Available events:
+   *   - `"ringing"` — fires on inbound SIP calls immediately after Rust
+   *     has sent 180 Ringing. Handler receives a CallSession with
+   *     sessionId, remoteUri, callUuid, extraHeaders. Rust auto-answers
+   *     right after this event, so the hook is currently observational
+   *     only. Return values / thrown errors are ignored.
+   *
+   * Handlers may be synchronous or async.
+   *
+   * ```ts
+   * server.on('ringing', (session) => {
+   *   console.log(`Incoming call from ${session.remoteUri}`);
+   * });
+   * ```
+   */
+  on(eventName: string, callback: (...args: any[]) => void | Promise<void>): void {
+    const arr = this.serverListeners.get(eventName) ?? [];
+    arr.push(callback);
+    this.serverListeners.set(eventName, arr);
+  }
+
+  private emitServerEvent(eventName: string, ...args: any[]): void {
+    const listeners = this.serverListeners.get(eventName);
+    if (!listeners) return;
+    for (const listener of listeners) {
+      try {
+        const result = listener(...args);
+        if (result && typeof (result as any).catch === 'function') {
+          (result as Promise<void>).catch((err) =>
+            console.error(`[agent-server] server event listener for ${eventName} failed:`, err)
+          );
+        }
+      } catch (err) {
+        console.error(`[agent-server] server event listener for ${eventName} failed:`, err);
+      }
+    }
   }
 
   /**
@@ -270,13 +329,19 @@ export class AgentServer {
     this.startHttpServer();
     console.log(`HTTP server on http://${this.host}:${this.port}`);
 
-    // Start SIP event loop
-    this.sipEventLoop();
+    // Start SIP event loop. Track the promise so we can await its exit
+    // during shutdown — without this the infinite while loop would pin
+    // Node's event loop forever.
+    const eventLoopDone = this.sipEventLoop();
 
     // Wait for shutdown signal
     await new Promise<void>((resolve) => {
-      process.on('SIGINT', () => resolve());
-      process.on('SIGTERM', () => resolve());
+      const onSignal = () => {
+        this.shutdownRequested = true;
+        resolve();
+      };
+      process.on('SIGINT', onSignal);
+      process.on('SIGTERM', onSignal);
     });
 
     console.log('Shutting down...');
@@ -299,6 +364,10 @@ export class AgentServer {
     }
     this.httpServer?.close();
     this.ep?.shutdown();
+    // Wait for the event loop to actually exit so Node can release the
+    // libuv handle and the process can terminate. The shutdown sentinel
+    // pushed by ep.shutdown() above wakes the loop immediately.
+    await eventLoopDone;
   }
 
   /**
@@ -315,32 +384,46 @@ export class AgentServer {
 
   // ─── Event dispatcher (single reader, no race conditions) ──────
 
-  private pendingInbound = new Map<string, string>(); // sessionId → remoteUri
-  // pendingOutbound removed — outbound calls start session directly after ep.call()
-
   private async sipEventLoop(): Promise<void> {
-    while (true) {
+    while (!this.shutdownRequested) {
       const ev = await this.waitForEvent(1000);
       if (!ev) continue;
 
-      if (ev.eventType === 'incoming_call' && ev.session) {
-        const sessionId = ev.session.sessionId;
-        const remoteUri = ev.session.remoteUri;
-        console.log(`Incoming call ${sessionId} from ${remoteUri}`);
-        this.ep!.answer(sessionId);
-        this.pendingInbound.set(sessionId, remoteUri);
+      // Sentinel pushed by ep.shutdown() — wake immediately instead of
+      // waiting for the next 1 s waitForEvent timeout, then exit cleanly.
+      if (ev.eventType === 'shutdown') {
+        break;
+      }
 
-      } else if (ev.eventType === 'call_media_active' && ev.sessionId !== undefined) {
-        const sessionId = ev.sessionId;
+      if (ev.eventType === 'call_ringing' && ev.session) {
+        // Pre-answer observational event. Rust is about to auto-answer.
+        // Fire server-level `ringing` listeners so user code can log /
+        // screen the call before media starts flowing.
+        const session = ev.session;
+        console.log(
+          `Incoming call ${session.sessionId} ringing (from=${session.remoteUri})`,
+        );
+        this.emitServerEvent('ringing', session);
 
-        if (this.pendingInbound.has(sessionId)) {
-          const remoteUri = this.pendingInbound.get(sessionId)!;
-          this.pendingInbound.delete(sessionId);
-          this.startCall(sessionId, remoteUri, 'inbound').catch((err) => {
-            console.error(`Inbound call ${sessionId} failed:`, err);
-            try { this.ep!.hangup(sessionId); } catch {}
-          });
+      } else if (ev.eventType === 'call_answered' && ev.session) {
+        // Call is answered and media is active — create the agent session.
+        // Outbound sessions are owned by the /outbound_call HTTP handler,
+        // which reserves the session id synchronously so we can skip the
+        // event here.
+        const session = ev.session;
+        const sessionId = session.sessionId;
+        if (this.outboundSessionIds.has(sessionId)) {
+          this.outboundSessionIds.delete(sessionId);
+          continue;
         }
+        if (this.activeCalls.has(sessionId)) {
+          // Defensive: duplicate event or retry.
+          continue;
+        }
+        this.startCall(sessionId, session.remoteUri, 'inbound').catch((err) => {
+          console.error(`Inbound call ${sessionId} failed:`, err);
+          try { this.ep!.hangup(sessionId); } catch {}
+        });
 
       } else if (ev.eventType === 'call_terminated' && ev.session) {
         const sessionId = ev.session.sessionId;
@@ -354,8 +437,8 @@ export class AgentServer {
           active.room.emitParticipantDisconnected();
         }
 
-        // Clean up pending
-        this.pendingInbound.delete(sessionId);
+        // Clean up outbound marker in case the call failed before answer
+        this.outboundSessionIds.delete(sessionId);
 
         // Signal active call to end
         if (active) {
@@ -476,6 +559,12 @@ export class AgentServer {
         // Hangup
         try { this.ep!.hangup(sessionId); } catch {}
 
+        // Mark room disconnected and emit "disconnected" event so any
+        // hooks attached via `room.on("disconnected", ...)` fire. The
+        // audio_stream server already does this; without it the SIP
+        // server leaves room.connected = true after the call ends.
+        try { ctx.room._onSessionEnded(); } catch {}
+
         this.activeCalls.delete(sessionId);
         console.log(`Call ${sessionId} ended (${direction}) duration=${durationSec.toFixed(1)}s`);
       }
@@ -570,12 +659,17 @@ export class AgentServer {
               // Blocking mode: wait for call to connect
               const sessionId = this.ep!.call(destination, fromUri, headers);
               console.log(`Outbound call ${sessionId} to ${destination} connected (from=${fromUri ?? 'default'})`);
+              // Reserve the id synchronously so the event loop doesn't
+              // race-create a duplicate session when `call_answered` arrives.
+              this.outboundSessionIds.add(sessionId);
               this.startCall(sessionId, destination, 'outbound');
               res.writeHead(200, { 'Content-Type': 'application/json' });
               res.end(JSON.stringify({ session_id: sessionId, status: 'connected', to: rawTo, from: rawFrom }));
             } else {
               // Non-blocking (default): generate session_id upfront, dial in background
               const sessionId = 'c' + crypto.randomUUID().replace(/-/g, '').slice(0, 16);
+              // Reserve up front so event loop recognizes this as outbound.
+              this.outboundSessionIds.add(sessionId);
               res.writeHead(200, { 'Content-Type': 'application/json' });
               res.end(JSON.stringify({ session_id: sessionId, status: 'dialing', to: rawTo, from: rawFrom }));
 
@@ -586,6 +680,7 @@ export class AgentServer {
                   this.startCall(returnedId, destination, 'outbound');
                 } catch (err) {
                   console.warn('Outbound call %s to %s failed:', sessionId, destination, err);
+                  this.outboundSessionIds.delete(sessionId);
                 }
               });
             }
@@ -650,21 +745,13 @@ export class AgentServer {
 
   // ─── Helpers ────────────────────────────────────────────────────
 
-  private waitForEvent(timeoutMs: number): Promise<ReturnType<SipEndpoint['pollEvent']> | null> {
-    return new Promise((resolve) => {
-      const start = Date.now();
-      const poll = () => {
-        const ev = this.ep?.pollEvent();
-        if (ev) {
-          resolve(ev);
-        } else if (Date.now() - start >= timeoutMs) {
-          resolve(null);
-        } else {
-          setTimeout(poll, 50);
-        }
-      };
-      poll();
-    });
+  private async waitForEvent(timeoutMs: number): Promise<ReturnType<SipEndpoint['pollEvent']> | null> {
+    // Use the napi blocking waitForEvent (runs on the napi thread pool, so
+    // the JS event loop is not blocked). This wakes immediately when
+    // ep.shutdown() pushes the Shutdown sentinel — much faster than the
+    // old setInterval-based polling and avoids burning CPU between polls.
+    if (!this.ep) return null;
+    return await this.ep.waitForEvent(timeoutMs);
   }
 
   private configureLogging(mode: string): void {
