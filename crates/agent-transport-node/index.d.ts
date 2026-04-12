@@ -104,6 +104,7 @@ export declare class SipEndpoint {
   waitForPlayout(sessionId: string, timeoutMs?: number): boolean;
   checkpoint(sessionId: string, name?: string): string;
   sendDtmf(sessionId: string, digits: string, method?: string): void;
+  sendDtmfAsync(sessionId: string, digits: string, method?: string): Promise<void>;
   sendInfo(sessionId: string, contentType: string, body: string): void;
   transfer(sessionId: string, destUri: string): void;
   transferAttended(sessionId: string, targetSessionId: string): void;

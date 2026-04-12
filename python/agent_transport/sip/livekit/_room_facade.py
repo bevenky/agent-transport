@@ -94,8 +94,28 @@ class _TransportLocalParticipant:
     # ─── Real implementations (mapped to endpoint) ───────────────────────
 
     async def publish_dtmf(self, *, code: int, digit: str) -> None:
-        """Send DTMF — maps to ep.send_dtmf()."""
-        self._ep.send_dtmf(self._sid, digit)
+        """Send DTMF — maps to ep.send_dtmf().
+
+        Polymorphic across transports:
+
+        - **SIP (RTP)**: the Rust FFI is a `runtime.block_on` wrapper
+          around `RtpTransport.send_dtmf_event`, which paces RFC 4733
+          events over ~280 ms per digit (1 start + 10 continue + 3
+          end-of-event packets × 20 ms ptime). Running this
+          synchronously from an async context would block the asyncio
+          loop for that entire window (and ~1 s on a 4-digit PIN).
+
+        - **audio_stream (Plivo WS)**: `send_dtmf` is a non-blocking
+          WebSocket send that emits `{"event": "sendDTMF", "dtmf": X}`
+          to Plivo. It takes microseconds, not hundreds of ms.
+
+        We `run_in_executor` unconditionally — harmless for the fast
+        audio_stream path (one thread hop), essential for the slow
+        SIP path so the loop can keep processing audio/STT frames
+        while RTP DTMF events are paced on the Rust side.
+        """
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, self._ep.send_dtmf, self._sid, digit)
 
     async def publish_track(self, track, options=None):
         """Publish a track — reads audio from it and mixes into our transport.

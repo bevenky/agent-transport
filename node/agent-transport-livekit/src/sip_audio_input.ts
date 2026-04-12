@@ -32,7 +32,6 @@ export class SipAudioInput extends _AudioInputBase {
   private sessionId: string;
   private closed = false;
   private attached = true;
-  private frameCount = 0;
   private inputStreamId: string | null = null;
 
   constructor(endpoint: SipEndpoint | AudioStreamEndpoint, sessionId: string) {
@@ -43,7 +42,6 @@ export class SipAudioInput extends _AudioInputBase {
     // Start immediately — the ReadableStream is pull-based, so recvAudioBytesAsync
     // won't be called until the downstream pipeline actually reads from the stream.
     // This matches how _ParticipantAudioInputStream adds its stream in the constructor.
-    console.log(`[SipAudioInput] constructor: sessionId=${sessionId} sr=${endpoint.inputSampleRate}`);
     this.start();
   }
 
@@ -53,18 +51,14 @@ export class SipAudioInput extends _AudioInputBase {
    */
   start(): void {
     if (this.inputStreamId !== null) return;
-    console.log('[SipAudioInput] start: creating audio stream and adding to multiStream');
 
     const self = this;
     const sampleRate = this.endpoint.inputSampleRate;
 
     // Create a ReadableStream that pulls audio from Rust
     const audioStream = new ReadableStream<AudioFrame>({
-      start(controller) {
-        console.log('[SipAudioInput] ReadableStream.start() called');
-      },
+      start(_controller) {},
       async pull(controller) {
-        if (self.frameCount === 0) console.log('[SipAudioInput] pull() invoked — reading from Rust...');
         if (self.closed) {
           self.pushSilenceAndClose(controller, sampleRate);
           return;
@@ -101,17 +95,6 @@ export class SipAudioInput extends _AudioInputBase {
             controller.enqueue(
               new AudioFrame(data, sampleRate, 1, samplesPerChannel),
             );
-
-            self.frameCount++;
-            if (self.frameCount === 1) {
-              console.log(
-                `SipAudioInput: first frame received sr=${sampleRate} samples=${samplesPerChannel}`,
-              );
-            } else if (self.frameCount % 250 === 0) {
-              console.log(
-                `SipAudioInput: ${self.frameCount} frames forwarded (${(self.frameCount * 0.02).toFixed(1)}s)`,
-              );
-            }
           }
         } catch {
           // Call ended (BYE received / stream closed)
@@ -126,7 +109,6 @@ export class SipAudioInput extends _AudioInputBase {
     this.inputStreamId = this.multiStream.addInputStream(
       audioStream as unknown as NodeReadableStream<AudioFrame>,
     );
-    console.log(`[SipAudioInput] start: added to multiStream, id=${this.inputStreamId}`);
   }
 
   /**

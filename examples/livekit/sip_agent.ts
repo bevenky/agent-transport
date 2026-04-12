@@ -58,9 +58,24 @@ server.sipSession(async (ctx: JobContext) => {
           'End the call when the user is done. ' +
           'Call when the user says goodbye or indicates they are finished.',
         parameters: z.object({}),
-        execute: async (_, runCtx) => {
+        // The second arg is ToolOptions = { ctx, toolCallId, abortSignal },
+        // NOT the RunContext directly. The AgentSession lives on opts.ctx.session.
+        execute: async (_args, opts) => {
           console.log('End call requested');
-          try { (runCtx as any).session?.shutdown(); } catch {}
+          const ctx = (opts as any).ctx;
+          const speechHandle = ctx?.speechHandle;
+          const session = ctx?.session;
+          // Defer shutdown until after the goodbye has played. This mirrors
+          // the Python EndCallTool pattern: speech_handle.add_done_callback
+          // so the goodbye finishes naturally before we tear down the call.
+          if (speechHandle && session) {
+            speechHandle.addDoneCallback(() => {
+              try { session.shutdown(); } catch (e) { console.error('session.shutdown failed:', e); }
+            });
+          } else if (session) {
+            // Fallback: shutdown immediately (goodbye may be cut off)
+            try { session.shutdown(); } catch (e) { console.error('session.shutdown failed:', e); }
+          }
           return 'Say goodbye to the user.';
         },
       }),

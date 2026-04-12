@@ -335,8 +335,15 @@ class AudioStreamOutput(AudioOutput):
                 self._audio_source.clear_queue()
                 await self._playback_enabled.wait()
 
-            if self._interrupted_event.is_set():
-                if self._flush_task:
+            # Match upstream _ParticipantAudioOutput._forward_audio guard:
+            # also skip frames when `_pushed_duration == 0`. This protects
+            # against stale frames from a previous speech handle arriving
+            # after `_wait_for_playout` has already reset `_pushed_duration`
+            # and cleared `_interrupted_event`. Without this check, such a
+            # frame would be replayed erroneously because the interrupted
+            # flag has already been cleared by the previous turn's cleanup.
+            if self._interrupted_event.is_set() or self._pushed_duration == 0:
+                if self._interrupted_event.is_set() and self._flush_task:
                     await self._flush_task
 
                 continue

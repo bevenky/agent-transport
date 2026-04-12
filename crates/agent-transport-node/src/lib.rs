@@ -106,6 +106,30 @@ impl Task for SipWaitForPlayoutTask {
     }
 }
 
+/// Send DTMF over RTP (RFC 4733), paced on a napi worker thread so the
+/// Node main event loop isn't blocked for ~280 ms per digit. Wraps the
+/// existing blocking `SipEndpoint::send_dtmf_with_method` which internally
+/// sends 14 RTP packets × 20 ms ptime per digit.
+pub struct SendDtmfTask {
+    endpoint: Arc<RustSipEndpoint>,
+    session_id: String,
+    digits: String,
+    method: String,
+}
+
+impl Task for SendDtmfTask {
+    type Output = ();
+    type JsValue = ();
+    fn compute(&mut self) -> Result<Self::Output> {
+        self.endpoint
+            .send_dtmf_with_method(&self.session_id, &self.digits, &self.method)
+            .map_err(napi_err)
+    }
+    fn resolve(&mut self, _env: Env, _output: Self::Output) -> Result<Self::JsValue> {
+        Ok(())
+    }
+}
+
 /// Blocking wait for the next endpoint event. Used by `waitForEvent()` —
 /// the napi equivalent of Python's `wait_for_event()`. Releases the JS
 /// event loop while waiting (runs on napi's thread pool).
@@ -355,7 +379,10 @@ type EventTsfn = ThreadsafeFunction<EventInfo, ErrorStrategy::CalleeHandled>;
 /// SIP endpoint — call control and audio I/O.
 #[napi]
 pub struct SipEndpoint {
-    inner: RustSipEndpoint,
+    // Arc so that async tasks (e.g., SendDtmfTask) can clone a handle and
+    // call methods from napi worker threads without blocking the main
+    // Node event loop.
+    inner: Arc<RustSipEndpoint>,
     callbacks: Arc<Mutex<HashMap<String, Vec<EventTsfn>>>>,
     event_thread_running: Arc<AtomicBool>,
 }
@@ -403,8 +430,9 @@ impl SipEndpoint {
             ..Default::default()
         };
 
-        let inner = RustSipEndpoint::new(rust_config)
-            .map_err(napi_err)?;
+        let inner = Arc::new(
+            RustSipEndpoint::new(rust_config).map_err(napi_err)?,
+        );
 
         Ok(Self {
             inner,
@@ -507,6 +535,25 @@ impl SipEndpoint {
         self.inner
             .send_dtmf_with_method(&session_id, &digits, method.as_deref().unwrap_or("rfc2833"))
             .map_err(napi_err)
+    }
+
+    /// Non-blocking Promise variant of `sendDtmf`. Runs the RTP pacing on
+    /// the napi worker thread pool so the Node main event loop can
+    /// continue processing audio/LLM/TTS frames while DTMF digits are
+    /// sent on the wire (~280 ms per digit).
+    #[napi(ts_return_type = "Promise<void>")]
+    pub fn send_dtmf_async(
+        &self,
+        session_id: String,
+        digits: String,
+        method: Option<String>,
+    ) -> AsyncTask<SendDtmfTask> {
+        AsyncTask::new(SendDtmfTask {
+            endpoint: Arc::clone(&self.inner),
+            session_id,
+            digits,
+            method: method.unwrap_or_else(|| "rfc2833".to_string()),
+        })
     }
 
     /// Send a SIP INFO message with custom content type and body.

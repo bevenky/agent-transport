@@ -917,7 +917,7 @@ impl SipEndpoint {
     /// Does NOT clear buffered audio — use clear_buffer for that.
     pub fn flush(&self, call_id: &str) -> Result<()> { self.with_call(call_id, |c| { if let Ok(mut d) = c.playout_notify.0.lock() { *d = false; } }) }
     pub fn clear_buffer(&self, call_id: &str) -> Result<()> {
-        info!("clear_buffer: call={} clearing audio buffer", call_id);
+        debug!("clear_buffer: call={} clearing audio buffer", call_id);
         self.with_call(call_id, |c| {
             c.audio_buf.clear();
             // Reset the input resampler — stale filter state from the previous speech
@@ -1063,10 +1063,16 @@ impl SipEndpoint {
     }
 
     pub fn stop_recording(&self, call_id: &str) -> Result<()> {
+        // Idempotent — matches audio_stream::Endpoint::stop_recording. The
+        // authoritative file writer lives on recording_mgr; the per-call
+        // `recorder` field is just a reference for the RTP path. If the call
+        // was already torn down by remote BYE, the mgr.stop() call still
+        // finalizes the file and we silently skip the per-call cleanup.
         self.recording_mgr.stop(call_id);
-        self.with_call(call_id, |c| {
+        if let Some(c) = self.state.lock_or_recover().calls.get(call_id) {
             *c.recorder.lock_or_recover() = None;
-        })
+        }
+        Ok(())
     }
 
     pub fn detect_beep(&self, call_id: &str, config: BeepDetectorConfig) -> Result<()> {

@@ -91,6 +91,23 @@ impl RtpTransport {
             let output_rate = t.output_sample_rate;
             let mut downsampler = Resampler::new_voip(output_rate, t.codec.sample_rate());
 
+            // ── BG audio instrumentation (debug only) ───────────────────
+            // Counts per 5s RTCP window so we can observe whether the
+            // Python forwarder is starving bg_audio_buf (empty on drain)
+            // or keeping it healthy.
+            let mut bg_empty_ticks: u32 = 0;
+            let mut bg_partial_ticks: u32 = 0; // 1..output_spf-1 samples
+            let mut bg_full_ticks: u32 = 0;    // == output_spf samples
+            let mut bg_sample_sum: u64 = 0;    // total samples drained this window
+            let mut bg_buf_len_sum: u64 = 0;   // sum of bg_audio_buf.len() BEFORE drain
+            let mut bg_buf_len_max: usize = 0;
+            // Sample-energy counters so we can tell whether the frames
+            // contain real audio or zero-valued silence (underrun from
+            // LiveKit's native AudioSource).
+            let mut bg_silent_ticks: u32 = 0; // ticks where all samples were 0
+            let mut bg_loud_ticks: u32 = 0;   // ticks with any |sample| > 100
+            let mut bg_abs_sum: u64 = 0;      // sum of |sample| across all drained samples
+
             loop {
                 tokio::select! {
                     _ = t.cancel.cancelled() => break,
@@ -100,14 +117,86 @@ impl RtpTransport {
                         let _ = t.socket.send_to(&sr, t.remote()).await;
                         let buf_ms = (audio_buf.len() as u32 * 1000) / output_rate;
                         debug!("RTP TX: pkts={} octets={} buf={}ms codec={:?} remote={}", pkt_count, octet_count, buf_ms, t.codec, t.remote());
+
+                        // BG audio health report
+                        let total_ticks = bg_empty_ticks + bg_partial_ticks + bg_full_ticks;
+                        if total_ticks > 0 {
+                            let avg_before_drain = bg_buf_len_sum / total_ticks as u64;
+                            let avg_abs = if bg_sample_sum > 0 {
+                                bg_abs_sum / bg_sample_sum
+                            } else {
+                                0
+                            };
+                            debug!(
+                                "BG TX health (5s): ticks={} empty={} partial={} full={} drained={} avg_buf={}ms max_buf={}samples | silent_ticks={} loud_ticks={} avg_abs_sample={}",
+                                total_ticks,
+                                bg_empty_ticks,
+                                bg_partial_ticks,
+                                bg_full_ticks,
+                                bg_sample_sum,
+                                avg_before_drain * 1000 / output_rate as u64,
+                                bg_buf_len_max,
+                                bg_silent_ticks,
+                                bg_loud_ticks,
+                                avg_abs,
+                            );
+                        }
+                        bg_empty_ticks = 0;
+                        bg_partial_ticks = 0;
+                        bg_full_ticks = 0;
+                        bg_sample_sum = 0;
+                        bg_buf_len_sum = 0;
+                        bg_buf_len_max = 0;
+                        bg_silent_ticks = 0;
+                        bg_loud_ticks = 0;
+                        bg_abs_sum = 0;
                     }
                     _ = iv.tick() => {}
                 }
 
                 let ts = t.timestamp.fetch_add(spf, Ordering::Relaxed);
 
+                // Snapshot bg buffer length BEFORE drain so we can see if
+                // Python is filling it or if we're racing empty.
+                let bg_buf_len_before = bg_audio_buf.len();
+                bg_buf_len_sum += bg_buf_len_before as u64;
+                if bg_buf_len_before > bg_buf_len_max {
+                    bg_buf_len_max = bg_buf_len_before;
+                }
+
                 // Drain background audio regardless of pause state
                 let bg_samples = bg_audio_buf.drain(output_spf);
+
+                // Categorize this tick (occupancy)
+                let n = bg_samples.len();
+                bg_sample_sum += n as u64;
+                if n == 0 {
+                    bg_empty_ticks += 1;
+                } else if n < output_spf {
+                    bg_partial_ticks += 1;
+                } else {
+                    bg_full_ticks += 1;
+                }
+
+                // Categorize this tick (energy) — detects silent frames
+                // coming from LiveKit's native AudioSource underrun.
+                if n > 0 {
+                    let mut max_abs: i32 = 0;
+                    let mut sum_abs: u64 = 0;
+                    for &s in &bg_samples {
+                        let a = s.unsigned_abs() as i32;
+                        if a > max_abs {
+                            max_abs = a;
+                        }
+                        sum_abs += a as u64;
+                    }
+                    bg_abs_sum += sum_abs;
+                    if max_abs == 0 {
+                        bg_silent_ticks += 1;
+                    } else if max_abs > 100 {
+                        bg_loud_ticks += 1;
+                    }
+                }
 
                 if paused.load(Ordering::Acquire) {
                     // Paused: send background audio only (no agent voice).

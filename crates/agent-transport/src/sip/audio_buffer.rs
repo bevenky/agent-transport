@@ -14,7 +14,7 @@
 
 use std::collections::VecDeque;
 use std::sync::Mutex;
-use tracing::{debug, info};
+use tracing::debug;
 
 use crate::sync::LockExt;
 
@@ -69,7 +69,7 @@ impl AudioBuffer {
         let queue_size_samples = (queue_size_ms as u64 * sample_rate as u64 / 1000) as usize;
         let notify_threshold = queue_size_samples;
         let capacity = queue_size_samples + notify_threshold; // 2x, same as WebRTC C++
-        info!(
+        debug!(
             "AudioBuffer: queue_size_ms={} sample_rate={} threshold={} capacity={}",
             queue_size_ms, sample_rate, notify_threshold, capacity
         );
@@ -143,7 +143,7 @@ impl AudioBuffer {
             let cb = inner.pending_complete.take();
             drop(inner);
             if flushed > 0 {
-                info!("AudioBuffer flush: cleared {} samples", flushed);
+                debug!("AudioBuffer flush: cleared {} samples", flushed);
             }
             if let Some(cb) = cb { cb(); }
             return Vec::new();
@@ -242,7 +242,7 @@ impl AudioBuffer {
         let _playout_cb = inner.playout_callback.take(); // Drop without firing
         drop(inner);
         if cleared > 0 {
-            info!("AudioBuffer clear: cleared {} samples", cleared);
+            debug!("AudioBuffer clear: cleared {} samples", cleared);
         }
         if let Some(cb) = cb { cb(); }
     }

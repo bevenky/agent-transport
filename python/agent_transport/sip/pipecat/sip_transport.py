@@ -145,8 +145,10 @@ class SipInputTransport(BaseInputTransport):
                     result = await loop.run_in_executor(
                         None, lambda: self._ep.recv_audio_bytes_blocking(self._cid, 20)
                     )
-                except Exception as e:
-                    logger.debug("SipInputTransport recv_audio error: {}", e)
+                except Exception:
+                    # Session ended (remote BYE removed the call from the
+                    # Rust call map). Exit the recv loop cleanly — the
+                    # event loop is responsible for firing on_client_disconnected.
                     break
                 if result is not None:
                     audio_bytes, sample_rate, num_channels = result
@@ -350,7 +352,6 @@ class SipOutputTransport(BaseOutputTransport):
         audio queued in Rust.
         """
         if isinstance(frame, InterruptionFrame):
-            logger.debug(f"InterruptionFrame: clearing buffer for {self._cid}")
             try:
                 self._ep.clear_buffer(self._cid)
             except Exception as e:

@@ -54,12 +54,55 @@ const agent = new voice.Agent({
       },
     }),
     endCall: llm.tool({
-      description: 'End the call when the user is done.',
+      description:
+        'End the call when the user is done. ' +
+        'Call when the user says goodbye or indicates they are finished.',
       parameters: z.object({}),
-      execute: async (_, ctx) => {
+      // The second arg is ToolOptions = { ctx, toolCallId, abortSignal },
+      // NOT the RunContext directly. The AgentSession lives on opts.ctx.session.
+      execute: async (_args, opts) => {
         console.log('End call requested');
-        (ctx as any).session.shutdown();
+        const ctx = (opts as any).ctx;
+        const speechHandle = ctx?.speechHandle;
+        const session = ctx?.session;
+        // Defer shutdown until after the goodbye has played. Mirrors
+        // the Python EndCallTool pattern: speech_handle.add_done_callback
+        // so the goodbye finishes naturally before we tear down the call.
+        if (speechHandle && session) {
+          speechHandle.addDoneCallback(() => {
+            try { session.shutdown(); } catch (e) { console.error('session.shutdown failed:', e); }
+          });
+        } else if (session) {
+          try { session.shutdown(); } catch (e) { console.error('session.shutdown failed:', e); }
+        }
         return 'Say goodbye to the user.';
+      },
+    }),
+    sendDtmf: llm.tool({
+      description:
+        'Send DTMF touch-tone digits into the active call. ' +
+        'Use this to navigate IVR menus, enter PINs, or trigger touch-tone actions.',
+      parameters: z.object({
+        digits: z.string().describe('Digits to send (0-9, *, #, A-D)'),
+      }),
+      // LiveKit JS SDK has no built-in `send_dtmf_events` tool (Python does),
+      // so we define the outbound DTMF tool here. Routes through our
+      // TransportLocalParticipant.publishDtmf → endpoint.sendDtmfAsync →
+      // Plivo `{"event":"sendDTMF","dtmf":"..."}` WS frame.
+      execute: async ({ digits }, _opts) => {
+        console.log(`Sending DTMF digits: ${digits}`);
+        try {
+          const jobCtx = getJobContext();
+          const lp = (jobCtx.room as any).localParticipant;
+          // Send digits one at a time to match upstream send_dtmf_events timing.
+          for (const digit of digits) {
+            await lp.publishDtmf({ code: digit.charCodeAt(0), digit });
+            await new Promise((r) => setTimeout(r, 300));
+          }
+          return `Successfully sent DTMF digits: ${digits}`;
+        } catch (e: any) {
+          return `Failed to send DTMF: ${e?.message ?? String(e)}`;
+        }
       },
     }),
   },
