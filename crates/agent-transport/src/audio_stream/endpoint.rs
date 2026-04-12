@@ -330,11 +330,15 @@ impl AudioStreamEndpoint {
     // ─── Call control ────────────────────────────────────────────────────
 
     pub fn hangup(&self, session_id: &str) -> Result<()> {
+        self.hangup_with_auth(session_id, None, None)
+    }
+
+    pub fn hangup_with_auth(&self, session_id: &str, auth_id: Option<&str>, auth_token: Option<&str>) -> Result<()> {
         let call_id = {
             let sess = self.sessions.lock_or_recover().remove(session_id);
             match sess { Some(s) => { cleanup_session(session_id, &s, &self.recording_mgr); s.call_id.clone() }, None => return Ok(()) }
         };
-        self.protocol.hangup(&call_id, &self.runtime);
+        self.protocol.hangup(&call_id, &self.runtime, auth_id, auth_token);
         Ok(())
     }
 
