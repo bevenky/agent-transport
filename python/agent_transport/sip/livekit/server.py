@@ -202,6 +202,8 @@ class JobContext:
     endpoint: SipEndpoint
     userdata: dict[str, Any] = field(default_factory=dict)
     extra_headers: dict[str, str] = field(default_factory=dict)
+    account_id: str | None = None
+    """Account ID for multi-tenancy — set by the consumer per session."""
 
     _agent_name: str = field(default="sip-agent", repr=False)
     _session: Any = field(default=None, repr=False)
@@ -296,6 +298,9 @@ class AgentServer:
         port: int | None = None,
         agent_name: str = "sip-agent",
         auth: Callable[..., bool | Coroutine] | None = None,
+        recording: bool = False,
+        recording_dir: str = "/tmp/agent-sessions",
+        recording_stereo: bool = True,
     ) -> None:
         self._sip_server = sip_server or os.environ.get("SIP_DOMAIN", "phone.plivo.com")
         self._sip_port = sip_port or int(os.environ.get("SIP_PORT", "5060"))
@@ -305,6 +310,9 @@ class AgentServer:
         self._port = port or int(os.environ.get("PORT", "8080"))
         self._agent_name = agent_name
         self._auth = auth
+        self._recording = recording
+        self._recording_dir = recording_dir
+        self._recording_stereo = recording_stereo
         self._entrypoint_fnc: Callable[..., Coroutine] | None = None
         self._setup_fnc: Callable | None = None
         self._proc = JobProcess()
@@ -532,6 +540,10 @@ class AgentServer:
             sys.exit(1)
 
         logger.info("Registered as %s@%s:%d", self._sip_username, self._sip_server, self._sip_port)
+
+        obs_url = _get_observability_url()
+        if obs_url:
+            logger.info("Observability enabled, target %s", obs_url)
 
         # Start HTTP server
         http_app = self._build_http_app()
@@ -797,12 +809,14 @@ class AgentServer:
                     reason = ev.get("reason", "unknown")
                     logger.info("Call %s terminated (reason=%s)", session_id, reason)
 
-                    # Clear audio buffer immediately to abort any pending playout
-                    # (prevents 5s "speech not done in time" timeout)
-                    try:
-                        self._ep.clear_buffer(session_id)
-                    except Exception:
-                        pass
+                    # Clear audio buffer to abort pending playout — but skip when
+                    # recording so the RTP send loop can drain remaining audio
+                    # into the recorder before shutdown.
+                    if not self._recording:
+                        try:
+                            self._ep.clear_buffer(session_id)
+                        except Exception:
+                            pass
 
                     # Emit participant_disconnected on Room facade (matches LiveKit WebRTC)
                     # RoomIO._on_participant_disconnected will call _close_soon() → session closes
@@ -866,35 +880,12 @@ class AgentServer:
     async def _upload_report(
         self, session, session_id: str, obs_url: str,
         recording_path: str | None = None, recording_started_at: float | None = None,
+        account_id: str | None = None,
     ) -> None:
-        """Build a SessionReport from the AgentSession and upload it."""
-        from pathlib import Path
-        from livekit.agents.voice.report import SessionReport
-        from livekit.agents.observability import Tagger
-        from livekit.agents.telemetry import _upload_session_report
-        from livekit.agents.utils import http_context
-
-        has_audio = recording_path and os.path.exists(recording_path)
-        report = SessionReport(
-            recording_options={"audio": bool(has_audio), "traces": True, "logs": True, "transcript": True},
-            job_id=str(session_id),
-            room_id=str(session_id),
-            room=str(session_id),
-            options=session.options,
-            events=session._recorded_events,
-            chat_history=session.history.copy(),
-            audio_recording_path=Path(recording_path) if has_audio else None,
-            audio_recording_started_at=recording_started_at if has_audio else None,
-            started_at=session._started_at,
-            model_usage=session.usage.model_usage if session.usage else None,
-        )
-
-        await _upload_session_report(
-            agent_name=self._agent_name,
-            observability_url=obs_url,
-            report=report,
-            tagger=Tagger(),
-            http_session=http_context.http_session(),
+        from .observability import upload_session_report
+        await upload_session_report(
+            session, session_id, obs_url, self._agent_name,
+            recording_path, recording_started_at, account_id,
         )
 
     async def _start_call(self, session_id: str, remote_uri: str, direction: str) -> None:
@@ -935,7 +926,7 @@ class AgentServer:
             if self._recording:
                 try:
                     os.makedirs(self._recording_dir, exist_ok=True)
-                    rec_path = os.path.join(self._recording_dir, f"call_{session_id}.wav")
+                    rec_path = os.path.join(self._recording_dir, f"recording_{session_id}.ogg")
                     self._ep.start_recording(session_id, rec_path, self._recording_stereo)
                     rec_started_at = time.time()
                 except Exception:
@@ -952,6 +943,7 @@ class AgentServer:
                 logger.exception("Call %s handler failed", session_id)
             finally:
                 SIP_CALL_DURATION.labels(nodename=node).observe(time.monotonic() - call_start)
+                logger.info("Call %s cleanup: session=%s", session_id, "set" if ctx._session is not None else "None")
 
                 if ctx._session is not None:
                     try:
@@ -961,18 +953,49 @@ class AgentServer:
                     except Exception:
                         pass
 
-                    # Upload session report (transcript, audio, metrics)
+                    # Stop recording and wait for file to be finalized
+                    if rec_path:
+                        try:
+                            self._ep.stop_recording(session_id)
+                            # Rust recorder finalizes on a background thread;
+                            # poll until the file appears (up to 2s)
+                            for _ in range(20):
+                                if os.path.exists(rec_path):
+                                    break
+                                await asyncio.sleep(0.1)
+                        except Exception:
+                            pass
+
+                    # Wait for session close (triggered by participant_disconnected
+                    # → _close_soon) rather than calling aclose() which cancels
+                    # in-progress LLM/TTS and discards the response from history.
+                    # The session's close event was wired in the session setter to
+                    # set call_ended — by the time we're here, it may already be
+                    # closing. Give it a few seconds to finalize in-flight responses.
+                    try:
+                        close_event = asyncio.Event()
+                        ctx._session.on("close", lambda *_: close_event.set())
+                        try:
+                            await asyncio.wait_for(close_event.wait(), timeout=5.0)
+                        except asyncio.TimeoutError:
+                            # Force close if graceful close didn't happen
+                            await ctx._session.aclose()
+                    except Exception:
+                        try:
+                            await ctx._session.aclose()
+                        except Exception:
+                            pass
+
+                    # Upload session report after session close so history is complete
                     obs_url = _get_observability_url()
                     if obs_url:
                         try:
-                            await self._upload_report(ctx._session, session_id, obs_url, rec_path, rec_started_at)
+                            await self._upload_report(
+                                ctx._session, session_id, obs_url, rec_path, rec_started_at,
+                                account_id=ctx.account_id,
+                            )
                         except Exception:
                             logger.warning("Failed to upload session report for call %s", session_id, exc_info=True)
-
-                    try:
-                        await ctx._session.aclose()
-                    except Exception:
-                        pass
                 for cb in ctx._shutdown_callbacks:
                     try:
                         result = cb()

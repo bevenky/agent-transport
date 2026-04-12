@@ -557,6 +557,7 @@ export class AgentServer {
               agentName: this.agentName,
               session: ctx.session,
               callId,
+              accountId: ctx.accountId,
               recordingPath: this.recording ? `${this.recordingDir}/call_${callId}.ogg` : undefined,
               recordingStartedAt: callStart,
             });

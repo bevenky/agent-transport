@@ -48,6 +48,7 @@ from ._room_facade import TransportRoom, create_transport_context
 from ._aio_utils import call_setup as _call_setup
 from livekit.rtc.room import SipDTMF
 from .server import JobProcess
+from .observability import _get_observability_url
 
 logger = logging.getLogger("agent_transport.audio_stream_server")
 
@@ -187,6 +188,8 @@ class JobContext:
     extra_headers: dict[str, str]
     endpoint: AudioStreamEndpoint
     userdata: dict[str, Any] = field(default_factory=dict)
+    account_id: str | None = None
+    """Account ID for multi-tenancy — set by the consumer per session."""
 
     _agent_name: str = field(default="agent", repr=False)
     _session: Any = field(default=None, repr=False)
@@ -480,6 +483,10 @@ class AudioStreamServer:
         )
         logger.info("Audio stream WebSocket server on ws://%s", self._listen_addr)
 
+        obs_url = _get_observability_url()
+        if obs_url:
+            logger.info("Observability enabled, target %s", obs_url)
+
         # Start HTTP server
         http_app = self._build_http_app()
         runner = web.AppRunner(http_app)
@@ -766,6 +773,19 @@ class AudioStreamServer:
                             logger.info("Session %s usage: %s", session_id, usage)
                     except Exception:
                         pass
+
+                    # Upload session report (transcript, metrics)
+                    obs_url = _get_observability_url()
+                    if obs_url:
+                        try:
+                            from .observability import upload_session_report
+                            await upload_session_report(
+                                ctx._session, session_id, obs_url, self._agent_name,
+                                account_id=ctx.account_id,
+                            )
+                        except Exception:
+                            logger.warning("Failed to upload session report for session %s", session_id, exc_info=True)
+
                     try:
                         await ctx._session.aclose()
                     except Exception:

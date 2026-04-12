@@ -124,6 +124,8 @@ class Assistant(Agent):
 
 @server.sip_session()
 async def entrypoint(ctx: JobContext):
+    ctx.account_id = "test_plivo_auth_id"
+
     session = AgentSession(
         vad=ctx.proc.userdata["vad"],
         stt=deepgram.STT(model="nova-3"),

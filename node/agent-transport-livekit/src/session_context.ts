@@ -40,6 +40,9 @@ export class JobContext {
   readonly room: TransportRoom;
   readonly proc: JobProcess;
 
+  /** Account ID for multi-tenancy — set by the consumer per session. */
+  accountId: string | undefined;
+
   private _session: any = null;
   private _callEnded: Promise<void>;
   private _resolveCallEnded: () => void;

@@ -431,6 +431,7 @@ export class AudioStreamServer {
               agentName: this.agentName,
               session: ctx.session,
               callId: sessionId,
+              accountId: ctx.accountId,
             });
           } catch (e) {
             console.warn(`Failed to upload session report for session ${sessionId}:`, e);
