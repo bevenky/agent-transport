@@ -552,7 +552,9 @@ impl SipEndpoint {
         let (user, pass) = (username.to_string(), password.to_string());
         let (st, etx, cc) = (self.state.clone(), self.event_tx.clone(), self.cancel.clone());
 
-        self.runtime.block_on(async {
+        let handle = self.runtime.handle().clone();
+        let jh = self.runtime.spawn_blocking(move || {
+        handle.block_on(async {
             let cred = Credential { username: user.clone(), password: pass.clone(), realm: None };
             let (ei, la) = { let s = st.lock_or_recover(); (s.dialog_layer.as_ref().unwrap().endpoint.clone(), s.local_addr.clone().unwrap()) };
 
@@ -616,11 +618,16 @@ impl SipEndpoint {
                 Err(EndpointError::Sip { code: u16::from(resp.status_code) as i32, message: e })
             }
         })
+        });
+        self.runtime.block_on(jh).map_err(|e| EndpointError::Other(e.to_string()))?
     }
 
     pub fn unregister(&self) -> Result<()> {
         let (srv, st, etx) = (self.config.sip_server.clone(), self.state.clone(), self.event_tx.clone());
-        self.runtime.block_on(async {
+        let st2 = st.clone();
+        let handle = self.runtime.handle().clone();
+        let jh = self.runtime.spawn_blocking(move || {
+        handle.block_on(async {
             let (ei, cred) = {
                 let s = st.lock_or_recover();
                 (s.dialog_layer.as_ref().cloned(), s.credential.clone())
@@ -639,8 +646,10 @@ impl SipEndpoint {
                     Err(e) => debug!("Unregister failed: {}", e),
                 }
             }
+        })
         });
-        let mut s = st.lock_or_recover();
+        let _ = self.runtime.block_on(jh);
+        let mut s = st2.lock_or_recover();
         s.registered = false;
         let _ = etx.try_send(EndpointEvent::Unregistered);
         Ok(())
@@ -659,7 +668,9 @@ impl SipEndpoint {
     pub fn call_with_from(&self, dest_uri: &str, from_uri: Option<&str>, headers: Option<HashMap<String, String>>, external_call_id: Option<String>) -> Result<String> {
         let (dest, cfg, st, etx, global_cancel) = (dest_uri.to_string(), self.config.clone(), self.state.clone(), self.event_tx.clone(), self.cancel.clone());
         let from_override = from_uri.map(|s| s.to_string());
-        self.runtime.block_on(async {
+        let handle = self.runtime.handle().clone();
+        let jh = self.runtime.spawn_blocking(move || {
+        handle.block_on(async {
             let (dl, cred, contact, aor, la, pa) = {
                 let s = st.lock_or_recover();
                 (s.dialog_layer.clone().ok_or(EndpointError::NotInitialized)?,
@@ -747,6 +758,8 @@ impl SipEndpoint {
             start_session_timer(session_expires, call_id.clone(), st.clone(), cc);
             Ok(call_id)
         })
+        });
+        self.runtime.block_on(jh).map_err(|e| EndpointError::Other(e.to_string()))?
     }
 
     // ─── Inbound answer (deprecated — Rust auto-answers) ────────────────────
@@ -781,8 +794,11 @@ impl SipEndpoint {
 
     pub fn hangup(&self, call_id: &str) -> Result<()> {
         let (st, etx) = (self.state.clone(), self.event_tx.clone());
-        self.runtime.block_on(async {
-            let ctx = st.lock_or_recover().calls.remove(call_id);
+        let call_id = call_id.to_string();
+        let handle = self.runtime.handle().clone();
+        let jh = self.runtime.spawn_blocking(move || {
+        handle.block_on(async {
+            let ctx = st.lock_or_recover().calls.remove(&call_id);
             if let Some(ctx) = ctx {
                 ctx.cancel.cancel();
                 if let Some(ref d) = ctx.client_dialog { let _ = d.hangup().await; }
@@ -791,6 +807,8 @@ impl SipEndpoint {
             }
             Ok(())
         })
+        });
+        self.runtime.block_on(jh).map_err(|e| EndpointError::Other(e.to_string()))?
     }
 
     pub fn send_dtmf(&self, call_id: &str, digits: &str) -> Result<()> { self.send_dtmf_with_method(call_id, digits, "rfc2833") }
@@ -799,9 +817,12 @@ impl SipEndpoint {
         let st = self.state.clone();
         let digits = digits.to_string();
         let method = method.to_string();
-        self.runtime.block_on(async {
+        let call_id = call_id.to_string();
+        let handle = self.runtime.handle().clone();
+        let jh = self.runtime.spawn_blocking(move || {
+        handle.block_on(async {
             let s = st.lock_or_recover();
-            let ctx = s.calls.get(call_id).ok_or_else(|| EndpointError::CallNotActive(call_id.to_string()))?;
+            let ctx = s.calls.get(&call_id).ok_or_else(|| EndpointError::CallNotActive(call_id.to_string()))?;
             for d in digits.chars() {
                 match method.as_str() {
                     "sip_info" | "info" => {
@@ -815,16 +836,21 @@ impl SipEndpoint {
             }
             Ok(())
         })
+        });
+        self.runtime.block_on(jh).map_err(|e| EndpointError::Other(e.to_string()))?
     }
 
     pub fn send_info(&self, call_id: &str, content_type: &str, body: &str) -> Result<()> {
         let st = self.state.clone();
         let ct = content_type.to_string();
         let b = body.to_string();
-        self.runtime.block_on(async {
+        let call_id = call_id.to_string();
+        let handle = self.runtime.handle().clone();
+        let jh = self.runtime.spawn_blocking(move || {
+        handle.block_on(async {
             let (cd, sd) = {
                 let s = st.lock_or_recover();
-                let ctx = s.calls.get(call_id).ok_or_else(|| EndpointError::CallNotActive(call_id.to_string()))?;
+                let ctx = s.calls.get(&call_id).ok_or_else(|| EndpointError::CallNotActive(call_id.to_string()))?;
                 (ctx.client_dialog.clone(), ctx.server_dialog.clone())
             };
             let hdrs = vec![rsip::Header::ContentType(ct.into())];
@@ -832,14 +858,19 @@ impl SipEndpoint {
             else if let Some(d) = sd { d.info(Some(hdrs), Some(b.into_bytes())).await.map_err(err)?; }
             Ok(())
         })
+        });
+        self.runtime.block_on(jh).map_err(|e| EndpointError::Other(e.to_string()))?
     }
 
     pub fn transfer(&self, call_id: &str, dest_uri: &str) -> Result<()> {
         let (st, dest) = (self.state.clone(), dest_uri.to_string());
-        self.runtime.block_on(async {
+        let call_id = call_id.to_string();
+        let handle = self.runtime.handle().clone();
+        let jh = self.runtime.spawn_blocking(move || {
+        handle.block_on(async {
             let (cd, sd) = {
                 let s = st.lock_or_recover();
-                let ctx = s.calls.get(call_id).ok_or_else(|| EndpointError::CallNotActive(call_id.to_string()))?;
+                let ctx = s.calls.get(&call_id).ok_or_else(|| EndpointError::CallNotActive(call_id.to_string()))?;
                 (ctx.client_dialog.clone(), ctx.server_dialog.clone())
             };
             let uri: rsip::Uri = dest.try_into().map_err(|e| err(format!("{:?}", e)))?;
@@ -847,6 +878,8 @@ impl SipEndpoint {
             else if let Some(d) = sd { d.refer(uri, None, None).await.map_err(err)?; }
             Ok(())
         })
+        });
+        self.runtime.block_on(jh).map_err(|e| EndpointError::Other(e.to_string()))?
     }
 
     pub fn transfer_attended(&self, _: &str, _: &str) -> Result<()> {
@@ -855,10 +888,13 @@ impl SipEndpoint {
 
     pub fn hold(&self, call_id: &str) -> Result<()> {
         let st = self.state.clone();
-        self.runtime.block_on(async {
+        let call_id = call_id.to_string();
+        let handle = self.runtime.handle().clone();
+        let jh = self.runtime.spawn_blocking(move || {
+        handle.block_on(async {
             let (cd, sd, sdp, held) = {
                 let s = st.lock_or_recover();
-                let ctx = s.calls.get(call_id).ok_or_else(|| EndpointError::CallNotActive(call_id.to_string()))?;
+                let ctx = s.calls.get(&call_id).ok_or_else(|| EndpointError::CallNotActive(call_id.to_string()))?;
                 if ctx.held.load(Ordering::Acquire) { return Ok(()); }
                 let sdp = ctx.local_sdp.as_ref().ok_or(EndpointError::Other("no SDP".into()))?
                     .replace("a=sendrecv", "a=sendonly");
@@ -871,14 +907,19 @@ impl SipEndpoint {
             info!("Call {} held (sendonly)", call_id);
             Ok(())
         })
+        });
+        self.runtime.block_on(jh).map_err(|e| EndpointError::Other(e.to_string()))?
     }
 
     pub fn unhold(&self, call_id: &str) -> Result<()> {
         let st = self.state.clone();
-        self.runtime.block_on(async {
+        let call_id = call_id.to_string();
+        let handle = self.runtime.handle().clone();
+        let jh = self.runtime.spawn_blocking(move || {
+        handle.block_on(async {
             let (cd, sd, sdp, held) = {
                 let s = st.lock_or_recover();
-                let ctx = s.calls.get(call_id).ok_or_else(|| EndpointError::CallNotActive(call_id.to_string()))?;
+                let ctx = s.calls.get(&call_id).ok_or_else(|| EndpointError::CallNotActive(call_id.to_string()))?;
                 if !ctx.held.load(Ordering::Acquire) { return Ok(()); }
                 let sdp = ctx.local_sdp.as_ref().ok_or(EndpointError::Other("no SDP".into()))?
                     .replace("a=sendonly", "a=sendrecv")
@@ -892,6 +933,8 @@ impl SipEndpoint {
             info!("Call {} unheld (sendrecv)", call_id);
             Ok(())
         })
+        });
+        self.runtime.block_on(jh).map_err(|e| EndpointError::Other(e.to_string()))?
     }
 
     // ─── Audio control ───────────────────────────────────────────────────────

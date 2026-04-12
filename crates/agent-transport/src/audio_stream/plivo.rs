@@ -177,16 +177,22 @@ impl StreamProtocol for PlivoProtocol {
     // Plivo does not support muteStream/unmuteStream.
     // Pause uses clearAudio instead (handled in endpoint.rs).
 
-    fn hangup(&self, call_id: &str, rt: &tokio::runtime::Runtime) {
-        if self.auth_id.is_empty() { return; }
-        let (auth_id, auth_token, cid) = (self.auth_id.clone(), self.auth_token.clone(), call_id.to_string());
-        rt.block_on(async {
-            let url = format!("https://api.plivo.com/v1/Account/{}/Call/{}/", auth_id, cid);
-            match reqwest::Client::new().delete(&url).basic_auth(&auth_id, Some(&auth_token)).send().await {
-                Ok(r) if r.status().is_success() || r.status().as_u16() == 404 => info!("Call {} hung up", cid),
-                Ok(r) => warn!("Hangup: {} {}", r.status(), r.text().await.unwrap_or_default()),
-                Err(e) => warn!("Hangup: {}", e),
-            }
+    fn hangup(&self, call_id: &str, rt: &tokio::runtime::Runtime, auth_id_override: Option<&str>, auth_token_override: Option<&str>) {
+        let aid = auth_id_override.unwrap_or(&self.auth_id);
+        let atk = auth_token_override.unwrap_or(&self.auth_token);
+        if aid.is_empty() { return; }
+        let (aid, atk, cid) = (aid.to_string(), atk.to_string(), call_id.to_string());
+        let handle = rt.handle().clone();
+        let jh = rt.spawn_blocking(move || {
+            handle.block_on(async {
+                let url = format!("https://api.plivo.com/v1/Account/{}/Call/{}/", aid, cid);
+                match reqwest::Client::new().delete(&url).basic_auth(&aid, Some(&atk)).send().await {
+                    Ok(r) if r.status().is_success() || r.status().as_u16() == 404 => info!("Call {} hung up", cid),
+                    Ok(r) => warn!("Hangup: {} {}", r.status(), r.text().await.unwrap_or_default()),
+                    Err(e) => warn!("Hangup: {}", e),
+                }
+            });
         });
+        let _ = rt.block_on(jh);
     }
 }
