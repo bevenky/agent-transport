@@ -18,11 +18,11 @@
 import { createServer, type Server, type IncomingMessage, type ServerResponse } from 'node:http';
 import { cpus } from 'node:os';
 import { hostname } from 'node:os';
-import { mkdirSync } from 'node:fs';
+import { mkdirSync, existsSync } from 'node:fs';
 import { SipEndpoint } from 'agent-transport';
 import { initializeLogger, InferenceRunner, runWithJobContext, log as agentLog, voice } from '@livekit/agents';
 import { JobContext } from './session_context.js';
-import { uploadReport } from './observability.js';
+import { uploadReport, getObservabilityUrl } from './observability.js';
 
 export class JobProcess {
   userData: Record<string, unknown> = {};
@@ -330,6 +330,11 @@ export class AgentServer {
     this.startHttpServer();
     console.log(`HTTP server on http://${this.host}:${this.port}`);
 
+    const obsUrl = getObservabilityUrl();
+    if (obsUrl) {
+      console.log(`Observability enabled, target ${obsUrl}`);
+    }
+
     // Start SIP event loop. Track the promise so we can await its exit
     // during shutdown — without this the infinite while loop would pin
     // Node's event loop forever.
@@ -488,10 +493,10 @@ export class AgentServer {
       this.sipCallsTotal[direction]++;
       const callStart = performance.now();
 
+      const sessionDir = `/tmp/agent-sessions`;
       try {
         // Wrap in runWithJobContext so getJobContext().room works inside handler
         // (matches LiveKit WebRTC where entrypoint runs inside job context)
-        const sessionDir = `/tmp/agent-sessions`;
         const stub = {
           room: ctx.room,
           job: { id: `job-${sessionId}`, agentName: this.agentName, enableRecording: false, room: { sid: ctx.room.sid, name: ctx.room.name } },
@@ -539,9 +544,6 @@ export class AgentServer {
         const durationSec = (performance.now() - callStart) / 1000;
         this.sipCallDurations.push(durationSec);
 
-        // Stop Rust recording if active
-        try { this.ep!.stopRecording(sessionId); } catch {}
-
         // Log usage and upload session report
         if (ctx.session) {
           try {
@@ -551,24 +553,37 @@ export class AgentServer {
             }
           } catch {}
 
+          // Wait for natural session close (preserves in-flight LLM/TTS responses in history)
+          // The participant_disconnected event triggers _close_soon() which does a graceful close.
+          try {
+            await new Promise<void>((resolve) => {
+              const timer = setTimeout(resolve, 5000);
+              ctx.session.on('close', () => { clearTimeout(timer); resolve(); });
+            });
+          } catch {
+            try { await (ctx.session as any).close(); } catch {}
+          }
+
+          // Stop recording and wait for file to be finalized
+          try { this.ep!.stopRecording(sessionId); } catch {}
+          const recPath = `${sessionDir}/recording_${sessionId}.ogg`;
+          for (let i = 0; i < 20; i++) {
+            if (existsSync(recPath)) break; await new Promise(r => setTimeout(r, 100));
+          }
+
           // Upload session report (transcript, audio, metrics)
           try {
             await uploadReport({
               agentName: this.agentName,
               session: ctx.session,
-              callId,
+              callId: sessionId,
               accountId: ctx.accountId,
-              recordingPath: this.recording ? `${this.recordingDir}/call_${callId}.ogg` : undefined,
-              recordingStartedAt: callStart,
+              recordingPath: recPath,
+              recordingStartedAt: Date.now(),
             });
           } catch (e) {
-            console.warn(`Failed to upload session report for call ${callId}:`, e);
+            console.warn(`Failed to upload session report for call ${sessionId}:`, e);
           }
-        }
-
-        // Close session
-        if (ctx.session) {
-          try { await (ctx.session as any).close(); } catch {}
         }
 
         // Hangup

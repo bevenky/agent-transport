@@ -9,7 +9,6 @@
  * Set LIVEKIT_OBSERVABILITY_URL to enable.
  */
 
-import { createSessionReport, sessionReportToJSON, type SessionReportOptions } from '@livekit/agents/dist/voice/report.js';
 import { MetricsRecordingHeader } from '@livekit/protocol';
 import { AccessToken } from 'livekit-server-sdk';
 import FormData from 'form-data';
@@ -17,6 +16,47 @@ import fs from 'node:fs/promises';
 
 export function getObservabilityUrl(): string | undefined {
   return process.env.LIVEKIT_OBSERVABILITY_URL;
+}
+
+/**
+ * Build a session report from the AgentSession.
+ * Inlined to avoid deep imports from @livekit/agents internals.
+ */
+function buildReport(session: any, callId: string, recordingPath?: string, recordingStartedAt?: number) {
+  const timestamp = Date.now();
+  const chatHistory = session.history?.copy?.() ?? session.history ?? { items: [], toJSON: () => ({ items: [] }) };
+  const events = (session._recordedEvents ?? [])
+    .filter((e: any) => e.type !== 'metrics_collected' && e.type !== 'session_usage_updated');
+
+  const usage = session.usage?.modelUsage?.map((u: any) => {
+    const obj: Record<string, any> = {};
+    for (const [k, v] of Object.entries(u)) {
+      if (v !== 0 && v !== null && v !== undefined && v !== '') obj[k] = v;
+    }
+    return obj;
+  }) ?? null;
+
+  return {
+    roomId: callId,
+    jobId: callId,
+    audioRecordingStartedAt: recordingStartedAt,
+    audioRecordingPath: recordingPath,
+    toDict() {
+      return {
+        job_id: callId,
+        room_id: callId,
+        room: callId,
+        events: events.map((e: any) => ({ ...e })),
+        chat_history: typeof chatHistory.toJSON === 'function'
+          ? chatHistory.toJSON({ excludeTimestamp: false })
+          : typeof chatHistory.to_dict === 'function'
+            ? chatHistory.to_dict({ exclude_timestamp: false })
+            : { items: Array.isArray(chatHistory) ? chatHistory : chatHistory.items ?? [] },
+        timestamp,
+        usage,
+      };
+    },
+  };
 }
 
 export async function uploadReport(options: {
@@ -32,21 +72,7 @@ export async function uploadReport(options: {
 
   const { agentName, session, callId, accountId, recordingPath, recordingStartedAt } = options;
 
-  const reportOpts: SessionReportOptions = {
-    jobId: callId,
-    roomId: callId,
-    room: callId,
-    options: session.options ?? {},
-    events: session._recordedEvents ?? [],
-    chatHistory: session.history?.copy?.() ?? session.history ?? [],
-    enableRecording: !!recordingPath,
-    startedAt: session._startedAt ?? Date.now(),
-    audioRecordingPath: recordingPath,
-    audioRecordingStartedAt: recordingStartedAt,
-    modelUsage: session.usage?.modelUsage,
-  };
-
-  const report = createSessionReport(reportOpts);
+  const report = buildReport(session, callId, recordingPath, recordingStartedAt);
 
   // Build header with roomTags for account identification
   const audioStartTime = report.audioRecordingStartedAt ?? 0;
@@ -76,7 +102,7 @@ export async function uploadReport(options: {
     header: { 'Content-Type': 'application/protobuf', 'Content-Length': headerBytes.length.toString() },
   });
 
-  const chatHistoryJson = JSON.stringify(sessionReportToJSON(report));
+  const chatHistoryJson = JSON.stringify(report.toDict());
   const chatHistoryBuffer = Buffer.from(chatHistoryJson, 'utf-8');
   formData.append('chat_history', chatHistoryBuffer, {
     filename: 'chat_history.json',
@@ -109,10 +135,11 @@ export async function uploadReport(options: {
   const jwt = await token.toJwt();
 
   // Upload
+  console.log(`Uploading session report for ${callId} to ${obsUrl} (account_id=${accountId})`);
   const url = new URL('/observability/recordings/v0', obsUrl);
   return new Promise<void>((resolve, reject) => {
     formData.submit(
-      { protocol: url.protocol, host: url.hostname, port: url.port || undefined, path: url.pathname, method: 'POST', headers: { Authorization: `Bearer ${jwt}` } },
+      { protocol: url.protocol as 'https:' | 'http:', host: url.hostname, port: url.port || undefined, path: url.pathname, method: 'POST', headers: { Authorization: `Bearer ${jwt}` } },
       (err, res) => {
         if (err) { reject(new Error(`Failed to upload session report: ${err.message}`)); return; }
         if (res.statusCode && res.statusCode >= 400) {
@@ -122,7 +149,7 @@ export async function uploadReport(options: {
           return;
         }
         res.resume();
-        res.on('end', () => resolve());
+        res.on('end', () => { console.log(`Session report uploaded for ${callId}`); resolve(); });
       },
     );
   });

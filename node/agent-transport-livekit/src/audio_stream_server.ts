@@ -26,7 +26,7 @@ import { AudioStreamEndpoint } from 'agent-transport';
 import { initializeLogger, InferenceRunner, runWithJobContext } from '@livekit/agents';
 import { AudioStreamJobContext } from './audio_stream_context.js';
 import { JobProcess } from './agent_server.js';
-import { uploadReport } from './observability.js';
+import { uploadReport, getObservabilityUrl } from './observability.js';
 
 export interface AudioStreamServerOptions {
   listenAddr?: string;
@@ -232,6 +232,11 @@ export class AudioStreamServer {
     this.startHttpServer();
     console.log(`HTTP server on http://${this.host}:${this.port}`);
 
+    const obsUrl = getObservabilityUrl();
+    if (obsUrl) {
+      console.log(`Observability enabled, target ${obsUrl}`);
+    }
+
     // Start event loop. Track the promise so we can await its exit during
     // shutdown — without this the infinite while loop pins libuv forever.
     const eventLoopDone = this.eventLoop();
@@ -371,12 +376,11 @@ export class AudioStreamServer {
       this.sessionCount++;
       const sessionStart = performance.now();
 
+      const sessionDir = `/tmp/agent-sessions`;
       try {
         // Wrap in runWithJobContext
         let agents: any;
         try { agents = await import('@livekit/agents'); } catch {}
-
-        const sessionDir = `/tmp/agent-sessions`;
         const stub = {
           room: ctx.room,
           job: { id: `job-${sessionId}`, agentName: this.agentName, enableRecording: false, room: { sid: ctx.room.sid, name: ctx.room.name } },
@@ -424,24 +428,48 @@ export class AudioStreamServer {
         const durationSec = (performance.now() - sessionStart) / 1000;
         this.sessionDurations.push(durationSec);
 
-        // Upload session report (transcript, metrics)
         if (ctx.session) {
+          try {
+            const usage = (ctx.session as any).usage;
+            if (usage) {
+              console.log(`Session ${sessionId} usage:`, JSON.stringify(usage));
+            }
+          } catch {}
+
+          // Wait for natural session close (preserves in-flight responses in history)
+          try {
+            await new Promise<void>((resolve) => {
+              const timer = setTimeout(resolve, 5000);
+              ctx.session.on('close', () => { clearTimeout(timer); resolve(); });
+            });
+          } catch {
+            try { await (ctx.session as any).close(); } catch {}
+          }
+
+          // Stop recording and wait for file to be finalized
+          try { this.ep!.stopRecording(sessionId); } catch {}
+          const recPath = `${sessionDir}/recording_${sessionId}.ogg`;
+          const { existsSync } = await import('node:fs');
+          for (let i = 0; i < 20; i++) {
+            if (existsSync(recPath)) break;
+            await new Promise(r => setTimeout(r, 100));
+          }
+
+          // Upload session report (transcript, audio, metrics)
           try {
             await uploadReport({
               agentName: this.agentName,
               session: ctx.session,
               callId: sessionId,
               accountId: ctx.accountId,
+              recordingPath: recPath,
+              recordingStartedAt: Date.now(),
             });
           } catch (e) {
             console.warn(`Failed to upload session report for session ${sessionId}:`, e);
           }
-
-          try { await (ctx.session as any).close(); } catch {}
         }
 
-        // Stop Rust recording if active
-        try { this.ep!.stopRecording(sessionId); } catch {}
         try { this.ep!.hangup(sessionId); } catch {}
 
         ctx.room._onSessionEnded();

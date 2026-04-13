@@ -1,5 +1,4 @@
 src/
 Cargo.toml
 build.rs
-*.node
 npm/

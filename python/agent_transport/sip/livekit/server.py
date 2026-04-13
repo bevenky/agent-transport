@@ -298,7 +298,7 @@ class AgentServer:
         port: int | None = None,
         agent_name: str = "sip-agent",
         auth: Callable[..., bool | Coroutine] | None = None,
-        recording: bool = False,
+        recording: bool = True,
         recording_dir: str = "/tmp/agent-sessions",
         recording_stereo: bool = True,
     ) -> None:

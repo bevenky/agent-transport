@@ -288,6 +288,9 @@ class AudioStreamServer:
         port: int | None = None,
         agent_name: str = "audio-stream-agent",
         auth: Callable[..., bool | Coroutine] | None = None,
+        recording: bool = True,
+        recording_dir: str = "/tmp/agent-sessions",
+        recording_stereo: bool = True,
     ) -> None:
         self._listen_addr = listen_addr or os.environ.get("AUDIO_STREAM_ADDR", "0.0.0.0:8765")
         self._plivo_auth_id = plivo_auth_id or os.environ.get("PLIVO_AUTH_ID", "")
@@ -297,6 +300,9 @@ class AudioStreamServer:
         self._port = port or int(os.environ.get("PORT", "8080"))
         self._agent_name = agent_name
         self._auth = auth
+        self._recording = recording
+        self._recording_dir = recording_dir
+        self._recording_stereo = recording_stereo
         self._entrypoint_fnc: Callable[..., Coroutine] | None = None
         self._setup_fnc: Callable | None = None
         self._proc = JobProcess()
@@ -755,6 +761,19 @@ class AudioStreamServer:
             STREAM_SESSIONS_TOTAL.labels(nodename=node).inc()
             session_start = time.monotonic()
 
+            # Start recording if enabled
+            rec_path = None
+            rec_started_at = None
+            if self._recording:
+                try:
+                    os.makedirs(self._recording_dir, exist_ok=True)
+                    rec_path = os.path.join(self._recording_dir, f"recording_{session_id}.ogg")
+                    self._ep.start_recording(session_id, rec_path, self._recording_stereo)
+                    rec_started_at = time.time()
+                except Exception:
+                    rec_path = None
+                    logger.warning("Failed to start recording for session %s", session_id, exc_info=True)
+
             try:
                 await self._entrypoint_fnc(ctx)
                 # Entrypoint returned — session.start() is non-blocking,
@@ -774,22 +793,43 @@ class AudioStreamServer:
                     except Exception:
                         pass
 
-                    # Upload session report (transcript, metrics)
+                    # Wait for session to fully close (preserves in-flight responses in history)
+                    try:
+                        close_event = asyncio.Event()
+                        ctx._session.on("close", lambda *_: close_event.set())
+                        try:
+                            await asyncio.wait_for(close_event.wait(), timeout=5.0)
+                        except asyncio.TimeoutError:
+                            await ctx._session.aclose()
+                    except Exception:
+                        try:
+                            await ctx._session.aclose()
+                        except Exception:
+                            pass
+
+                    # Stop recording and wait for file to be finalized
+                    if rec_path:
+                        try:
+                            self._ep.stop_recording(session_id)
+                            for _ in range(20):
+                                if os.path.exists(rec_path):
+                                    break
+                                await asyncio.sleep(0.1)
+                        except Exception:
+                            pass
+
+                    # Upload session report (transcript, audio, metrics)
                     obs_url = _get_observability_url()
                     if obs_url:
                         try:
                             from .observability import upload_session_report
                             await upload_session_report(
                                 ctx._session, session_id, obs_url, self._agent_name,
+                                rec_path, rec_started_at,
                                 account_id=ctx.account_id,
                             )
                         except Exception:
                             logger.warning("Failed to upload session report for session %s", session_id, exc_info=True)
-
-                    try:
-                        await ctx._session.aclose()
-                    except Exception:
-                        pass
                 for cb in ctx._shutdown_callbacks:
                     try:
                         result = cb()
