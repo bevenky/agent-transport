@@ -133,7 +133,7 @@ async def upload_session_report(
     part.headers["Content-Type"] = "application/protobuf"
     part.headers["Content-Length"] = str(len(header_bytes))
 
-    chat_history_json = json.dumps(report.chat_history.to_dict(exclude_timestamp=False))
+    chat_history_json = json.dumps(report.to_dict())
     part = mp.append(chat_history_json)
     part.set_content_disposition("form-data", name="chat_history", filename="chat_history.json")
     part.headers["Content-Type"] = "application/json"
