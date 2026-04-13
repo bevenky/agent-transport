@@ -131,7 +131,7 @@ pub trait StreamProtocol: Send + Sync + 'static {
 
     /// Hang up the call via provider's API (REST, WebSocket command, etc.).
     /// Called from a blocking context (tokio runtime).
-    fn hangup(&self, call_id: &str, rt: &tokio::runtime::Runtime);
+    fn hangup(&self, call_id: &str, rt: &tokio::runtime::Runtime, auth_id: Option<&str>, auth_token: Option<&str>);
 
     /// Build a "mute stream" command to pause audio output on the provider side.
     /// Returns None if the provider doesn't support server-side mute.
