@@ -996,6 +996,14 @@ class AgentServer:
                             )
                         except Exception:
                             logger.warning("Failed to upload session report for call %s", session_id, exc_info=True)
+
+                        # Clean up local recording after upload attempt
+                        if rec_path:
+                            try:
+                                os.remove(rec_path)
+                            except Exception:
+                                logger.warning("Failed to clean up recording %s", rec_path, exc_info=True)
+
                 for cb in ctx._shutdown_callbacks:
                     try:
                         result = cb()

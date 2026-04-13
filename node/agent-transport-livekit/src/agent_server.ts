@@ -584,6 +584,13 @@ export class AgentServer {
           } catch (e) {
             console.warn(`Failed to upload session report for call ${sessionId}:`, e);
           }
+
+          // Clean up local recording after upload attempt
+          if (getObservabilityUrl()) {
+            try { const { unlinkSync } = await import('node:fs'); unlinkSync(recPath); } catch (e) {
+              console.warn(`Failed to clean up recording ${recPath}:`, e);
+            }
+          }
         }
 
         // Hangup

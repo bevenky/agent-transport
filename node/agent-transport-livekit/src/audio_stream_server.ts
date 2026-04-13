@@ -468,6 +468,13 @@ export class AudioStreamServer {
           } catch (e) {
             console.warn(`Failed to upload session report for session ${sessionId}:`, e);
           }
+
+          // Clean up local recording after upload attempt
+          if (getObservabilityUrl()) {
+            try { const { unlinkSync } = await import('node:fs'); unlinkSync(recPath); } catch (e) {
+              console.warn(`Failed to clean up recording ${recPath}:`, e);
+            }
+          }
         }
 
         try { this.ep!.hangup(sessionId); } catch {}
