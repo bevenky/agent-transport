@@ -134,6 +134,8 @@ Minimum versions: `livekit-agents>=1.5`, `pipecat-ai>=0.0.108`
 npm install agent-transport @livekit/agents @livekit/rtc-node
 ```
 
+> **macOS note:** The ONNX runtime bundled with `@livekit/agents-plugin-livekit` (v1.21+) has a [known mutex crash](https://github.com/microsoft/onnxruntime/issues/24579) on macOS that kills the turn detection inference process. Add `"overrides": { "onnxruntime-node": "1.20.1" }` to your `package.json` to pin a working version. Linux is unaffected.
+
 [Building from source](docs/compile.md)
 
 ## Examples
