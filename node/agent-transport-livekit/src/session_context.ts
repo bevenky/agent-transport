@@ -62,6 +62,7 @@ export class JobContext {
     });
   }
 
+  /** Get the current agent session, or null if not yet set. */
   get session(): any {
     return this._session;
   }
@@ -122,6 +123,7 @@ export class JobContext {
     });
   }
 
+  /** Register a callback to run when the session ends. */
   addShutdownCallback(callback: () => void | Promise<void>): void {
     this._shutdownCallbacks.push(callback);
   }

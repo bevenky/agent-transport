@@ -23,6 +23,7 @@ import { SipEndpoint } from 'agent-transport';
 import { initializeLogger, InferenceRunner, runWithJobContext, log as agentLog, voice } from '@livekit/agents';
 import { JobContext } from './session_context.js';
 
+/** Holds user data shared across calls — populated in the setup function. */
 export class JobProcess {
   userData: Record<string, unknown> = {};
 }

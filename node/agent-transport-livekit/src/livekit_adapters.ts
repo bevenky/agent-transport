@@ -74,19 +74,23 @@ export interface TransportEndpoint {
 
 type EventCallback = (...args: any[]) => void;
 
+/** Simple event emitter matching LiveKit's rtc.EventEmitter interface. */
 export class EventEmitter {
   private _events: Map<string, Set<EventCallback>> = new Map();
 
+  /** Register a listener for the given event. Returns the callback for chaining. */
   on(event: string, callback: EventCallback): EventCallback {
     if (!this._events.has(event)) this._events.set(event, new Set());
     this._events.get(event)!.add(callback);
     return callback;
   }
 
+  /** Remove a previously registered listener. */
   off(event: string, callback: EventCallback): void {
     this._events.get(event)?.delete(callback);
   }
 
+  /** Emit an event, calling all registered listeners synchronously. */
   emit(event: string, ...args: any[]): void {
     for (const cb of this._events.get(event) ?? []) {
       try { cb(...args); } catch (e) { console.error(`Error in ${event} listener:`, e); }
@@ -274,6 +278,7 @@ export class TransportLocalParticipant {
 
 // ─── Transport Room ─────────────────────────────────────────────────────────
 
+/** Room facade for SIP/audio stream sessions — accessed via ctx.room. Emits LiveKit-compatible events. */
 export class TransportRoom extends EventEmitter {
   private _endpoint: TransportEndpoint;
   private _sessionId: string;

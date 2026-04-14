@@ -100,6 +100,7 @@ export class AudioStreamServer {
   // would pin Node's libuv event loop forever.
   private shutdownRequested = false;
 
+  /** Create an AudioStreamServer with the given options. Falls back to env vars. */
   constructor(opts: AudioStreamServerOptions) {
     this.listenAddr = opts.listenAddr ?? process.env.AUDIO_STREAM_ADDR ?? '0.0.0.0:8765';
     this.plivoAuthId = opts.plivoAuthId ?? process.env.PLIVO_AUTH_ID ?? '';
@@ -111,6 +112,7 @@ export class AudioStreamServer {
     this.authFn = opts.auth;
   }
 
+  /** Register a setup function that runs once at startup for shared resources. */
   setup(fn: SetupFn): void {
     this.setupFn = fn;
   }
@@ -122,10 +124,12 @@ export class AudioStreamServer {
     this.setupFn = fn as any;
   }
 
+  /** Register the session entrypoint handler — called for each incoming audio stream. */
   audioStreamSession(fn: EntrypointFn): void {
     this.entrypointFn = fn;
   }
 
+  /** Run the server — starts WebSocket listener, HTTP server, and event loop. */
   async run(): Promise<void> {
     // Handle unhandled rejections from LiveKit SDK TTS abort paths gracefully
     process.on('unhandledRejection', (reason) => {
