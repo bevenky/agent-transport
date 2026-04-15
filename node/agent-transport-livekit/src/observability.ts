@@ -1,21 +1,25 @@
 /**
  * Observability setup for agent-transport (Node.js).
  *
- * Custom upload because @livekit/agents' uploadSessionReport doesn't
- * support roomTags on MetricsRecordingHeader. We pass account_id
- * (plivo_auth_id) via roomTags so the observability server can
- * identify the account for filtering.
+ * Uploads session reports (transcript, events, audio) to the
+ * observability server after each call ends. Uses basic auth.
  *
- * Set LIVEKIT_OBSERVABILITY_URL to enable.
+ * Set AGENT_OBSERVABILITY_URL to enable.
  */
 
-import { MetricsRecordingHeader } from '@livekit/protocol';
-import { AccessToken } from 'livekit-server-sdk';
 import FormData from 'form-data';
 import fs from 'node:fs/promises';
 
 export function getObservabilityUrl(): string | undefined {
-  return process.env.LIVEKIT_OBSERVABILITY_URL;
+  return process.env.AGENT_OBSERVABILITY_URL;
+}
+
+function buildAuthHeaders(): Record<string, string> {
+  const user = process.env.AGENT_OBSERVABILITY_USER;
+  const pass = process.env.AGENT_OBSERVABILITY_PASS;
+  if (!user || !pass) return {};
+  const credentials = Buffer.from(`${user}:${pass}`).toString('base64');
+  return { Authorization: `Basic ${credentials}` };
 }
 
 /**
@@ -74,32 +78,27 @@ export async function uploadReport(options: {
 
   const report = buildReport(session, callId, recordingPath, recordingStartedAt);
 
-  // Build header with roomTags for account identification
-  const audioStartTime = report.audioRecordingStartedAt ?? 0;
+  // Build JSON header
   const roomTags: Record<string, string> = {};
   if (accountId) {
     roomTags['account_id'] = accountId;
   }
 
-  const headerMsg = new MetricsRecordingHeader({
-    roomId: report.roomId,
-    duration: BigInt(0),
-    startTime: {
-      seconds: BigInt(Math.floor(audioStartTime / 1000)),
-      nanos: Math.floor((audioStartTime % 1000) * 1e6),
-    },
-    roomTags,
+  const headerJson = JSON.stringify({
+    session_id: callId,
+    room_tags: roomTags,
+    start_time: report.audioRecordingStartedAt ?? 0,
   });
-  const headerBytes = Buffer.from(headerMsg.toBinary());
+  const headerBuffer = Buffer.from(headerJson, 'utf-8');
 
   // Build multipart form
   const formData = new FormData();
 
-  formData.append('header', headerBytes, {
-    filename: 'header.binpb',
-    contentType: 'application/protobuf',
-    knownLength: headerBytes.length,
-    header: { 'Content-Type': 'application/protobuf', 'Content-Length': headerBytes.length.toString() },
+  formData.append('header', headerBuffer, {
+    filename: 'header.json',
+    contentType: 'application/json',
+    knownLength: headerBuffer.length,
+    header: { 'Content-Type': 'application/json', 'Content-Length': headerBuffer.length.toString() },
   });
 
   const chatHistoryJson = JSON.stringify(report.toDict());
@@ -124,22 +123,13 @@ export async function uploadReport(options: {
     }
   }
 
-  // JWT auth
-  const apiKey = process.env.LIVEKIT_API_KEY;
-  const apiSecret = process.env.LIVEKIT_API_SECRET;
-  if (!apiKey || !apiSecret) {
-    throw new Error('LIVEKIT_API_KEY and LIVEKIT_API_SECRET must be set for session upload');
-  }
-  const token = new AccessToken(apiKey, apiSecret, { ttl: '6h' });
-  token.addObservabilityGrant({ write: true });
-  const jwt = await token.toJwt();
-
-  // Upload
+  // Upload with basic auth
+  const authHeaders = buildAuthHeaders();
   console.log(`Uploading session report for ${callId} to ${obsUrl} (account_id=${accountId})`);
   const url = new URL('/observability/recordings/v0', obsUrl);
   return new Promise<void>((resolve, reject) => {
     formData.submit(
-      { protocol: url.protocol as 'https:' | 'http:', host: url.hostname, port: url.port || undefined, path: url.pathname, method: 'POST', headers: { Authorization: `Bearer ${jwt}` } },
+      { protocol: url.protocol as 'https:' | 'http:', host: url.hostname, port: url.port || undefined, path: url.pathname, method: 'POST', headers: authHeaders },
       (err, res) => {
         if (err) { reject(new Error(`Failed to upload session report: ${err.message}`)); return; }
         if (res.statusCode && res.statusCode >= 400) {
