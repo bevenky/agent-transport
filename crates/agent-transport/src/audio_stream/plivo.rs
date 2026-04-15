@@ -118,11 +118,6 @@ impl StreamProtocol for PlivoProtocol {
                 let headers = plivo.extra_headers.as_deref()
                     .map(parse_extra_headers)
                     .unwrap_or_default();
-                info!(
-                    raw_extra_headers = ?plivo.extra_headers,
-                    parsed_headers = ?headers,
-                    "Plivo start event extra_headers"
-                );
                 Some(StreamEvent::Start {
                     call_id: start.call_id,
                     stream_id: start.stream_id,
