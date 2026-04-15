@@ -60,13 +60,24 @@ fn detect_encoding(fmt: &PlivoMediaFormat) -> WireEncoding {
 
 fn parse_extra_headers(raw: &str) -> HashMap<String, String> {
     let mut headers = HashMap::new();
+    // Try JSON first: {"key": "value"}
     if raw.starts_with('{') {
         if let Ok(p) = serde_json::from_str::<HashMap<String, String>>(raw) {
             return p;
         }
+        // Plivo sends a non-standard brace format: {key: value, key2: value2}
+        // Strip braces and parse as colon-separated pairs.
+        let inner = raw.trim_start_matches('{').trim_end_matches('}');
+        for part in inner.split(',') {
+            if let Some((k, v)) = part.split_once(':') {
+                headers.insert(k.trim().to_string(), v.trim().to_string());
+            }
+        }
+        return headers;
     }
-    // Plivo uses semicolon-delimited key=value pairs
-    for part in raw.split(';') {
+    // Semicolon or comma-delimited key=value pairs:
+    // "userId=12345;sessionId=abc" or "agentUuid=xxx,name=Amal"
+    for part in raw.split(|c| c == ';' || c == ',') {
         if let Some((k, v)) = part.split_once('=') {
             headers.insert(k.trim().to_string(), v.trim().to_string());
         }
@@ -107,6 +118,11 @@ impl StreamProtocol for PlivoProtocol {
                 let headers = plivo.extra_headers.as_deref()
                     .map(parse_extra_headers)
                     .unwrap_or_default();
+                info!(
+                    raw_extra_headers = ?plivo.extra_headers,
+                    parsed_headers = ?headers,
+                    "Plivo start event extra_headers"
+                );
                 Some(StreamEvent::Start {
                     call_id: start.call_id,
                     stream_id: start.stream_id,
@@ -194,5 +210,72 @@ impl StreamProtocol for PlivoProtocol {
             });
         });
         let _ = rt.block_on(jh);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_plivo_brace_format() {
+        let raw = "{X-PH-name: Amal, X-PH-is_fs_krisp_enabled: true}";
+        let h = parse_extra_headers(raw);
+        assert_eq!(h.get("X-PH-name").unwrap(), "Amal");
+        assert_eq!(h.get("X-PH-is_fs_krisp_enabled").unwrap(), "true");
+    }
+
+    #[test]
+    fn parse_plivo_brace_format_single() {
+        let raw = "{X-PH-is_fs_krisp_enabled: true}";
+        let h = parse_extra_headers(raw);
+        assert_eq!(h.len(), 1);
+        assert_eq!(h.get("X-PH-is_fs_krisp_enabled").unwrap(), "true");
+    }
+
+    #[test]
+    fn parse_json_format() {
+        let raw = r#"{"userId": "12345", "sessionId": "abc"}"#;
+        let h = parse_extra_headers(raw);
+        assert_eq!(h.get("userId").unwrap(), "12345");
+        assert_eq!(h.get("sessionId").unwrap(), "abc");
+    }
+
+    #[test]
+    fn parse_semicolon_delimited() {
+        let raw = "userId=12345;sessionId=abc-xyz";
+        let h = parse_extra_headers(raw);
+        assert_eq!(h.get("userId").unwrap(), "12345");
+        assert_eq!(h.get("sessionId").unwrap(), "abc-xyz");
+    }
+
+    #[test]
+    fn parse_comma_delimited() {
+        let raw = "agentUuid=xxx,name=Amal";
+        let h = parse_extra_headers(raw);
+        assert_eq!(h.get("agentUuid").unwrap(), "xxx");
+        assert_eq!(h.get("name").unwrap(), "Amal");
+    }
+
+    #[test]
+    fn parse_single_pair() {
+        let raw = "name=Amal";
+        let h = parse_extra_headers(raw);
+        assert_eq!(h.len(), 1);
+        assert_eq!(h.get("name").unwrap(), "Amal");
+    }
+
+    #[test]
+    fn parse_empty_json_object() {
+        let raw = "{}";
+        let h = parse_extra_headers(raw);
+        assert!(h.is_empty());
+    }
+
+    #[test]
+    fn parse_empty_string() {
+        let raw = "";
+        let h = parse_extra_headers(raw);
+        assert!(h.is_empty());
     }
 }
