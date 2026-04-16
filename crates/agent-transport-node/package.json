@@ -1,6 +1,6 @@
 {
   "name": "agent-transport",
-  "version": "0.1.8",
+  "version": "0.1.9",
   "description": "SIP and audio streaming transport for AI voice agents (pure Rust)",
   "type": "module",
   "main": "index.js",
@@ -37,8 +37,8 @@
     "prebuild": "node -e \"const fs=require('fs'); if (fs.existsSync('index.d.ts')) fs.copyFileSync('index.d.ts','index.d.ts.snapshot')\"",
     "build": "CMAKE_POLICY_VERSION_MINIMUM=3.5 napi build --release --no-js && npm run postbuild:check",
     "build:debug": "CMAKE_POLICY_VERSION_MINIMUM=3.5 napi build --no-js && npm run postbuild:check",
-    "postbuild:check": "node -e \"const fs=require('fs'); const snap='index.d.ts.snapshot'; if (!fs.existsSync(snap)) process.exit(0); const cur=fs.existsSync('index.d.ts')?fs.statSync('index.d.ts').size:0; const ref=fs.statSync(snap).size; if (cur < ref/2) { console.error('[postbuild] index.d.ts shrank ('+cur+' < '+ref+' bytes); napi may have clobbered it \u2014 restoring snapshot.'); fs.copyFileSync(snap,'index.d.ts'); } fs.unlinkSync(snap)\"",
-    "build:livekit": "cd ../../node/agent-transport-livekit && npm run build && mkdir -p ../../crates/agent-transport-node/livekit && cp -r dist/* ../../crates/agent-transport-node/livekit/",
+    "postbuild:check": "node -e \"const fs=require('fs'); const snap='index.d.ts.snapshot'; if (!fs.existsSync(snap)) process.exit(0); const cur=fs.existsSync('index.d.ts')?fs.statSync('index.d.ts').size:0; const ref=fs.statSync(snap).size; if (cur < ref/2) { console.error('[postbuild] index.d.ts shrank ('+cur+' < '+ref+' bytes); napi may have clobbered it — restoring snapshot.'); fs.copyFileSync(snap,'index.d.ts'); } fs.unlinkSync(snap)\"",
+    "build:livekit": "tsc -p tsconfig.livekit.json",
     "build:all": "npm run build && npm run build:livekit"
   },
   "peerDependencies": {
@@ -54,6 +54,10 @@
     }
   },
   "devDependencies": {
-    "@napi-rs/cli": "^3"
+    "@napi-rs/cli": "^3",
+    "typescript": "^5.0.0",
+    "@types/node": "^20.0.0",
+    "@livekit/agents": ">=1.2.0",
+    "@livekit/rtc-node": ">=0.13.0"
   }
 }

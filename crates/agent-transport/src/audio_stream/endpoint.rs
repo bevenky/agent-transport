@@ -349,7 +349,23 @@ impl AudioStreamEndpoint {
     pub fn hangup_with_auth(&self, session_id: &str, auth_id: Option<&str>, auth_token: Option<&str>) -> Result<()> {
         let call_id = {
             let sess = self.sessions.lock_or_recover().remove(session_id);
-            match sess { Some(s) => { cleanup_session(session_id, &s, &self.recording_mgr); s.call_id.clone() }, None => return Ok(()) }
+            match sess {
+                Some(s) => {
+                    // Send a WebSocket Close frame BEFORE cancelling tasks.
+                    // The writer task drains remaining messages on cancel, so
+                    // this frame is guaranteed to reach Plivo. Without it,
+                    // dropping ws_tx just RSTs the TCP connection and Plivo
+                    // may keep the call alive until its inactivity timeout.
+                    // This is the primary hangup signal — the REST API DELETE
+                    // below is a belt-and-suspenders backup (and is skipped
+                    // entirely when no auth credentials are available).
+                    info!("hangup: sending WS Close frame for session {}", session_id);
+                    let _ = s.ws_tx.send(Message::Close(None));
+                    cleanup_session(session_id, &s, &self.recording_mgr);
+                    s.call_id.clone()
+                }
+                None => return Ok(())
+            }
         };
         self.protocol.hangup(&call_id, &self.runtime, auth_id, auth_token);
         Ok(())
@@ -495,7 +511,37 @@ async fn handle_ws(
     tokio::spawn(async move {
         loop {
             tokio::select! {
-                _ = cc.cancelled() => break,
+                _ = cc.cancelled() => {
+                    // Drain any remaining messages before exiting. This
+                    // ensures a queued WebSocket Close frame (from hangup)
+                    // is flushed to Plivo before we drop the sink. Without
+                    // this, the select! might pick cancelled() over recv()
+                    // when both are ready, silently discarding the Close.
+                    let mut drained = 0u32;
+                    while let Ok(m) = ws_rx.try_recv() {
+                        let is_close = matches!(m, Message::Close(_));
+                        // Timeout: don't hang if WS is dead or Plivo isn't reading.
+                        match tokio::time::timeout(
+                            std::time::Duration::from_millis(500),
+                            sink.send(m),
+                        ).await {
+                            Ok(Ok(())) => {
+                                drained += 1;
+                                if is_close {
+                                    info!("WS writer: flushed Close frame to Plivo (drained {} msgs)", drained);
+                                }
+                            }
+                            _ => {
+                                debug!("WS writer: drain send failed/timed out, stopping");
+                                break;
+                            }
+                        }
+                    }
+                    if drained > 0 {
+                        debug!("WS writer: drained {} remaining messages on cancel", drained);
+                    }
+                    break;
+                }
                 msg = ws_rx.recv() => {
                     match msg { Some(m) => { if sink.send(m).await.is_err() { break; } }, None => break }
                 }
