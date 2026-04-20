@@ -75,12 +75,20 @@ jobs:
       - name: Install system deps
         run: sudo apt-get update && sudo apt-get install -y cmake libopus-dev
 
-      - name: Build + install wheel with test extras
+      - name: Build wheel
         working-directory: crates/agent-transport-python
         run: |
           pip install --upgrade pip maturin
-          # Build and install the wheel (use --release matching build-python.yml)
-          maturin develop --release --extras all,test
+          maturin build --release --out dist
+
+      - name: Install wheel with test extras
+        working-directory: crates/agent-transport-python
+        run: |
+          # Install the freshly-built wheel plus the `all` (livekit+pipecat)
+          # and `test` extras. `pip install <path-to-wheel>[test,all]` works
+          # because the wheel's metadata exposes the extras.
+          WHEEL=$(ls dist/*.whl | head -1)
+          pip install "${WHEEL}[all,test]"
 
       - name: Run pytest
         working-directory: crates/agent-transport-python
