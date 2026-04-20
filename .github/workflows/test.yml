@@ -57,14 +57,68 @@ jobs:
       - name: Run tests with audio streaming
         run: cargo test --features audio-stream
 
+  run-python-tests:
+    needs: changes
+    if: needs.changes.outputs.core == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@1.94.0
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install system deps
+        run: sudo apt-get update && sudo apt-get install -y cmake libopus-dev
+
+      - name: Build + install wheel with test extras
+        working-directory: crates/agent-transport-python
+        run: |
+          pip install --upgrade pip maturin
+          # Build and install the wheel (use --release matching build-python.yml)
+          maturin develop --release --extras all,test
+
+      - name: Run pytest
+        working-directory: crates/agent-transport-python
+        run: pytest -v tests/
+
+  run-node-tests:
+    needs: changes
+    if: needs.changes.outputs.core == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Run TS unit tests
+        working-directory: crates/agent-transport-node
+        # tsx is the only dep needed; no native build required for these
+        # tests since they only exercise pure-TS helpers.
+        run: |
+          npm install --no-save tsx typescript @types/node
+          npx tsx --test adapters/livekit/*.test.ts
+
   test:
     if: always()
-    needs: [changes, run-tests]
+    needs: [changes, run-tests, run-python-tests, run-node-tests]
     runs-on: ubuntu-latest
     steps:
       - name: Passed
-        if: needs.run-tests.result == 'success' || needs.run-tests.result == 'skipped'
+        if: |
+          (needs.run-tests.result == 'success' || needs.run-tests.result == 'skipped') &&
+          (needs.run-python-tests.result == 'success' || needs.run-python-tests.result == 'skipped') &&
+          (needs.run-node-tests.result == 'success' || needs.run-node-tests.result == 'skipped')
         run: echo "Tests passed or skipped (docs-only change)"
       - name: Failed
-        if: needs.run-tests.result == 'failure' || needs.run-tests.result == 'cancelled'
+        if: |
+          needs.run-tests.result == 'failure' || needs.run-tests.result == 'cancelled' ||
+          needs.run-python-tests.result == 'failure' || needs.run-python-tests.result == 'cancelled' ||
+          needs.run-node-tests.result == 'failure' || needs.run-node-tests.result == 'cancelled'
         run: exit 1
