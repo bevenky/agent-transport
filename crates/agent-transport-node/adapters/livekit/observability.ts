@@ -23,6 +23,29 @@ function buildAuthHeaders(): Record<string, string> {
 }
 
 /**
+ * Extract primitive scalar fields from AgentSession.options so the session
+ * report carries the configuration that shaped the call (VAD settings, turn
+ * detection flags, timeouts, etc.). Mirrors the Python SDK's filter — skips
+ * private fields (leading underscore) and any non-primitive values (complex
+ * plugin instances, nested objects) so the payload stays JSON-safe.
+ *
+ * Keys can stay camelCase — agent-observability's server normalises to
+ * snake_case on ingest.
+ */
+function extractOptions(options: any): Record<string, unknown> {
+  if (options == null || typeof options !== 'object') return {};
+  const out: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(options)) {
+    if (key.startsWith('_')) continue;
+    const t = typeof value;
+    if (t === 'string' || t === 'number' || t === 'boolean' || value === null) {
+      out[key] = value;
+    }
+  }
+  return out;
+}
+
+/**
  * Build a session report from the AgentSession.
  * Inlined to avoid deep imports from @livekit/agents internals.
  */
@@ -40,6 +63,8 @@ function buildReport(session: any, callId: string, recordingPath?: string, recor
     return obj;
   }) ?? null;
 
+  const options = extractOptions(session.options);
+
   return {
     roomId: callId,
     jobId: callId,
@@ -56,6 +81,7 @@ function buildReport(session: any, callId: string, recordingPath?: string, recor
           : typeof chatHistory.to_dict === 'function'
             ? chatHistory.to_dict({ exclude_timestamp: false })
             : { items: Array.isArray(chatHistory) ? chatHistory : chatHistory.items ?? [] },
+        options,
         timestamp,
         usage,
       };

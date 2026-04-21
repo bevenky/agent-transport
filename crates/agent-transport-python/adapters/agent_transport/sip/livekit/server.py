@@ -40,8 +40,6 @@ from livekit.rtc.room import SipDTMF
 from .sip_io import SipAudioInput, SipAudioOutput
 from ._room_facade import TransportRoom, create_transport_context
 from ._aio_utils import call_setup as _call_setup
-# TODO: Re-enable OTel observability once we finalize the tracing backend.
-# from .observability import setup_observability, shutdown_observability
 from .observability import _get_observability_url
 
 logger = logging.getLogger("agent_transport.server")
@@ -481,9 +479,6 @@ class AgentServer:
     async def _run(self, *, log_mode: str = "start") -> None:
         self._configure_logging(log_mode)
 
-        # TODO: Re-enable OTel observability once we finalize the tracing backend.
-        # setup_observability()
-
         if not self._sip_username or not self._sip_password:
             logger.error("Set SIP_USERNAME and SIP_PASSWORD environment variables")
             sys.exit(1)
@@ -578,8 +573,6 @@ class AgentServer:
         # in run_in_executor so the asyncio loop isn't blocked for the
         # ~200ms it takes to talk to the proxy.
         await loop.run_in_executor(None, self._ep.shutdown)
-        # TODO: Re-enable OTel observability once we finalize the tracing backend.
-        # shutdown_observability()
 
     def _configure_logging(self, mode: str) -> None:
         if mode == "debug":
