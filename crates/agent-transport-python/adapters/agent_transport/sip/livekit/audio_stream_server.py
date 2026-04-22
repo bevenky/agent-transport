@@ -672,9 +672,30 @@ class AudioStreamServer:
                     except Exception:
                         pass
 
-                    # Emit participant_disconnected on Room facade (matches LiveKit WebRTC)
-                    # RoomIO._on_participant_disconnected will call _close_soon() → session closes
+                    # Shut down the session gracefully BEFORE emitting
+                    # participant_disconnected. LiveKit's default handler calls
+                    # `_close_soon(drain=False)`, which force-interrupts any
+                    # in-flight LLM/TTS response — the final assistant message
+                    # (e.g. the reply after a tool call) would never land in
+                    # chat_history. Calling `shutdown(drain=True)` first sets
+                    # `_closing_task` so the subsequent `_close_soon` becomes a
+                    # no-op and the session drains normally, letting in-flight
+                    # speech finalize into history.
                     ctx = self._session_contexts.get(session_id)
+                    if ctx and ctx._session is not None:
+                        try:
+                            ctx._session.shutdown(drain=True)
+                        except Exception:
+                            logger.warning(
+                                "Graceful session shutdown failed; falling back "
+                                "to default close",
+                                exc_info=True,
+                            )
+
+                    # Emit participant_disconnected on Room facade (matches
+                    # LiveKit WebRTC). RoomIO._on_participant_disconnected calls
+                    # `_close_soon(drain=False)`, which is a no-op here because
+                    # `_closing_task` was already set above.
                     if ctx and ctx._room:
                         remote = ctx._room._remote
                         remote.disconnect_reason = 1  # CLIENT_INITIATED

@@ -89,7 +89,7 @@ export class AudioStreamServer {
   private userdata: Record<string, unknown> = {};
   private proc = new JobProcess();
   private ep?: AudioStreamEndpoint;
-  private activeSessions = new Map<string, { promise: Promise<void>; resolveEnded: () => void; room?: any }>();
+  private activeSessions = new Map<string, { promise: Promise<void>; resolveEnded: () => void; room?: any; ctx?: any }>();
   private httpServer?: Server;
   private loadMonitor = new LoadMonitor();
   private inferenceExecutor: any;
@@ -323,8 +323,27 @@ export class AudioStreamServer {
         const reason = ev.reason ?? 'unknown';
         console.log(`Session ${sessionId} terminated (reason=${reason})`);
 
-        // Emit participant_disconnected on Room facade
+        // Shut down the session gracefully BEFORE emitting
+        // participant_disconnected. LiveKit's default handler calls
+        // `_closeSoon({ drain: false })`, which force-interrupts any in-flight
+        // LLM/TTS response — the final assistant message (e.g. the reply
+        // after a tool call) would never land in chat_history. Calling
+        // `shutdown({ drain: true })` first sets the closing state so the
+        // subsequent `_closeSoon` becomes a no-op and the session drains
+        // normally, letting in-flight speech finalize into history.
         const active = this.activeSessions.get(sessionId);
+        if (active?.ctx?.session?.shutdown) {
+          try {
+            active.ctx.session.shutdown({ drain: true });
+          } catch (err) {
+            console.warn(
+              `Graceful session shutdown failed for ${sessionId}; falling back to default close`,
+              err,
+            );
+          }
+        }
+
+        // Emit participant_disconnected on Room facade.
         if (active?.room) {
           active.room.emitParticipantDisconnected();
         }
@@ -487,7 +506,7 @@ export class AudioStreamServer {
     };
 
     const sessionPromise = runSession();
-    this.activeSessions.set(sessionId, { promise: sessionPromise, resolveEnded, room: ctx.room });
+    this.activeSessions.set(sessionId, { promise: sessionPromise, resolveEnded, room: ctx.room, ctx });
   }
 
   // ─── HTTP server ────────────────────────────────────────────────────

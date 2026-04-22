@@ -100,7 +100,7 @@ export class AgentServer {
   private userdata: Record<string, unknown> = {};
   private proc = new JobProcess();
   private ep?: SipEndpoint;
-  private activeCalls = new Map<string, { promise: Promise<void>; resolveEnded: () => void; room?: any }>();
+  private activeCalls = new Map<string, { promise: Promise<void>; resolveEnded: () => void; room?: any; ctx?: any }>();
   private httpServer?: Server;
   private loadMonitor = new LoadMonitor();
   private inferenceExecutor: any = null;
@@ -436,9 +436,29 @@ export class AgentServer {
         const reason = ev.reason ?? 'unknown';
         console.log(`Call ${sessionId} terminated (reason=${reason})`);
 
-        // Emit participant_disconnected on Room facade (matches LiveKit WebRTC)
-        // RoomIO._on_participant_disconnected will call _close_soon() → session closes
+        // Shut down the session gracefully BEFORE emitting
+        // participant_disconnected. LiveKit's default handler calls
+        // `_closeSoon({ drain: false })`, which force-interrupts any in-flight
+        // LLM/TTS response — the final assistant message (e.g. the reply
+        // after a tool call) would never land in chat_history. Calling
+        // `shutdown({ drain: true })` first sets the closing state so the
+        // subsequent `_closeSoon` becomes a no-op and the session drains
+        // normally, letting in-flight speech finalize into history.
         const active = this.activeCalls.get(sessionId);
+        if (active?.ctx?.session?.shutdown) {
+          try {
+            active.ctx.session.shutdown({ drain: true });
+          } catch (err) {
+            console.warn(
+              `Graceful session shutdown failed for ${sessionId}; falling back to default close`,
+              err,
+            );
+          }
+        }
+
+        // Emit participant_disconnected on Room facade (matches LiveKit WebRTC).
+        // RoomIO._on_participant_disconnected calls _closeSoon({ drain: false }),
+        // which is a no-op here because the session is already closing.
         if (active?.room) {
           active.room.emitParticipantDisconnected();
         }
@@ -609,7 +629,7 @@ export class AgentServer {
     };
 
     const callPromise = runCall();
-    this.activeCalls.set(sessionId, { promise: callPromise, resolveEnded, room: ctx.room });
+    this.activeCalls.set(sessionId, { promise: callPromise, resolveEnded, room: ctx.room, ctx });
   }
 
   // ─── HTTP server ────────────────────────────────────────────────
