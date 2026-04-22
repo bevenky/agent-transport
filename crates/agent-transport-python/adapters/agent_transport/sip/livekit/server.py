@@ -879,6 +879,7 @@ class AgentServer:
         await upload_session_report(
             session, session_id, obs_url, self._agent_name,
             recording_path, recording_started_at, account_id,
+            transport="sip",
         )
 
     async def _start_call(self, session_id: str, remote_uri: str, direction: str) -> None:

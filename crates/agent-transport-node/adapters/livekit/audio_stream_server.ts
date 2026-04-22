@@ -464,6 +464,7 @@ export class AudioStreamServer {
               accountId: ctx.accountId,
               recordingPath: recPath,
               recordingStartedAt: Date.now(),
+              transport: 'audio_stream',
             });
           } catch (e) {
             console.warn(`Failed to upload session report for session ${sessionId}:`, e);

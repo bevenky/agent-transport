@@ -96,11 +96,12 @@ export async function uploadReport(options: {
   accountId?: string;
   recordingPath?: string;
   recordingStartedAt?: number;
+  transport?: 'sip' | 'audio_stream';
 }): Promise<void> {
   const obsUrl = getObservabilityUrl();
   if (!obsUrl) return;
 
-  const { agentName, session, callId, accountId, recordingPath, recordingStartedAt } = options;
+  const { agentName, session, callId, accountId, recordingPath, recordingStartedAt, transport } = options;
 
   const report = buildReport(session, callId, recordingPath, recordingStartedAt);
 
@@ -110,11 +111,15 @@ export async function uploadReport(options: {
     roomTags['account_id'] = accountId;
   }
 
-  const headerJson = JSON.stringify({
+  const headerPayload: Record<string, unknown> = {
     session_id: callId,
     room_tags: roomTags,
     start_time: report.audioRecordingStartedAt ?? 0,
-  });
+  };
+  if (transport) {
+    headerPayload.transport = transport;
+  }
+  const headerJson = JSON.stringify(headerPayload);
   const headerBuffer = Buffer.from(headerJson, 'utf-8');
 
   // Build multipart form

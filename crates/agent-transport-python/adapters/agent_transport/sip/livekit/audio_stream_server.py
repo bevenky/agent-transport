@@ -827,6 +827,7 @@ class AudioStreamServer:
                                 ctx._session, session_id, obs_url, self._agent_name,
                                 rec_path, rec_started_at,
                                 account_id=ctx.account_id,
+                                transport="audio_stream",
                             )
                         except Exception:
                             logger.warning("Failed to upload session report for session %s", session_id, exc_info=True)

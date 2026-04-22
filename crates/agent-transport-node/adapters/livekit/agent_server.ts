@@ -580,6 +580,7 @@ export class AgentServer {
               accountId: ctx.accountId,
               recordingPath: recPath,
               recordingStartedAt: Date.now(),
+              transport: 'sip',
             });
           } catch (e) {
             console.warn(`Failed to upload session report for call ${sessionId}:`, e);

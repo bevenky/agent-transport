@@ -81,10 +81,12 @@ async def upload_session_report(
     recording_path: str | None = None,
     recording_started_at: float | None = None,
     account_id: str | None = None,
+    transport: str | None = None,
 ) -> None:
     """Build a session report and upload it to the observability server.
 
-    Used by both AgentServer (SIP) and AudioStreamServer.
+    Used by both AgentServer (SIP) and AudioStreamServer. `transport` is the
+    transport that carried the call — "sip" or "audio_stream".
     """
     import json
     import aiohttp
@@ -102,11 +104,14 @@ async def upload_session_report(
     if account_id:
         room_tags["account_id"] = account_id
 
-    header = json.dumps({
+    header_payload = {
         "session_id": str(session_id),
         "room_tags": room_tags,
         "start_time": recording_started_at or 0,
-    })
+    }
+    if transport:
+        header_payload["transport"] = transport
+    header = json.dumps(header_payload)
 
     report_dict = _build_report_dict(session, session_id)
     chat_history_json = json.dumps(report_dict)
