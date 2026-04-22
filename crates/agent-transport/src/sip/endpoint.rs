@@ -9,7 +9,7 @@ use crossbeam_channel::{Receiver, Sender};
 use tokio::net::UdpSocket;
 use tokio::runtime::Runtime;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use beep_detector::{BeepDetector, BeepDetectorConfig};
 use rsip::message::HasHeaders;
@@ -20,7 +20,7 @@ use rsipstack::dialog::dialog_layer::DialogLayer;
 use rsipstack::dialog::invitation::InviteOption;
 use rsipstack::dialog::registration::Registration;
 use rsipstack::transport::tcp::TcpConnection;
-use rsipstack::transport::{SipAddr, TransportLayer};
+use rsipstack::transport::{SipAddr, SipConnection, TransportLayer};
 use rsipstack::EndpointBuilder;
 
 use crate::audio::AudioFrame;
@@ -362,6 +362,46 @@ mod termination_tests {
     }
 }
 
+#[cfg(test)]
+mod contact_refresh_tests {
+    use super::*;
+
+    #[test]
+    fn contact_parts_for_addr_formats_transport_tcp_uri() {
+        let addr: SocketAddr = "203.0.113.5:40001".parse().unwrap();
+        let (uri, hp) = contact_parts_for_addr("alice", addr).unwrap();
+        // rsip canonicalizes the transport param to uppercase on serialize;
+        // matches the initial-registration path which produces the same
+        // canonical form. SIP parameter values are case-insensitive per
+        // RFC 3261.
+        assert_eq!(uri.to_string(), "sip:alice@203.0.113.5:40001;transport=TCP");
+        assert_eq!(hp.host.to_string(), "203.0.113.5");
+        assert_eq!(hp.port.map(u16::from), Some(40001));
+    }
+
+    #[test]
+    fn contact_parts_for_addr_preserves_port_across_calls() {
+        // Same IP, different port — NAT rebind scenario. Helper must emit
+        // the new port in both the URI and the HostWithPort; the loop's
+        // `changed` predicate relies on port comparison to detect this.
+        let addr1: SocketAddr = "198.51.100.7:5060".parse().unwrap();
+        let addr2: SocketAddr = "198.51.100.7:60001".parse().unwrap();
+        let (_, hp1) = contact_parts_for_addr("bob", addr1).unwrap();
+        let (uri2, hp2) = contact_parts_for_addr("bob", addr2).unwrap();
+        assert_eq!(hp1.port.map(u16::from), Some(5060));
+        assert_eq!(hp2.port.map(u16::from), Some(60001));
+        assert!(uri2.to_string().contains(":60001;"), "uri: {}", uri2);
+    }
+
+    #[test]
+    fn tcp_destination_for_addr_preserves_tcp_transport() {
+        let addr: SocketAddr = "204.89.148.67:5060".parse().unwrap();
+        let dest = tcp_destination_for_addr(addr);
+        assert_eq!(dest.r#type, Some(rsip::Transport::Tcp));
+        assert_eq!(dest.get_socketaddr().unwrap(), addr);
+    }
+}
+
 /// Start session timer refresh (periodic Re-INVITE).
 ///
 /// Runs as a tokio task so shutdown (cancel) is observed within one tick,
@@ -444,6 +484,33 @@ fn parse_session_expires(resp: &rsip::Response) -> Option<u32> {
         }
     }
     None
+}
+
+// Build the (Contact URI, HostWithPort) pair for a STUN-discovered public
+// address. URI format mirrors the initial registration path so rsipstack's
+// 401 auth retry preserves `transport=tcp`.
+fn contact_parts_for_addr(
+    user: &str,
+    new_addr: SocketAddr,
+) -> Result<(rsip::Uri, rsip::HostWithPort)> {
+    let uri: rsip::Uri = format!(
+        "sip:{}@{}:{};transport=tcp",
+        user,
+        new_addr.ip(),
+        new_addr.port()
+    )
+    .try_into()
+    .map_err(|e| err(format!("{:?}", e)))?;
+    let hp: rsip::HostWithPort = format!("{}:{}", new_addr.ip(), new_addr.port())
+        .try_into()
+        .map_err(|e| err(format!("{:?}", e)))?;
+    Ok((uri, hp))
+}
+
+fn tcp_destination_for_addr(addr: SocketAddr) -> SipAddr {
+    let mut dest = SipAddr::from(addr);
+    dest.r#type = Some(rsip::Transport::Tcp);
+    dest
 }
 
 // ─── SipEndpoint ─────────────────────────────────────────────────────────────
@@ -597,16 +664,159 @@ impl SipEndpoint {
                 { let mut s = st.lock_or_recover(); s.registered = true; s.credential = Some(cred); s.contact_uri = Some(contact_uri.clone()); s.aor = Some(aor.clone()); s.public_addr = pa; }
                 let _ = etx.try_send(EndpointEvent::Registered);
 
-                // Re-registration loop (TCP keepalive is handled by the persistent connection)
+                // Re-registration loop (TCP keepalive is handled by the persistent connection).
+                //
+                // Fix for issue #50: on every tick, re-run STUN and rebuild Contact +
+                // EndpointState if the public IP has moved. Without this, a WiFi/ISP
+                // switch leaves the proxy with a stale Contact and EndpointState with
+                // a stale public_addr — incoming INVITEs land in a black hole (486) or
+                // the SDP answer points caller's RTP at an IP we no longer own. We also
+                // evict the cached TCP connection on change so rsipstack opens a fresh
+                // socket from the new source IP (otherwise writes EPIPE on the dead
+                // socket and re-registration fails forever).
                 let re = reg.expires().max(50) as u64;
                 let (st2, etx2) = (st.clone(), etx.clone());
+                let user2 = user.clone();
+                let stun2 = stun.clone();
                 tokio::spawn(async move {
                     loop {
-                        tokio::select! { _ = cc.cancelled() => break, _ = tokio::time::sleep(std::time::Duration::from_secs(re)) => {} }
+                        tokio::select! {
+                            _ = cc.cancelled() => break,
+                            _ = tokio::time::sleep(std::time::Duration::from_secs(re)) => {}
+                        }
+
+                        // Refresh STUN on a blocking thread (sync UDP, 3s timeout).
+                        let stun3 = stun2.clone();
+                        let new_pa: Option<SocketAddr> =
+                            match tokio::task::spawn_blocking(move || sdp::stun_binding(&stun3)).await {
+                                Ok(Ok(a)) => Some(a),
+                                Ok(Err(e)) => {
+                                    warn!("STUN refresh failed, keeping cached Contact: {}", e);
+                                    None
+                                }
+                                Err(e) => {
+                                    warn!("STUN refresh task join failed: {}", e);
+                                    None
+                                }
+                            };
+
+                        // If the public IP moved, rebuild Contact + public_address on
+                        // `reg`, evict the dead TCP socket, and update EndpointState
+                        // immediately so outbound SDP and inbound auto-answer use the
+                        // new IP even before the next re-register confirms. The Contact
+                        // on the proxy side only updates after a successful REGISTER,
+                        // but SDP/RTP correctness is independent and worth fixing
+                        // unconditionally.
+                        //
+                        // Compare host only, NOT port: sdp::stun_binding() opens a
+                        // fresh UDP socket per call, which gets a fresh NAT mapping
+                        // and thus a different public port every single tick. Using
+                        // port in the comparison would trigger rebuild+evict on every
+                        // cycle, churning the TCP connection and preventing a stable
+                        // registration from taking hold.
+                        if let Some(new_addr) = new_pa {
+                            let changed = reg.public_address.as_ref().map_or(true, |hp| {
+                                hp.host.to_string() != new_addr.ip().to_string()
+                            });
+                            if changed {
+                                let old_hp = reg.public_address.clone();
+                                info!(
+                                    "public IP changed: {:?} → {}, rebuilding Contact",
+                                    old_hp, new_addr
+                                );
+                                match contact_parts_for_addr(&user2, new_addr) {
+                                    Ok((new_uri, new_hp)) => {
+                                        reg.contact = Some(rsip::typed::Contact {
+                                            display_name: None,
+                                            uri: new_uri.clone(),
+                                            params: vec![],
+                                        });
+                                        reg.public_address = Some(new_hp);
+
+                                        // Apply to EndpointState immediately so inbound
+                                        // auto-answer and outbound SDP use the current
+                                        // IP. If the subsequent re-register fails, the
+                                        // Contact on the proxy is stale — but SDP here
+                                        // is still correct for any call that does land.
+                                        {
+                                            let mut s = st2.lock_or_recover();
+                                            s.contact_uri = Some(new_uri);
+                                            s.public_addr = Some(new_addr);
+                                        }
+
+                                        // Replace the stale TCP connection with a fresh
+                                        // one bound to the new source IP. We cannot just
+                                        // evict — `TransportLayer.listens` is empty in
+                                        // agent-transport (setup uses add_connection, not
+                                        // add_transport), so after eviction get_addrs()
+                                        // returns [] and rsipstack's get_via() fails with
+                                        // "not sipaddrs" before it even tries to dial a
+                                        // new socket. Connect first, then add_connection
+                                        // — the HashMap key is the remote addr, so the
+                                        // insert replaces the old entry in place and
+                                        // get_addrs() now reports our new local_addr.
+                                        let (srv_addr, dl_opt, new_la) = {
+                                            let s = st2.lock_or_recover();
+                                            (s.sip_server_addr, s.dialog_layer.clone(), s.local_addr.clone())
+                                        };
+                                        if let (Some(addr), Some(dl)) = (srv_addr, dl_opt) {
+                                            match format!("{}:{}", addr.ip(), addr.port()).try_into() {
+                                                Ok(hp) => {
+                                                    let server_sip = SipAddr::new(rsip::Transport::Tcp, hp);
+                                                    match TcpConnection::connect(&server_sip, Some(cc.clone())).await {
+                                                        Ok(new_tcp) => {
+                                                            let fresh_la = new_tcp.inner.local_addr.clone();
+                                                            let conn: SipConnection = new_tcp.into();
+                                                            dl.endpoint.transport_layer.add_connection(conn);
+                                                            {
+                                                                let mut s = st2.lock_or_recover();
+                                                                s.local_addr = Some(fresh_la.clone());
+                                                            }
+                                                            info!(
+                                                                "replaced stale TCP: {:?} → {} (remote {})",
+                                                                new_la, fresh_la, addr
+                                                            );
+                                                        }
+                                                        Err(e) => {
+                                                            warn!(
+                                                                "TCP reconnect to {} failed ({}); register will retry next cycle",
+                                                                addr, e
+                                                            );
+                                                        }
+                                                    }
+                                                }
+                                                Err(e) => warn!("could not build SipAddr for TCP replace: {:?}", e),
+                                            }
+                                        }
+                                    }
+                                    Err(e) => warn!("contact rebuild failed: {}", e),
+                                }
+                            }
+                        }
+
                         match reg.register(server_uri.clone(), Some(exp)).await {
-                            Ok(r) if r.status_code == rsip::StatusCode::OK => debug!("Re-registered"),
-                            Ok(r) => { st2.lock_or_recover().registered = false; let _ = etx2.try_send(EndpointEvent::RegistrationFailed { error: format!("{}", r.status_code) }); }
-                            Err(e) => { st2.lock_or_recover().registered = false; let _ = etx2.try_send(EndpointEvent::RegistrationFailed { error: e.to_string() }); }
+                            Ok(r) if r.status_code == rsip::StatusCode::OK => {
+                                let mut s = st2.lock_or_recover();
+                                if !s.registered {
+                                    info!("re-registered after failure window");
+                                }
+                                s.registered = true;
+                                debug!("Re-registered");
+                            }
+                            Ok(r) => {
+                                warn!("re-register non-OK response: {}", r.status_code);
+                                st2.lock_or_recover().registered = false;
+                                let _ = etx2.try_send(EndpointEvent::RegistrationFailed {
+                                    error: format!("{}", r.status_code),
+                                });
+                            }
+                            Err(e) => {
+                                warn!("re-register error: {}", e);
+                                st2.lock_or_recover().registered = false;
+                                let _ = etx2.try_send(EndpointEvent::RegistrationFailed {
+                                    error: e.to_string(),
+                                });
+                            }
                         }
                     }
                 });
@@ -671,14 +881,15 @@ impl SipEndpoint {
         let handle = self.runtime.handle().clone();
         let jh = self.runtime.spawn_blocking(move || {
         handle.block_on(async {
-            let (dl, cred, contact, aor, la, pa) = {
+            let (dl, cred, contact, aor, la, pa, sip_server_addr) = {
                 let s = st.lock_or_recover();
                 (s.dialog_layer.clone().ok_or(EndpointError::NotInitialized)?,
                  s.credential.clone().ok_or(EndpointError::NotRegistered)?,
                  s.contact_uri.clone().ok_or(EndpointError::NotRegistered)?,
                  s.aor.clone().ok_or(EndpointError::NotRegistered)?,
                  s.local_addr.clone().ok_or(EndpointError::NotInitialized)?,
-                 s.public_addr)
+                 s.public_addr,
+                 s.sip_server_addr.ok_or(EndpointError::NotInitialized)?)
             };
             let la_str = la.addr.host.to_string();
 
@@ -701,7 +912,10 @@ impl SipEndpoint {
                 format!("{};transport=tcp", dest)
             } else { dest.clone() };
             let callee: rsip::Uri = dest_tcp.try_into().map_err(|e| err(format!("{:?}", e)))?;
-            let opt = InviteOption { caller, callee, contact, credential: Some(cred), offer: Some(offer.into_bytes()), content_type: Some("application/sdp".into()), headers: custom_hdrs, ..Default::default() };
+            // Keep the Request-URI as the dialed domain while sending to the
+            // startup-resolved Plivo proxy, matching REGISTER's DNS-free path.
+            let destination = Some(tcp_destination_for_addr(sip_server_addr));
+            let opt = InviteOption { caller, callee, destination, contact, credential: Some(cred), offer: Some(offer.into_bytes()), content_type: Some("application/sdp".into()), headers: custom_hdrs, ..Default::default() };
 
             let (ds, dr) = dl.new_dialog_state_channel();
             let (dialog, resp) = dl.do_invite(opt, ds).await.map_err(err)?;
