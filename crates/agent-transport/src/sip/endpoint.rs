@@ -392,6 +392,14 @@ mod contact_refresh_tests {
         assert_eq!(hp2.port.map(u16::from), Some(60001));
         assert!(uri2.to_string().contains(":60001;"), "uri: {}", uri2);
     }
+
+    #[test]
+    fn tcp_destination_for_addr_preserves_tcp_transport() {
+        let addr: SocketAddr = "204.89.148.67:5060".parse().unwrap();
+        let dest = tcp_destination_for_addr(addr);
+        assert_eq!(dest.r#type, Some(rsip::Transport::Tcp));
+        assert_eq!(dest.get_socketaddr().unwrap(), addr);
+    }
 }
 
 /// Start session timer refresh (periodic Re-INVITE).
@@ -497,6 +505,12 @@ fn contact_parts_for_addr(
         .try_into()
         .map_err(|e| err(format!("{:?}", e)))?;
     Ok((uri, hp))
+}
+
+fn tcp_destination_for_addr(addr: SocketAddr) -> SipAddr {
+    let mut dest = SipAddr::from(addr);
+    dest.r#type = Some(rsip::Transport::Tcp);
+    dest
 }
 
 // ─── SipEndpoint ─────────────────────────────────────────────────────────────
@@ -867,14 +881,15 @@ impl SipEndpoint {
         let handle = self.runtime.handle().clone();
         let jh = self.runtime.spawn_blocking(move || {
         handle.block_on(async {
-            let (dl, cred, contact, aor, la, pa) = {
+            let (dl, cred, contact, aor, la, pa, sip_server_addr) = {
                 let s = st.lock_or_recover();
                 (s.dialog_layer.clone().ok_or(EndpointError::NotInitialized)?,
                  s.credential.clone().ok_or(EndpointError::NotRegistered)?,
                  s.contact_uri.clone().ok_or(EndpointError::NotRegistered)?,
                  s.aor.clone().ok_or(EndpointError::NotRegistered)?,
                  s.local_addr.clone().ok_or(EndpointError::NotInitialized)?,
-                 s.public_addr)
+                 s.public_addr,
+                 s.sip_server_addr.ok_or(EndpointError::NotInitialized)?)
             };
             let la_str = la.addr.host.to_string();
 
@@ -897,7 +912,10 @@ impl SipEndpoint {
                 format!("{};transport=tcp", dest)
             } else { dest.clone() };
             let callee: rsip::Uri = dest_tcp.try_into().map_err(|e| err(format!("{:?}", e)))?;
-            let opt = InviteOption { caller, callee, contact, credential: Some(cred), offer: Some(offer.into_bytes()), content_type: Some("application/sdp".into()), headers: custom_hdrs, ..Default::default() };
+            // Keep the Request-URI as the dialed domain while sending to the
+            // startup-resolved Plivo proxy, matching REGISTER's DNS-free path.
+            let destination = Some(tcp_destination_for_addr(sip_server_addr));
+            let opt = InviteOption { caller, callee, destination, contact, credential: Some(cred), offer: Some(offer.into_bytes()), content_type: Some("application/sdp".into()), headers: custom_hdrs, ..Default::default() };
 
             let (ds, dr) = dl.new_dialog_state_channel();
             let (dialog, resp) = dl.do_invite(opt, ds).await.map_err(err)?;
