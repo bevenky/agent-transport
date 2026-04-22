@@ -41,15 +41,11 @@ audio/temp/
 testing/
 todos/
 real_tests/
-python/build/
 recording_*.ogg
 
 # Local recordings dir (test/debug captures, not source-controlled)
 recordings/
 
-# maturin build directory — not source-controlled. CI populates it via
-# `cp -r python/agent_transport crates/agent-transport-python/python/`
-# (see .github/workflows/build-python.yml). Local devs typically use a
-# symlink: `ln -s ../../python crates/agent-transport-python/python`.
-# Either way the contents are a transient mirror of python/agent_transport/.
-crates/agent-transport-python/python
+# Python crate build artifacts
+crates/agent-transport-python/adapters/agent_transport/*.so
+crates/agent-transport-python/adapters/agent_transport/*.dylib*
