@@ -92,11 +92,7 @@ jobs:
 
       - name: Run pytest
         working-directory: crates/agent-transport-python
-        # Skip the existing test_pipecat_* suites: they fail to import under
-        # pipecat-ai >= 0.0.108 because pipecat's own base_serializer hits a
-        # missing `rtvi` subpackage. That's a pre-existing dep issue in the
-        # Pipecat adapter tests, unrelated to this PR — track separately.
-        run: pytest -v tests/ --ignore-glob='tests/test_pipecat_*.py'
+        run: pytest -v tests/
 
   run-node-tests:
     needs: changes
