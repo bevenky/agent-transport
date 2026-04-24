@@ -349,7 +349,21 @@ impl AudioStreamEndpoint {
                     info!("hangup: sending WS Close frame for session {}", session_id);
                     let _ = s.ws_tx.send(Message::Close(None));
                     cleanup_session(session_id, &s, &self.recording_mgr);
-                    s.call_id.clone()
+                    let call_id = s.call_id.clone();
+                    // Notify adapters that the session has ended. The reader
+                    // loop's own "ws disconnected" emission is skipped once
+                    // we've already removed the session from state, so there
+                    // is no duplicate event.
+                    let mut term_session = crate::sip::call::CallSession::new(
+                        session_id.to_string(),
+                        crate::sip::call::CallDirection::Inbound,
+                    );
+                    term_session.call_uuid = Some(call_id.clone());
+                    let _ = self.event_tx.try_send(EndpointEvent::CallTerminated {
+                        session: term_session,
+                        reason: "local hangup".into(),
+                    });
+                    call_id
                 }
                 None => return Ok(())
             }
