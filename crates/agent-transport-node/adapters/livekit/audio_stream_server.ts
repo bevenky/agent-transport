@@ -26,6 +26,7 @@ import { AudioStreamEndpoint } from 'agent-transport';
 import { initializeLogger, InferenceRunner, runWithJobContext } from '@livekit/agents';
 import { AudioStreamJobContext } from './audio_stream_context.js';
 import { JobProcess } from './agent_server.js';
+import { uploadReport, getObservabilityUrl } from './observability.js';
 
 export interface AudioStreamServerOptions {
   listenAddr?: string;
@@ -88,7 +89,7 @@ export class AudioStreamServer {
   private userdata: Record<string, unknown> = {};
   private proc = new JobProcess();
   private ep?: AudioStreamEndpoint;
-  private activeSessions = new Map<string, { promise: Promise<void>; resolveEnded: () => void; room?: any }>();
+  private activeSessions = new Map<string, { promise: Promise<void>; resolveEnded: () => void; room?: any; ctx?: any }>();
   private httpServer?: Server;
   private loadMonitor = new LoadMonitor();
   private inferenceExecutor: any;
@@ -231,6 +232,11 @@ export class AudioStreamServer {
     this.startHttpServer();
     console.log(`HTTP server on http://${this.host}:${this.port}`);
 
+    const obsUrl = getObservabilityUrl();
+    if (obsUrl) {
+      console.log(`Observability enabled, target ${obsUrl}`);
+    }
+
     // Start event loop. Track the promise so we can await its exit during
     // shutdown — without this the infinite while loop pins libuv forever.
     const eventLoopDone = this.eventLoop();
@@ -317,8 +323,27 @@ export class AudioStreamServer {
         const reason = ev.reason ?? 'unknown';
         console.log(`Session ${sessionId} terminated (reason=${reason})`);
 
-        // Emit participant_disconnected on Room facade
+        // Shut down the session gracefully BEFORE emitting
+        // participant_disconnected. LiveKit's default handler calls
+        // `_closeSoon({ drain: false })`, which force-interrupts any in-flight
+        // LLM/TTS response — the final assistant message (e.g. the reply
+        // after a tool call) would never land in chat_history. Calling
+        // `shutdown({ drain: true })` first sets the closing state so the
+        // subsequent `_closeSoon` becomes a no-op and the session drains
+        // normally, letting in-flight speech finalize into history.
         const active = this.activeSessions.get(sessionId);
+        if (active?.ctx?.session?.shutdown) {
+          try {
+            active.ctx.session.shutdown({ drain: true });
+          } catch (err) {
+            console.warn(
+              `Graceful session shutdown failed for ${sessionId}; falling back to default close`,
+              err,
+            );
+          }
+        }
+
+        // Emit participant_disconnected on Room facade.
         if (active?.room) {
           active.room.emitParticipantDisconnected();
         }
@@ -370,12 +395,11 @@ export class AudioStreamServer {
       this.sessionCount++;
       const sessionStart = performance.now();
 
+      const sessionDir = `/tmp/agent-sessions`;
       try {
         // Wrap in runWithJobContext
         let agents: any;
         try { agents = await import('@livekit/agents'); } catch {}
-
-        const sessionDir = `/tmp/agent-sessions`;
         const stub = {
           room: ctx.room,
           job: { id: `job-${sessionId}`, agentName: this.agentName, enableRecording: false, room: { sid: ctx.room.sid, name: ctx.room.name } },
@@ -424,11 +448,55 @@ export class AudioStreamServer {
         this.sessionDurations.push(durationSec);
 
         if (ctx.session) {
-          try { await (ctx.session as any).close(); } catch {}
+          try {
+            const usage = (ctx.session as any).usage;
+            if (usage) {
+              console.log(`Session ${sessionId} usage:`, JSON.stringify(usage));
+            }
+          } catch {}
+
+          // Wait for natural session close (preserves in-flight responses in history)
+          try {
+            await new Promise<void>((resolve) => {
+              const timer = setTimeout(resolve, 5000);
+              ctx.session.on('close', () => { clearTimeout(timer); resolve(); });
+            });
+          } catch {
+            try { await (ctx.session as any).close(); } catch {}
+          }
+
+          // Stop recording and wait for file to be finalized
+          try { this.ep!.stopRecording(sessionId); } catch {}
+          const recPath = `${sessionDir}/recording_${sessionId}.ogg`;
+          const { existsSync } = await import('node:fs');
+          for (let i = 0; i < 20; i++) {
+            if (existsSync(recPath)) break;
+            await new Promise(r => setTimeout(r, 100));
+          }
+
+          // Upload session report (transcript, audio, metrics)
+          try {
+            await uploadReport({
+              agentName: this.agentName,
+              session: ctx.session,
+              callId: sessionId,
+              accountId: ctx.accountId,
+              recordingPath: recPath,
+              recordingStartedAt: Date.now() / 1000,
+              transport: 'audio_stream',
+            });
+          } catch (e) {
+            console.warn(`Failed to upload session report for session ${sessionId}:`, e);
+          }
+
+          // Clean up local recording after upload attempt
+          if (getObservabilityUrl()) {
+            try { const { unlinkSync } = await import('node:fs'); unlinkSync(recPath); } catch (e) {
+              console.warn(`Failed to clean up recording ${recPath}:`, e);
+            }
+          }
         }
 
-        // Stop Rust recording if active
-        try { this.ep!.stopRecording(sessionId); } catch {}
         try { this.ep!.hangup(sessionId); } catch {}
 
         ctx.room._onSessionEnded();
@@ -438,7 +506,7 @@ export class AudioStreamServer {
     };
 
     const sessionPromise = runSession();
-    this.activeSessions.set(sessionId, { promise: sessionPromise, resolveEnded, room: ctx.room });
+    this.activeSessions.set(sessionId, { promise: sessionPromise, resolveEnded, room: ctx.room, ctx });
   }
 
   // ─── HTTP server ────────────────────────────────────────────────────

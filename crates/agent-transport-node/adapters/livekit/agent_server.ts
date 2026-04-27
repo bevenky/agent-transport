@@ -18,10 +18,11 @@
 import { createServer, type Server, type IncomingMessage, type ServerResponse } from 'node:http';
 import { cpus } from 'node:os';
 import { hostname } from 'node:os';
-import { mkdirSync } from 'node:fs';
+import { mkdirSync, existsSync } from 'node:fs';
 import { SipEndpoint } from 'agent-transport';
 import { initializeLogger, InferenceRunner, runWithJobContext, log as agentLog, voice } from '@livekit/agents';
 import { JobContext } from './session_context.js';
+import { uploadReport, getObservabilityUrl } from './observability.js';
 
 export class JobProcess {
   userData: Record<string, unknown> = {};
@@ -99,7 +100,7 @@ export class AgentServer {
   private userdata: Record<string, unknown> = {};
   private proc = new JobProcess();
   private ep?: SipEndpoint;
-  private activeCalls = new Map<string, { promise: Promise<void>; resolveEnded: () => void; room?: any }>();
+  private activeCalls = new Map<string, { promise: Promise<void>; resolveEnded: () => void; room?: any; ctx?: any }>();
   private httpServer?: Server;
   private loadMonitor = new LoadMonitor();
   private inferenceExecutor: any = null;
@@ -329,6 +330,11 @@ export class AgentServer {
     this.startHttpServer();
     console.log(`HTTP server on http://${this.host}:${this.port}`);
 
+    const obsUrl = getObservabilityUrl();
+    if (obsUrl) {
+      console.log(`Observability enabled, target ${obsUrl}`);
+    }
+
     // Start SIP event loop. Track the promise so we can await its exit
     // during shutdown — without this the infinite while loop would pin
     // Node's event loop forever.
@@ -430,9 +436,29 @@ export class AgentServer {
         const reason = ev.reason ?? 'unknown';
         console.log(`Call ${sessionId} terminated (reason=${reason})`);
 
-        // Emit participant_disconnected on Room facade (matches LiveKit WebRTC)
-        // RoomIO._on_participant_disconnected will call _close_soon() → session closes
+        // Shut down the session gracefully BEFORE emitting
+        // participant_disconnected. LiveKit's default handler calls
+        // `_closeSoon({ drain: false })`, which force-interrupts any in-flight
+        // LLM/TTS response — the final assistant message (e.g. the reply
+        // after a tool call) would never land in chat_history. Calling
+        // `shutdown({ drain: true })` first sets the closing state so the
+        // subsequent `_closeSoon` becomes a no-op and the session drains
+        // normally, letting in-flight speech finalize into history.
         const active = this.activeCalls.get(sessionId);
+        if (active?.ctx?.session?.shutdown) {
+          try {
+            active.ctx.session.shutdown({ drain: true });
+          } catch (err) {
+            console.warn(
+              `Graceful session shutdown failed for ${sessionId}; falling back to default close`,
+              err,
+            );
+          }
+        }
+
+        // Emit participant_disconnected on Room facade (matches LiveKit WebRTC).
+        // RoomIO._on_participant_disconnected calls _closeSoon({ drain: false }),
+        // which is a no-op here because the session is already closing.
         if (active?.room) {
           active.room.emitParticipantDisconnected();
         }
@@ -487,10 +513,10 @@ export class AgentServer {
       this.sipCallsTotal[direction]++;
       const callStart = performance.now();
 
+      const sessionDir = `/tmp/agent-sessions`;
       try {
         // Wrap in runWithJobContext so getJobContext().room works inside handler
         // (matches LiveKit WebRTC where entrypoint runs inside job context)
-        const sessionDir = `/tmp/agent-sessions`;
         const stub = {
           room: ctx.room,
           job: { id: `job-${sessionId}`, agentName: this.agentName, enableRecording: false, room: { sid: ctx.room.sid, name: ctx.room.name } },
@@ -538,10 +564,7 @@ export class AgentServer {
         const durationSec = (performance.now() - callStart) / 1000;
         this.sipCallDurations.push(durationSec);
 
-        // Stop Rust recording if active
-        try { this.ep!.stopRecording(sessionId); } catch {}
-
-        // Log usage
+        // Log usage and upload session report
         if (ctx.session) {
           try {
             const usage = (ctx.session as any).usage;
@@ -549,11 +572,46 @@ export class AgentServer {
               console.log(`Call ${sessionId} usage:`, JSON.stringify(usage));
             }
           } catch {}
-        }
 
-        // Close session
-        if (ctx.session) {
-          try { await (ctx.session as any).close(); } catch {}
+          // Wait for natural session close (preserves in-flight LLM/TTS responses in history)
+          // The participant_disconnected event triggers _close_soon() which does a graceful close.
+          try {
+            await new Promise<void>((resolve) => {
+              const timer = setTimeout(resolve, 5000);
+              ctx.session.on('close', () => { clearTimeout(timer); resolve(); });
+            });
+          } catch {
+            try { await (ctx.session as any).close(); } catch {}
+          }
+
+          // Stop recording and wait for file to be finalized
+          try { this.ep!.stopRecording(sessionId); } catch {}
+          const recPath = `${sessionDir}/recording_${sessionId}.ogg`;
+          for (let i = 0; i < 20; i++) {
+            if (existsSync(recPath)) break; await new Promise(r => setTimeout(r, 100));
+          }
+
+          // Upload session report (transcript, audio, metrics)
+          try {
+            await uploadReport({
+              agentName: this.agentName,
+              session: ctx.session,
+              callId: sessionId,
+              accountId: ctx.accountId,
+              recordingPath: recPath,
+              recordingStartedAt: Date.now() / 1000,
+              transport: 'sip',
+            });
+          } catch (e) {
+            console.warn(`Failed to upload session report for call ${sessionId}:`, e);
+          }
+
+          // Clean up local recording after upload attempt
+          if (getObservabilityUrl()) {
+            try { const { unlinkSync } = await import('node:fs'); unlinkSync(recPath); } catch (e) {
+              console.warn(`Failed to clean up recording ${recPath}:`, e);
+            }
+          }
         }
 
         // Hangup
@@ -571,7 +629,7 @@ export class AgentServer {
     };
 
     const callPromise = runCall();
-    this.activeCalls.set(sessionId, { promise: callPromise, resolveEnded, room: ctx.room });
+    this.activeCalls.set(sessionId, { promise: callPromise, resolveEnded, room: ctx.room, ctx });
   }
 
   // ─── HTTP server ────────────────────────────────────────────────

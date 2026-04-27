@@ -105,8 +105,10 @@ impl AudioStreamEndpoint {
     pub fn send_audio_with_callback(&self, session_id: &str, frame: &AudioFrame, on_complete: CompletionCallback) -> Result<()> {
         let (audio_buf, resampler) = {
             let s = self.sessions.lock_or_recover();
-            let sess = s.get(session_id).ok_or_else(|| EndpointError::CallNotActive(session_id.to_string()))?;
-            (sess.audio_buf.clone(), sess.input_resampler.clone())
+            match s.get(session_id) {
+                Some(sess) => (sess.audio_buf.clone(), sess.input_resampler.clone()),
+                None => return Ok(()),
+            }
         };
         let target_rate = self.config.output_sample_rate;
         if frame.sample_rate != 0 && frame.sample_rate != target_rate {
@@ -144,8 +146,10 @@ impl AudioStreamEndpoint {
     pub fn send_background_audio(&self, session_id: &str, frame: &AudioFrame) -> Result<()> {
         let bg_buf = {
             let s = self.sessions.lock_or_recover();
-            let sess = s.get(session_id).ok_or_else(|| EndpointError::CallNotActive(session_id.to_string()))?;
-            sess.bg_audio_buf.clone()
+            match s.get(session_id) {
+                Some(sess) => sess.bg_audio_buf.clone(),
+                None => return Ok(()),
+            }
         };
         bg_buf.push_no_backpressure(&frame.data);
         Ok(())
@@ -207,7 +211,10 @@ impl AudioStreamEndpoint {
     /// Any audio already in the WS send queue will be overridden by the provider's clear.
     pub fn clear_buffer(&self, session_id: &str) -> Result<()> {
         let s = self.sessions.lock_or_recover();
-        let sess = s.get(session_id).ok_or_else(|| EndpointError::CallNotActive(session_id.to_string()))?;
+        let sess = match s.get(session_id) {
+            Some(s) => s,
+            None => return Ok(()),
+        };
         sess.audio_buf.clear();
         // Reset resampler to prevent stale filter artifacts on next speech
         *sess.input_resampler.lock_or_recover() = None;
@@ -231,7 +238,10 @@ impl AudioStreamEndpoint {
 
     pub fn checkpoint(&self, session_id: &str, name: Option<&str>) -> Result<String> {
         let s = self.sessions.lock_or_recover();
-        let sess = s.get(session_id).ok_or_else(|| EndpointError::CallNotActive(session_id.to_string()))?;
+        let sess = match s.get(session_id) {
+            Some(s) => s,
+            None => return Ok(String::new()),
+        };
         let cp_name = name.map(String::from).unwrap_or_else(|| {
             format!("cp-{}", sess.checkpoint_counter.fetch_add(1, Ordering::Relaxed))
         });
@@ -246,18 +256,21 @@ impl AudioStreamEndpoint {
     /// so Plivo's playedStream confirms when ALL audio has actually been played.
     pub fn flush(&self, session_id: &str) -> Result<()> {
         let s = self.sessions.lock_or_recover();
-        let sess = s.get(session_id).ok_or_else(|| EndpointError::CallNotActive(session_id.to_string()))?;
-        let cp_name = format!("cp-{}", sess.checkpoint_counter.fetch_add(1, Ordering::Relaxed));
-        *sess.pending_flush.lock_or_recover() = Some(cp_name.clone());
-        debug!("Flush: checkpoint '{}' queued for session {} (send loop will send after drain)", cp_name, session_id);
+        if let Some(sess) = s.get(session_id) {
+            let cp_name = format!("cp-{}", sess.checkpoint_counter.fetch_add(1, Ordering::Relaxed));
+            *sess.pending_flush.lock_or_recover() = Some(cp_name.clone());
+            debug!("Flush: checkpoint '{}' queued for session {} (send loop will send after drain)", cp_name, session_id);
+        }
         Ok(())
     }
 
     pub fn wait_for_playout(&self, session_id: &str, timeout_ms: u64) -> Result<bool> {
         let notify = {
             let s = self.sessions.lock_or_recover();
-            let sess = s.get(session_id).ok_or_else(|| EndpointError::CallNotActive(session_id.to_string()))?;
-            sess.checkpoint_notify.clone()
+            match s.get(session_id) {
+                Some(sess) => sess.checkpoint_notify.clone(),
+                None => return Ok(true),
+            }
         };
         let (lock, cvar) = &*notify;
         let guard = lock.lock_or_recover();
