@@ -54,6 +54,19 @@ class AudioRecorder(AudioBufferProcessor):
             enable_turn_audio=enable_turn_audio,
             **kwargs,
         )
+        # When ``path`` is omitted, fall back to the path the server
+        # transport allocated for observability (set when
+        # AGENT_OBSERVABILITY_URL is configured). With no path from either
+        # source, the processor degrades to a plain AudioBufferProcessor.
+        # We also publish the chosen path back onto the transport so the
+        # server transport's end-of-session upload finds the correct file
+        # even when the user picked their own path.
+        if path is None:
+            path = getattr(transport, "recording_path", None)
+        try:
+            transport.recording_path = path
+        except Exception:
+            pass
         self._transport = transport
         self._path = path
         self._stereo = stereo

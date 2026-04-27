@@ -22,6 +22,22 @@ function buildAuthHeaders(): Record<string, string> {
   return { Authorization: `Basic ${credentials}` };
 }
 
+export function normalizeRecordingStartedAt(recordingStartedAt?: number): number {
+  if (
+    recordingStartedAt == null ||
+    !Number.isFinite(recordingStartedAt) ||
+    recordingStartedAt <= 0
+  ) {
+    return 0;
+  }
+
+  // The observability server expects epoch seconds. Keep accepting epoch
+  // milliseconds defensively because earlier Node callers passed Date.now().
+  return recordingStartedAt > 100_000_000_000
+    ? recordingStartedAt / 1000
+    : recordingStartedAt;
+}
+
 /**
  * Extract primitive scalar fields from AgentSession.options so the session
  * report carries the configuration that shaped the call (VAD settings, turn
@@ -114,7 +130,7 @@ export async function uploadReport(options: {
   const headerPayload: Record<string, unknown> = {
     session_id: callId,
     room_tags: roomTags,
-    start_time: report.audioRecordingStartedAt ?? 0,
+    start_time: normalizeRecordingStartedAt(report.audioRecordingStartedAt),
   };
   if (transport) {
     headerPayload.transport = transport;

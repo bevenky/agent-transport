@@ -612,7 +612,7 @@ export class AgentServer {
                 callId: sessionId,
                 accountId: ctx.accountId,
                 recordingPath: recPath ?? undefined,
-                recordingStartedAt: Date.now(),
+                recordingStartedAt: Date.now() / 1000,
                 transport: 'sip',
               });
             } catch (e) {

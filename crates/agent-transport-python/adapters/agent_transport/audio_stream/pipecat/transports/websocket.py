@@ -24,6 +24,7 @@ Usage:
 
 import asyncio
 import inspect
+import os
 import platform
 import time
 from dataclasses import dataclass, field
@@ -40,6 +41,12 @@ except ImportError:
 
 from ..audio_stream_transport import AudioStreamTransport
 from ..serializers.plivo import PlivoFrameSerializer
+from ....observability import (
+    SessionRecorder,
+    upload_session_report,
+    _get_observability_url,
+    _recording_dir,
+)
 
 try:
     import prometheus_client
@@ -215,6 +222,10 @@ class WebsocketServerTransport:
         )
         logger.info("WebSocket server listening on ws://{}", self._listen_addr)
 
+        startup_obs_url = _get_observability_url()
+        if startup_obs_url:
+            logger.info("Observability enabled, target {}", startup_obs_url)
+
         # Start HTTP server if aiohttp available and port configured
         http_task = None
         if HAS_AIOHTTP and self._http_port:
@@ -320,6 +331,42 @@ class WebsocketServerTransport:
             _event_queue=event_queue,
         )
 
+        # Observability hookup — gated on AGENT_OBSERVABILITY_URL.
+        # See sip/pipecat/transports/sip.py for the matching SIP wiring.
+        obs_url = _get_observability_url()
+        recording_path: Optional[str] = None
+        recording_started_at: Optional[float] = None
+        if obs_url:
+            try:
+                rec_dir = _recording_dir()
+                os.makedirs(rec_dir, exist_ok=True)
+                recording_path = os.path.join(rec_dir, f"recording_{session_id}.ogg")
+                recording_started_at = time.time()
+            except Exception:
+                logger.warning("Failed to prepare recording dir for {}", session_id, exc_info=True)
+                recording_path = None
+                recording_started_at = None
+        transport.recording_path = recording_path
+        transport.recording_started_at = recording_started_at
+        # Pre-populate the recorder's options with framework-known facts so
+        # the dashboard's Config tab has useful content even when the
+        # handler doesn't pass anything extra.
+        baseline_options: dict = {
+            "transport": "audio_stream",
+            "audio_sample_rate": self._sample_rate,
+            "session_id": session_id,
+        }
+        if session_data.get("call_uuid"):
+            baseline_options["call_uuid"] = session_data["call_uuid"]
+        if session_data.get("extra_headers"):
+            baseline_options["extra_headers"] = session_data["extra_headers"]
+        transport.session_recorder = (
+            SessionRecorder(options=baseline_options) if obs_url else None
+        )
+        # Multi-tenancy hook — same contract as LiveKit's ctx.account_id:
+        # handlers set this per session and the observability upload includes it.
+        transport.account_id = None
+
         task = asyncio.create_task(self._run_session(session_id, transport))
         self._active_sessions[session_id] = task
         self._session_start_times[session_id] = time.monotonic()
@@ -346,6 +393,49 @@ class WebsocketServerTransport:
             if HAS_PROMETHEUS:
                 RUNNING_SESSIONS_GAUGE.dec()
                 STREAM_SESSION_DURATION.observe(duration)
+
+            # Observability upload + cleanup — same shape as the SIP server.
+            obs_url = _get_observability_url()
+            recorder = getattr(transport, "session_recorder", None)
+            recording_path = getattr(transport, "recording_path", None)
+            recording_started_at = getattr(transport, "recording_started_at", None)
+            logger.debug(
+                "Observability gate for {}: obs_url_set={}, recorder_set={}, "
+                "recording_path={}",
+                session_id, bool(obs_url), recorder is not None, recording_path,
+            )
+            if obs_url and recorder is not None:
+                if recording_path:
+                    for _ in range(20):
+                        if os.path.exists(recording_path):
+                            break
+                        await asyncio.sleep(0.1)
+                try:
+                    await upload_session_report(
+                        recorder=recorder,
+                        session_id=session_id,
+                        obs_url=obs_url,
+                        recording_path=recording_path,
+                        recording_started_at=recording_started_at,
+                        account_id=getattr(transport, "account_id", None),
+                        transport="audio_stream",
+                    )
+                except Exception:
+                    logger.warning(
+                        "Failed to upload session report for {}",
+                        session_id, exc_info=True,
+                    )
+                if recording_path:
+                    try:
+                        os.remove(recording_path)
+                    except FileNotFoundError:
+                        pass
+                    except Exception:
+                        logger.warning(
+                            "Failed to clean up recording {}",
+                            recording_path, exc_info=True,
+                        )
+
             logger.info("Session {} ended ({:.1f}s)", session_id, duration)
 
     # ── HTTP server ──────────────────────────────────────────────────────

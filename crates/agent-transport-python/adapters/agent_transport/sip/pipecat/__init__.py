@@ -10,6 +10,7 @@ from .sip_transport import SipTransport, SipInputTransport, SipOutputTransport
 from .transports.sip import SipServerTransport, SipServerParams
 from .processors import AudioRecorder
 from .mixers import SoundfileMixer
+from ...observability import SessionRecorder
 
 __all__ = [
     "SipTransport",
@@ -19,4 +20,5 @@ __all__ = [
     "SipServerParams",
     "AudioRecorder",
     "SoundfileMixer",
+    "SessionRecorder",
 ]
