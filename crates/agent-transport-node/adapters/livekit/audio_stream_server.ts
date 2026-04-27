@@ -482,7 +482,7 @@ export class AudioStreamServer {
               callId: sessionId,
               accountId: ctx.accountId,
               recordingPath: recPath,
-              recordingStartedAt: Date.now(),
+              recordingStartedAt: Date.now() / 1000,
               transport: 'audio_stream',
             });
           } catch (e) {
