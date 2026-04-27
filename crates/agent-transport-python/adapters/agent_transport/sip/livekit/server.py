@@ -935,10 +935,13 @@ class AgentServer:
             SIP_CALLS_TOTAL.labels(nodename=node, direction=direction).inc()
             call_start = time.monotonic()
 
-            # Start recording if enabled
+            # Start recording if enabled — only when observability is configured,
+            # since the recording's only purpose is to be uploaded as part of the
+            # session report. Without observability there's nowhere to send it
+            # and nothing would clean up the file.
             rec_path = None
             rec_started_at = None
-            if self._recording:
+            if self._recording and _get_observability_url():
                 try:
                     os.makedirs(self._recording_dir, exist_ok=True)
                     rec_path = os.path.join(self._recording_dir, f"recording_{session_id}.ogg")
@@ -1001,18 +1004,20 @@ class AgentServer:
                         except Exception:
                             pass
 
-                    # Upload session report after session close so history is complete
+                    # Upload session report after session close so history is complete.
+                    # Cleanup runs in finally so the on-disk recording is always removed
+                    # after an upload attempt — including when the upload fails.
                     obs_url = _get_observability_url()
-                    if obs_url:
-                        try:
-                            await self._upload_report(
-                                ctx._session, session_id, obs_url, rec_path, rec_started_at,
-                                account_id=ctx.account_id,
-                            )
-                        except Exception:
-                            logger.warning("Failed to upload session report for call %s", session_id, exc_info=True)
-
-                        # Clean up local recording after upload attempt
+                    try:
+                        if obs_url:
+                            try:
+                                await self._upload_report(
+                                    ctx._session, session_id, obs_url, rec_path, rec_started_at,
+                                    account_id=ctx.account_id,
+                                )
+                            except Exception:
+                                logger.warning("Failed to upload session report for call %s", session_id, exc_info=True)
+                    finally:
                         if rec_path:
                             try:
                                 os.remove(rec_path)

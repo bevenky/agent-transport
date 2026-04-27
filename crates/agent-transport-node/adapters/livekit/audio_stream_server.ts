@@ -396,6 +396,7 @@ export class AudioStreamServer {
       const sessionStart = performance.now();
 
       const sessionDir = `/tmp/agent-sessions`;
+      let recPath: string | null = null;
       try {
         // Wrap in runWithJobContext
         let agents: any;
@@ -423,13 +424,21 @@ export class AudioStreamServer {
           await this.entrypointFn!(ctx);
         }
 
-        // Start Rust recording (stereo OGG/Opus at transport layer)
-        try {
-          const { mkdirSync } = await import('node:fs');
-          mkdirSync(sessionDir, { recursive: true });
-          this.ep!.startRecording(sessionId, `${sessionDir}/recording_${sessionId}.ogg`, true);
-          console.log(`Recording started: ${sessionDir}/recording_${sessionId}.ogg`);
-        } catch {}
+        // Start Rust recording (stereo OGG/Opus at transport layer) — only when
+        // observability is configured, since the recording's only purpose is to be
+        // uploaded as part of the session report. Without observability there's
+        // nowhere to send it and nothing would clean up the file.
+        if (getObservabilityUrl()) {
+          try {
+            const { mkdirSync } = await import('node:fs');
+            mkdirSync(sessionDir, { recursive: true });
+            recPath = `${sessionDir}/recording_${sessionId}.ogg`;
+            this.ep!.startRecording(sessionId, recPath, true);
+            console.log(`Recording started: ${recPath}`);
+          } catch {
+            recPath = null;
+          }
+        }
 
         // Hook user state changes for debug logging
         if (ctx.session) {
@@ -466,33 +475,37 @@ export class AudioStreamServer {
           }
 
           // Stop recording and wait for file to be finalized
-          try { this.ep!.stopRecording(sessionId); } catch {}
-          const recPath = `${sessionDir}/recording_${sessionId}.ogg`;
-          const { existsSync } = await import('node:fs');
-          for (let i = 0; i < 20; i++) {
-            if (existsSync(recPath)) break;
-            await new Promise(r => setTimeout(r, 100));
+          if (recPath) {
+            try { this.ep!.stopRecording(sessionId); } catch {}
+            const { existsSync } = await import('node:fs');
+            for (let i = 0; i < 20; i++) {
+              if (existsSync(recPath)) break;
+              await new Promise(r => setTimeout(r, 100));
+            }
           }
 
-          // Upload session report (transcript, audio, metrics)
+          // Upload session report (transcript, audio, metrics).
+          // Cleanup runs in finally so the on-disk recording is always removed
+          // after an upload attempt — including when the upload fails.
           try {
-            await uploadReport({
-              agentName: this.agentName,
-              session: ctx.session,
-              callId: sessionId,
-              accountId: ctx.accountId,
-              recordingPath: recPath,
-              recordingStartedAt: Date.now(),
-              transport: 'audio_stream',
-            });
-          } catch (e) {
-            console.warn(`Failed to upload session report for session ${sessionId}:`, e);
-          }
-
-          // Clean up local recording after upload attempt
-          if (getObservabilityUrl()) {
-            try { const { unlinkSync } = await import('node:fs'); unlinkSync(recPath); } catch (e) {
-              console.warn(`Failed to clean up recording ${recPath}:`, e);
+            try {
+              await uploadReport({
+                agentName: this.agentName,
+                session: ctx.session,
+                callId: sessionId,
+                accountId: ctx.accountId,
+                recordingPath: recPath ?? undefined,
+                recordingStartedAt: Date.now(),
+                transport: 'audio_stream',
+              });
+            } catch (e) {
+              console.warn(`Failed to upload session report for session ${sessionId}:`, e);
+            }
+          } finally {
+            if (recPath) {
+              try { const { unlinkSync } = await import('node:fs'); unlinkSync(recPath); } catch (e) {
+                console.warn(`Failed to clean up recording ${recPath}:`, e);
+              }
             }
           }
         }
