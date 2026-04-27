@@ -96,9 +96,42 @@ class AudioStreamInputTransport(BaseInputTransport):
     async def start(self, frame: StartFrame):
         if self._started:
             return
+        recorder = getattr(self._transport, "session_recorder", None)
+        if recorder is not None:
+            try:
+                from ....observability import enable_start_frame_metrics
+                enable_start_frame_metrics(frame)
+            except Exception:
+                logger.warning(
+                    "Failed to enable pipecat metrics for observability", exc_info=True,
+                )
         await super().start(frame)
         self._started = True
         await self.set_transport_ready(frame)
+        # Auto-attach the SessionRecorder as a pipeline observer so
+        # AGENT_OBSERVABILITY_URL just works without user-side wiring.
+        # FrameProcessor.setup() populates self._observer with the
+        # PipelineTask's TaskObserver, which exposes add_observer().
+        if recorder is not None and self._observer is not None:
+            try:
+                if recorder not in getattr(self._observer, "_observers", []):
+                    self._observer.add_observer(recorder)
+            except Exception:
+                logger.warning(
+                    "Failed to auto-attach SessionRecorder observer", exc_info=True,
+                )
+        if recorder is not None:
+            try:
+                from ....observability import populate_options_from_pipeline
+                populate_options_from_pipeline(recorder, self, frame)
+                logger.info(
+                    "Session options populated from pipeline ({} processors)",
+                    len(recorder._options.get("pipeline", [])),
+                )
+            except Exception:
+                logger.warning(
+                    "Failed to populate session options from pipeline", exc_info=True,
+                )
         self._recv_task = asyncio.create_task(self._recv_loop())
         self._event_task = asyncio.create_task(self._event_loop())
         await self._transport._call_event_handler("on_client_connected")

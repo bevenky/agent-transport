@@ -15,6 +15,7 @@ from .audio_stream_transport import (
 )
 from .mixers import SoundfileMixer
 from .processors import AudioRecorder
+from ...observability import SessionRecorder
 
 __all__ = [
     "PlivoFrameSerializer",
@@ -25,4 +26,5 @@ __all__ = [
     "AudioStreamOutputTransport",
     "SoundfileMixer",
     "AudioRecorder",
+    "SessionRecorder",
 ]
