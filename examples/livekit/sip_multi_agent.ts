@@ -222,6 +222,8 @@ class SupportAgent extends voice.Agent<CallData> {
 // ─── Server ──────────────────────────────────────────────────────
 
 server.sipSession(async (ctx: JobContext) => {
+  ctx.setMetadata({ account_id: process.env.AGENT_ACCOUNT_ID ?? 'demo-account' });
+
   const session = new voice.AgentSession<CallData>({
     vad: ctx.proc.userData.vad as silero.VAD,
     stt: new deepgram.STT({ model: 'nova-3' }),

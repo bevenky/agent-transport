@@ -507,36 +507,20 @@ export class AgentServer {
       callEnded,
       resolveCallEnded: resolveEnded,
       proc: this.proc,
+      inferenceExecutor: this.inferenceExecutor,
+      enableRecording: false,
     });
 
     const runCall = async () => {
       this.sipCallsTotal[direction]++;
       const callStart = performance.now();
 
-      const sessionDir = `/tmp/agent-sessions`;
-      let recPath: string | null = null;
+      const sessionDir = ctx.sessionDirectory;
+      let recPath: string | undefined;
+      let recordingStartedAt: number | undefined;
       try {
-        // Wrap in runWithJobContext so getJobContext().room works inside handler
-        // (matches LiveKit WebRTC where entrypoint runs inside job context)
-        const stub = {
-          room: ctx.room,
-          job: { id: `job-${sessionId}`, agentName: this.agentName, enableRecording: false, room: { sid: ctx.room.sid, name: ctx.room.name } },
-          _primaryAgentSession: undefined as any,
-          sessionDirectory: sessionDir,
-          proc: { executorType: null },
-          inferenceExecutor: this.inferenceExecutor,
-          initRecording: () => {},
-          connect: async () => {},
-          addShutdownCallback: () => {},
-          shutdown: () => {},
-          is_fake_job: () => false,
-          isFakeJob: () => false,
-          worker_id: 'local',
-          workerId: 'local',
-        };
-
         if (runWithJobContext) {
-          await runWithJobContext(stub as any, () => this.entrypointFn!(ctx));
+          await runWithJobContext(ctx as any, () => this.entrypointFn!(ctx));
         } else {
           await this.entrypointFn!(ctx);
         }
@@ -557,9 +541,11 @@ export class AgentServer {
           try {
             mkdirSync(sessionDir, { recursive: true });
             recPath = `${sessionDir}/recording_${sessionId}.ogg`;
+            recordingStartedAt = Date.now();
             this.ep!.startRecording(sessionId, recPath, true);
           } catch {
-            recPath = null;
+            recPath = undefined;
+            recordingStartedAt = undefined;
           }
         }
 
@@ -605,19 +591,19 @@ export class AgentServer {
           // Cleanup runs in finally so the on-disk recording is always removed
           // after an upload attempt — including when the upload fails.
           try {
-            try {
-              await uploadReport({
-                agentName: this.agentName,
-                session: ctx.session,
-                callId: sessionId,
-                accountId: ctx.accountId,
-                recordingPath: recPath ?? undefined,
-                recordingStartedAt: Date.now(),
-                transport: 'sip',
-              });
-            } catch (e) {
-              console.warn(`Failed to upload session report for call ${sessionId}:`, e);
-            }
+            await uploadReport({
+              agentName: this.agentName,
+              session: ctx.session,
+              callId: sessionId,
+              accountId: ctx.accountId,
+              metadata: ctx.metadata,
+              direction: ctx.direction,
+              recordingPath: recPath,
+              recordingStartedAt,
+              transport: 'sip',
+            });
+          } catch (e) {
+            console.warn(`Failed to upload session report for call ${sessionId}:`, e);
           } finally {
             if (recPath) {
               try { const { unlinkSync } = await import('node:fs'); unlinkSync(recPath); } catch (e) {
