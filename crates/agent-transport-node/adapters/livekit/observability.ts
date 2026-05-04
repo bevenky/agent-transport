@@ -191,11 +191,59 @@ function buildOtlpJsonPayload(
   };
 }
 
+function camelToSnake(key: string): string {
+  return key.replace(/[A-Z]/g, (c) => `_${c.toLowerCase()}`);
+}
+
+function snakeifyKeys(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(snakeifyKeys);
+  if (value && typeof value === 'object') {
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+      out[camelToSnake(k)] = snakeifyKeys(v);
+    }
+    return out;
+  }
+  return value;
+}
+
+// LiveKit's Node SDK serializes events with `events.push({ ...event })`, so the
+// objects keep camelCase keys and ms-epoch `createdAt` values native to JS.
+// The Python SDK ships snake_case + float-seconds via Pydantic. The obs UI is
+// keyed off the Python wire format, so we normalize Node events to match.
+function normalizeEvents(events: unknown[]): unknown[] {
+  return events.map((event) => {
+    const snake = snakeifyKeys(event) as Record<string, unknown>;
+    if (typeof snake.created_at === 'number' && snake.created_at > 1e12) {
+      snake.created_at = snake.created_at / 1000;
+    }
+    if (snake.type === 'speech_created') {
+      delete snake.speech_handle;
+    }
+    const item = snake.item;
+    if (item && typeof item === 'object' && !Array.isArray(item)) {
+      const i = item as Record<string, unknown>;
+      if (typeof i.created_at === 'number' && i.created_at > 1e12) {
+        i.created_at = i.created_at / 1000;
+      }
+      // Python omits empty agent ids on the first handoff; the UI expects
+      // `from != null` to be a real predicate, so coerce "" → null.
+      if (i.old_agent_id === '') delete i.old_agent_id;
+      if (i.new_agent_id === '') delete i.new_agent_id;
+    }
+    return snake;
+  });
+}
+
 export function buildOtlpLogRecords(
   report: voice.SessionReport,
   agentName: string,
   roomTags: Record<string, string>,
 ): OtlpLogRecord[] {
+  const sessionReportJson = voice.sessionReportToJSON(report) as Record<string, unknown>;
+  if (Array.isArray(sessionReportJson.events)) {
+    sessionReportJson.events = normalizeEvents(sessionReportJson.events);
+  }
   return [
     {
       body: 'session report',
@@ -204,7 +252,7 @@ export function buildOtlpLogRecords(
         room_id: report.roomId,
         job_id: report.jobId,
         'logger.name': 'chat_history',
-        'session.report': voice.sessionReportToJSON(report),
+        'session.report': sessionReportJson,
         agent_name: agentName,
         sdk_version: sdkVersion,
         room_tags: roomTags,
@@ -319,7 +367,10 @@ export async function uploadReport(options: {
   const authHeaders = await buildBearerAuthHeaders();
 
   console.log(`Uploading native LiveKit observability for ${callId} to ${obsUrl} (account_id=${accountId})`);
-  await uploadOtlpLogs(obsUrl, authHeaders, report, buildOtlpLogRecords(report, agentName, roomTags));
+  // Recording callback creates the agent_transport_sessions row; OTLP merges
+  // events/options/usage onto it via UPDATE. If OTLP arrives first the UPDATE
+  // no-ops and the patch is lost, leaving raw_report with only chat_history.
   await uploadRecordingCallback(obsUrl, authHeaders, report, roomTags);
+  await uploadOtlpLogs(obsUrl, authHeaders, report, buildOtlpLogRecords(report, agentName, roomTags));
   console.log(`Native LiveKit observability uploaded for ${callId}`);
 }
