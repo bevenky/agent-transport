@@ -14,6 +14,7 @@
  */
 
 import type { SipEndpoint } from 'agent-transport';
+import { mkdirSync } from 'node:fs';
 import { SipAudioInput } from './sip_audio_input.js';
 import { SipAudioOutput } from './sip_audio_output.js';
 import { TransportRoom } from './livekit_adapters.js';
@@ -29,6 +30,9 @@ export interface JobContextOptions {
   callEnded: Promise<void>;
   resolveCallEnded: () => void;
   proc?: JobProcess;
+  inferenceExecutor?: unknown;
+  enableRecording?: boolean;
+  sessionDirectory?: string;
 }
 
 export class JobContext {
@@ -39,16 +43,26 @@ export class JobContext {
   readonly userdata: Record<string, unknown>;
   readonly room: TransportRoom;
   readonly proc: JobProcess;
+  readonly job: { id: string; agentName: string; enableRecording: boolean; room: TransportRoom };
+  readonly workerId = 'local';
+  readonly sessionDirectory: string;
+  readonly inferenceExecutor: unknown;
+  metadata: Record<string, unknown> = {};
 
   /** Account ID for multi-tenancy — set by the consumer per session. */
   accountId: string | undefined;
 
+  /** @internal Primary AgentSession used by LiveKit job-context helpers. */
+  _primaryAgentSession: any = undefined;
+
   private _session: any = null;
   private _callEnded: Promise<void>;
   private _resolveCallEnded: () => void;
-  private _shutdownCallbacks: Array<() => void | Promise<void>> = [];
+  private _shutdownCallbacks: Array<(reason?: string) => void | Promise<void>> = [];
+  private _shutdownCallbacksFired = false;
 
   constructor(opts: JobContextOptions) {
+    const agentName = opts.agentName ?? 'sip-agent';
     this.sessionId = opts.sessionId;
     this.remoteUri = opts.remoteUri;
     this.direction = opts.direction;
@@ -57,12 +71,21 @@ export class JobContext {
     this.userdata = opts.userdata;
     this._callEnded = opts.callEnded;
     this._resolveCallEnded = opts.resolveCallEnded;
+    this.inferenceExecutor = opts.inferenceExecutor;
+    this.sessionDirectory = opts.sessionDirectory ?? '/tmp/agent-sessions';
+    try { mkdirSync(this.sessionDirectory, { recursive: true }); } catch {}
 
     // Create Room facade
     this.room = new TransportRoom(opts.endpoint as any, opts.sessionId, {
-      agentName: opts.agentName ?? 'sip-agent',
+      agentName,
       callerIdentity: opts.remoteUri,
     });
+    this.job = {
+      id: `job-${opts.sessionId}`,
+      agentName,
+      enableRecording: opts.enableRecording ?? false,
+      room: this.room,
+    };
   }
 
   get session(): any {
@@ -83,6 +106,7 @@ export class JobContext {
       );
     }
     this._session = session;
+    this._primaryAgentSession = session;
 
     // Wire SIP audio I/O before session.start() is called
     session.input.audio = new SipAudioInput(this.endpoint, this.sessionId);
@@ -117,16 +141,36 @@ export class JobContext {
     // Listen to session close event — handles agent-initiated shutdown
     session.on('close', async () => {
       console.log(`Call ${this.sessionId} session closed`);
-      for (const cb of this._shutdownCallbacks) {
-        try { await cb(); } catch {}
-      }
+      await this.runShutdownCallbacks('session closed');
       this._resolveCallEnded();
       try { this.endpoint.hangup(this.sessionId); } catch {}
     });
   }
 
-  addShutdownCallback(callback: () => void | Promise<void>): void {
+  setMetadata(metadata: Record<string, unknown>): void {
+    for (const [key, value] of Object.entries(metadata)) {
+      if (value !== undefined && value !== null) {
+        this.metadata[key] = value;
+      }
+    }
+
+    const accountId = this.metadata.account_id ?? this.metadata.accountId;
+    if (accountId !== undefined && accountId !== null) {
+      this.accountId = String(accountId);
+      this.metadata.account_id = this.accountId;
+    }
+  }
+
+  addShutdownCallback(callback: (reason?: string) => void | Promise<void>): void {
     this._shutdownCallbacks.push(callback);
+  }
+
+  private async runShutdownCallbacks(reason: string): Promise<void> {
+    if (this._shutdownCallbacksFired) return;
+    this._shutdownCallbacksFired = true;
+    for (const cb of this._shutdownCallbacks) {
+      try { await cb(reason); } catch {}
+    }
   }
 
   /**
@@ -147,16 +191,7 @@ export class JobContext {
     console.log(`Call ${this.sessionId} JobContext.shutdown(reason=${JSON.stringify(reason)})`);
     // Fire user callbacks — fire-and-forget (shutdown() is sync for
     // API parity with LiveKit's JobContext).
-    for (const cb of this._shutdownCallbacks) {
-      try {
-        const r = cb();
-        if (r && typeof (r as any).then === 'function') {
-          (r as Promise<unknown>).catch(() => {});
-        }
-      } catch {
-        /* best-effort */
-      }
-    }
+    this.runShutdownCallbacks(reason).catch(() => {});
     try {
       this.endpoint.hangup(this.sessionId);
     } catch {
@@ -187,5 +222,21 @@ export class JobContext {
   /** @internal Wait for call to end — called by server after entrypoint returns */
   get callEnded(): Promise<void> {
     return this._callEnded;
+  }
+
+  isFakeJob(): boolean {
+    return false;
+  }
+
+  is_fake_job(): boolean {
+    return false;
+  }
+
+  async connect(): Promise<void> {
+    // The SIP transport is already connected by the time the agent starts.
+  }
+
+  initRecording(): void {
+    // agent-transport owns mixed transport recording; LiveKit RecorderIO is disabled.
   }
 }

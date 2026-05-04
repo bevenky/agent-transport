@@ -1,80 +1,82 @@
-"""Observability for agent-transport.
+"""Observability upload integration for agent-transport.
 
-Uploads a session report (transcript + events + config + audio) to the Plivo
-observability server at call end. Basic auth via AGENT_OBSERVABILITY_USER /
-AGENT_OBSERVABILITY_PASS (optional — request is sent without auth if unset).
+The Python LiveKit SDK owns the native observability protocol: protobuf
+recording uploads, OTLP log records, Tagger outcomes, and JudgeGroup results.
+agent-transport only adapts its SIP/audio_stream JobContext into the SDK's
+SessionReport shape, attaches transport tags through the SDK Tagger, and then
+delegates upload to LiveKit's telemetry helpers.
 
-Set AGENT_OBSERVABILITY_URL to enable.
+Set AGENT_OBSERVABILITY_URL plus LIVEKIT_API_KEY / LIVEKIT_API_SECRET to enable
+native SDK uploads. The API key/secret are shared with agent-observability so it
+can validate the SDK Bearer JWT locally.
 """
+
+from __future__ import annotations
 
 import logging
 import os
+from typing import Any
 
 logger = logging.getLogger("agent_transport.observability")
+
+_sdk_upload_lock = None
+_sdk_upload_lock_loop = None
+
+
+def _get_sdk_upload_lock():
+    import asyncio
+
+    global _sdk_upload_lock, _sdk_upload_lock_loop
+    loop = asyncio.get_running_loop()
+    if _sdk_upload_lock is None or _sdk_upload_lock_loop is not loop:
+        _sdk_upload_lock = asyncio.Lock()
+        _sdk_upload_lock_loop = loop
+    return _sdk_upload_lock
 
 
 def _get_observability_url() -> str | None:
     return os.environ.get("AGENT_OBSERVABILITY_URL")
 
 
-def _build_auth_header() -> dict[str, str]:
-    """Build basic auth header from env vars. Returns empty dict if not configured."""
-    import base64
-    user = os.environ.get("AGENT_OBSERVABILITY_USER")
-    password = os.environ.get("AGENT_OBSERVABILITY_PASS")
-    if not user or not password:
-        return {}
-    credentials = base64.b64encode(f"{user}:{password}".encode()).decode()
-    return {"Authorization": f"Basic {credentials}"}
+def _ensure_transport_tags(
+    tagger: Any,
+    *,
+    account_id: str | None,
+    transport: str | None,
+    direction: str | None,
+    agent_name: str,
+    metadata: dict[str, Any] | None = None,
+) -> None:
+    add = getattr(tagger, "add", None)
+    if not callable(add):
+        return
 
-
-def _build_report_dict(session, session_id: str) -> dict:
-    """Build session report dict from session fields directly."""
-    import time
-
-    events = [
-        e.model_dump() if hasattr(e, "model_dump") else dict(e)
-        for e in (session._recorded_events or [])
-        if getattr(e, "type", None) not in ("metrics_collected", "session_usage_updated")
-    ]
-
-    chat_history = session.history.copy() if hasattr(session.history, "copy") else session.history
-    if hasattr(chat_history, "to_dict"):
-        chat_history_dict = chat_history.to_dict(exclude_timestamp=False)
-    elif hasattr(chat_history, "toJSON"):
-        chat_history_dict = chat_history.toJSON(exclude_timestamp=False)
-    else:
-        chat_history_dict = {"items": list(chat_history) if chat_history else []}
-
-    options = session.options
-    options_dict = {}
-    for k, v in vars(options).items():
-        if k.startswith("_"):
-            continue
-        if isinstance(v, (str, int, float, bool, type(None))):
-            options_dict[k] = v
-
-    usage = None
-    if session.usage and hasattr(session.usage, "model_usage") and session.usage.model_usage:
-        usage = []
-        for u in session.usage.model_usage:
-            entry = u.model_dump() if hasattr(u, "model_dump") else dict(u) if hasattr(u, "__dict__") else {}
-            usage.append({k: v for k, v in entry.items() if v not in (0, None, "")})
-
-    return {
-        "job_id": str(session_id),
-        "room_id": str(session_id),
-        "room": str(session_id),
-        "events": events,
-        "chat_history": chat_history_dict,
-        "options": options_dict,
-        "timestamp": time.time(),
-        "usage": usage,
+    session_metadata = {
+        **(metadata or {}),
+        "agent_name": agent_name,
+        **({"account_id": account_id} if account_id else {}),
+        **({"transport": transport} if transport else {}),
+        **({"direction": direction} if direction else {}),
     }
+
+    add("agent.session", metadata=session_metadata)
+    add(f"agent.name:{agent_name}", metadata={"agent_name": agent_name})
+    if account_id:
+        add(f"account_id:{account_id}", metadata={"account_id": account_id})
+    if transport:
+        add(f"transport:{transport}", metadata={"transport": transport})
+    if direction:
+        add(f"direction:{direction}", metadata={"direction": direction})
+
+
+def _get_sdk_tagger() -> Any:
+    from livekit.agents.observability import Tagger
+
+    return Tagger()
 
 
 async def upload_session_report(
-    session,
+    session: Any,
     session_id: str,
     obs_url: str,
     agent_name: str,
@@ -82,74 +84,70 @@ async def upload_session_report(
     recording_started_at: float | None = None,
     account_id: str | None = None,
     transport: str | None = None,
+    direction: str | None = None,
+    metadata: dict[str, Any] | None = None,
+    tagger: Any = None,
+    job_context: Any = None,
 ) -> None:
-    """Build a session report and upload it to the observability server.
-
-    Used by both AgentServer (SIP) and AudioStreamServer. `transport` is the
-    transport that carried the call — "sip" or "audio_stream".
-    """
-    import json
-    import aiohttp
-
-    has_audio = recording_path and os.path.exists(recording_path)
-    if recording_path:
-        logger.info(
-            "Recording path=%s exists=%s size=%s",
-            recording_path,
-            os.path.exists(recording_path),
-            os.path.getsize(recording_path) if os.path.exists(recording_path) else "N/A",
+    """Upload the session through LiveKit's native SDK telemetry helpers."""
+    if not os.environ.get("LIVEKIT_API_KEY") or not os.environ.get("LIVEKIT_API_SECRET"):
+        raise RuntimeError(
+            "LIVEKIT_API_KEY and LIVEKIT_API_SECRET are required for native "
+            "LiveKit observability uploads"
         )
 
-    room_tags = {}
-    if account_id:
-        room_tags["account_id"] = account_id
+    import aiohttp
+    from livekit.agents.telemetry.traces import (
+        _setup_cloud_tracer,
+        _shutdown_telemetry,
+        _upload_session_report,
+    )
 
-    header_payload = {
-        "session_id": str(session_id),
-        "room_tags": room_tags,
-        "start_time": recording_started_at or 0,
-    }
-    if transport:
-        header_payload["transport"] = transport
-    header = json.dumps(header_payload)
+    tagger = tagger or getattr(job_context, "tagger", None) or _get_sdk_tagger()
+    _ensure_transport_tags(
+        tagger,
+        account_id=account_id,
+        transport=transport,
+        direction=direction,
+        agent_name=agent_name,
+        metadata=metadata,
+    )
 
-    report_dict = _build_report_dict(session, session_id)
-    chat_history_json = json.dumps(report_dict)
+    make_report = getattr(job_context, "make_session_report", None)
+    if not callable(make_report):
+        raise RuntimeError("job_context with make_session_report is required for native upload")
 
-    mp = aiohttp.MultipartWriter("form-data")
+    report = make_report(
+        session,
+        recording_path=recording_path,
+        recording_started_at=recording_started_at,
+        recording_options={
+            "audio": bool(recording_path and os.path.exists(recording_path)),
+            "traces": False,
+            "logs": True,
+            "transcript": True,
+        },
+    )
 
-    part = mp.append(header)
-    part.set_content_disposition("form-data", name="header", filename="header.json")
-    part.headers["Content-Type"] = "application/json"
-    part.headers["Content-Length"] = str(len(header))
-
-    part = mp.append(chat_history_json)
-    part.set_content_disposition("form-data", name="chat_history", filename="chat_history.json")
-    part.headers["Content-Type"] = "application/json"
-    part.headers["Content-Length"] = str(len(chat_history_json))
-
-    if has_audio:
+    logger.info("Uploading native LiveKit session report for %s to %s", session_id, obs_url)
+    async with _get_sdk_upload_lock():
+        _setup_cloud_tracer(
+            room_id=report.room_id,
+            job_id=report.job_id,
+            observability_url=obs_url,
+            enable_traces=False,
+            enable_logs=True,
+        )
         try:
-            import aiofiles
-            async with aiofiles.open(recording_path, "rb") as f:
-                audio_bytes = await f.read()
-        except Exception:
-            audio_bytes = b""
-        if audio_bytes:
-            part = mp.append(audio_bytes)
-            part.set_content_disposition("form-data", name="audio", filename="recording.ogg")
-            part.headers["Content-Type"] = "audio/ogg"
-            part.headers["Content-Length"] = str(len(audio_bytes))
+            async with aiohttp.ClientSession() as http_session:
+                await _upload_session_report(
+                    agent_name=agent_name,
+                    observability_url=obs_url,
+                    report=report,
+                    tagger=tagger,
+                    http_session=http_session,
+                )
+        finally:
+            _shutdown_telemetry()
 
-    auth_headers = _build_auth_header()
-    upload_headers = {"Content-Type": mp.content_type, **auth_headers}
-
-    logger.info("Uploading session report for %s to %s (account_id=%s)", session_id, obs_url, account_id)
-    async with aiohttp.ClientSession() as http_session:
-        async with http_session.post(
-            f"{obs_url}/observability/recordings/v0",
-            data=mp,
-            headers=upload_headers,
-        ) as resp:
-            resp.raise_for_status()
-    logger.info("Session report uploaded for %s", session_id)
+    logger.info("Native LiveKit session report uploaded for %s", session_id)

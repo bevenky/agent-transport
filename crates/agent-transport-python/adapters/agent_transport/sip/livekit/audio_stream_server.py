@@ -46,9 +46,10 @@ from livekit.agents.utils import MovingAverage
 from .audio_stream_io import AudioStreamInput, AudioStreamOutput
 from ._room_facade import TransportRoom, create_transport_context
 from ._aio_utils import call_setup as _call_setup
+from .judging import EvaluationConfig, run_configured_judges
 from livekit.rtc.room import SipDTMF
 from .server import JobProcess
-from .observability import _get_observability_url
+from .observability import _ensure_transport_tags, _get_observability_url
 
 logger = logging.getLogger("agent_transport.audio_stream_server")
 
@@ -188,8 +189,12 @@ class JobContext:
     extra_headers: dict[str, str]
     endpoint: AudioStreamEndpoint
     userdata: dict[str, Any] = field(default_factory=dict)
+    metadata: dict[str, Any] = field(default_factory=dict)
+    """Session metadata to attach to native LiveKit observability tags."""
     account_id: str | None = None
     """Account ID for multi-tenancy — set by the consumer per session."""
+    evaluation: EvaluationConfig | None = None
+    """Post-conversation evaluation config for this session."""
 
     _agent_name: str = field(default="agent", repr=False)
     _session: Any = field(default=None, repr=False)
@@ -205,6 +210,26 @@ class JobContext:
     def session(self):
         return self._session
 
+    @property
+    def tagger(self):
+        return getattr(self._job_stub, "tagger", None)
+
+    def set_metadata(self, metadata: dict[str, Any]) -> None:
+        """Attach session metadata to native LiveKit observability tags."""
+        self.metadata.update({str(key): value for key, value in metadata.items() if value is not None})
+        if account_id := self.metadata.get("account_id"):
+            self.account_id = str(account_id)
+            self.metadata["account_id"] = self.account_id
+
+        _ensure_transport_tags(
+            self.tagger,
+            account_id=self.account_id,
+            transport="audio_stream",
+            direction=self.direction,
+            agent_name=self._agent_name,
+            metadata=self.metadata,
+        )
+
     @session.setter
     def session(self, session: Any) -> None:
         """Set the agent session — automatically wires audio stream I/O.
@@ -213,6 +238,8 @@ class JobContext:
         call session.start(agent=, room=ctx.room) directly.
         """
         self._session = session
+        if self._job_stub is not None:
+            self._job_stub._primary_agent_session = session
 
         # Wire audio stream I/O before session.start() is called
         session.input.audio = AudioStreamInput(self.endpoint, self.session_id)
@@ -758,7 +785,11 @@ class AudioStreamServer:
         )
         # Set on JobContext so get_job_context().room works inside handler
         job_stub, job_ctx_token = create_transport_context(
-            room, agent_name=self._agent_name)
+            room,
+            agent_name=self._agent_name,
+            inference_executor=getattr(self, "_inference_executor", None),
+            enable_recording=self._recording,
+        )
 
         ctx = JobContext(
             session_id=session_id,
@@ -844,11 +875,22 @@ class AudioStreamServer:
                     if obs_url:
                         try:
                             from .observability import upload_session_report
+                            await run_configured_judges(
+                                session=ctx._session,
+                                job_context=ctx._job_stub,
+                                evaluation=ctx.evaluation,
+                                session_id=session_id,
+                                logger=logger,
+                            )
                             await upload_session_report(
                                 ctx._session, session_id, obs_url, self._agent_name,
                                 rec_path, rec_started_at,
                                 account_id=ctx.account_id,
                                 transport="audio_stream",
+                                direction=ctx.direction,
+                                metadata=ctx.metadata,
+                                tagger=ctx.tagger,
+                                job_context=ctx._job_stub,
                             )
                         except Exception:
                             logger.warning("Failed to upload session report for session %s", session_id, exc_info=True)

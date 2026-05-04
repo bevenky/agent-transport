@@ -389,36 +389,20 @@ export class AudioStreamServer {
       callEnded,
       resolveCallEnded: resolveEnded,
       proc: this.proc,
+      inferenceExecutor: this.inferenceExecutor,
+      enableRecording: false,
     });
 
     const runSession = async () => {
       this.sessionCount++;
       const sessionStart = performance.now();
 
-      const sessionDir = `/tmp/agent-sessions`;
+      const sessionDir = ctx.sessionDirectory;
+      let recPath: string | undefined;
+      let recordingStartedAt: number | undefined;
       try {
-        // Wrap in runWithJobContext
-        let agents: any;
-        try { agents = await import('@livekit/agents'); } catch {}
-        const stub = {
-          room: ctx.room,
-          job: { id: `job-${sessionId}`, agentName: this.agentName, enableRecording: false, room: { sid: ctx.room.sid, name: ctx.room.name } },
-          _primaryAgentSession: undefined as any,
-          sessionDirectory: sessionDir,
-          proc: { executorType: null },
-          inferenceExecutor: this.inferenceExecutor,
-          initRecording: () => {},
-          connect: async () => {},
-          addShutdownCallback: () => {},
-          shutdown: () => {},
-          is_fake_job: () => false,
-          isFakeJob: () => false,
-          worker_id: 'local',
-          workerId: 'local',
-        };
-
-        if (agents?.runWithJobContext) {
-          await agents.runWithJobContext(stub, () => this.entrypointFn!(ctx));
+        if (runWithJobContext) {
+          await runWithJobContext(ctx as any, () => this.entrypointFn!(ctx));
         } else {
           await this.entrypointFn!(ctx);
         }
@@ -427,8 +411,10 @@ export class AudioStreamServer {
         try {
           const { mkdirSync } = await import('node:fs');
           mkdirSync(sessionDir, { recursive: true });
-          this.ep!.startRecording(sessionId, `${sessionDir}/recording_${sessionId}.ogg`, true);
-          console.log(`Recording started: ${sessionDir}/recording_${sessionId}.ogg`);
+          recPath = `${sessionDir}/recording_${sessionId}.ogg`;
+          recordingStartedAt = Date.now();
+          this.ep!.startRecording(sessionId, recPath, true);
+          console.log(`Recording started: ${recPath}`);
         } catch {}
 
         // Hook user state changes for debug logging
@@ -467,11 +453,12 @@ export class AudioStreamServer {
 
           // Stop recording and wait for file to be finalized
           try { this.ep!.stopRecording(sessionId); } catch {}
-          const recPath = `${sessionDir}/recording_${sessionId}.ogg`;
           const { existsSync } = await import('node:fs');
-          for (let i = 0; i < 20; i++) {
-            if (existsSync(recPath)) break;
-            await new Promise(r => setTimeout(r, 100));
+          if (recPath) {
+            for (let i = 0; i < 20; i++) {
+              if (existsSync(recPath)) break;
+              await new Promise(r => setTimeout(r, 100));
+            }
           }
 
           // Upload session report (transcript, audio, metrics)
@@ -481,8 +468,10 @@ export class AudioStreamServer {
               session: ctx.session,
               callId: sessionId,
               accountId: ctx.accountId,
+              metadata: ctx.metadata,
+              direction: ctx.direction,
               recordingPath: recPath,
-              recordingStartedAt: Date.now() / 1000,
+              recordingStartedAt,
               transport: 'audio_stream',
             });
           } catch (e) {
@@ -490,7 +479,7 @@ export class AudioStreamServer {
           }
 
           // Clean up local recording after upload attempt
-          if (getObservabilityUrl()) {
+          if (getObservabilityUrl() && recPath) {
             try { const { unlinkSync } = await import('node:fs'); unlinkSync(recPath); } catch (e) {
               console.warn(`Failed to clean up recording ${recPath}:`, e);
             }

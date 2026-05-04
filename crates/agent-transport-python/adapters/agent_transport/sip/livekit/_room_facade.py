@@ -500,34 +500,38 @@ class _StubJob:
 
 
 class _NoopTagger:
-    """No-op shim for livekit.agents Tagger.
-
-    LiveKit's `JobContext.tagger` returns a real Tagger instance for cloud
-    eval/analytics. We don't have cloud connectivity, so user code that
-    calls ctx.tagger.success() / .fail() / .add() / ._evaluation() should
-    not crash. This shim accepts any method call and silently no-ops.
-    """
+    """No-op shim for older livekit-agents versions without Tagger."""
 
     def __getattr__(self, name):
-        # Any method call returns a no-op callable that accepts anything.
         def _noop(*args, **kwargs):
             return None
         return _noop
 
 
+def _create_tagger():
+    try:
+        from livekit.agents.observability import Tagger
+        return Tagger()
+    except Exception:
+        return _NoopTagger()
+
+
 class _StubJobContext:
-    """Minimal stub for JobContext — provides .room, .job, and other fields
-    that AgentSession.start() accesses via get_job_context().
+    """Minimal JobContext facade for AgentSession.get_job_context() calls."""
 
-    Not a full JobContext — just enough to avoid RuntimeError and AttributeError.
-    """
-
-    def __init__(self, room: TransportRoom, agent_name: str = "agent"):
+    def __init__(
+        self,
+        room: TransportRoom,
+        agent_name: str = "agent",
+        *,
+        enable_recording: bool = True,
+    ):
         self._room = room
         self._job = _StubJob(
             id=f"job-{room._sid}",
             agent_name=agent_name,
             room=_StubJobRoom(sid=room.sid, name=room.name),
+            enable_recording=enable_recording,
         )
         # Override _job.room with the real TransportRoom (mirrors LiveKit
         # JobContext where ctx.job.room IS the live rtc.Room). Code that
@@ -543,7 +547,7 @@ class _StubJobContext:
         # ctx._log_fields by LiveKit's internal _ContextLogFieldsFilter,
         # though we don't install that filter ourselves).
         self._log_fields: dict = {}
-        self._tagger = _NoopTagger()
+        self._tagger = _create_tagger()
 
     @property
     def room(self):
@@ -572,51 +576,18 @@ class _StubJobContext:
     def init_recording(self, options):
         """Called by AgentSession when record=True is passed to session.start().
 
-        Starts Rust-level recording (stereo OGG/Opus) directly from the
-        transport send/recv loops — zero Python overhead, zero per-frame
-        copying, zero GIL hold per frame (the encoder runs on a dedicated
-        OS thread inside Rust).
-
-        Also disables RecorderIO's Python-level recording to avoid double
-        recording. Rust recording is more efficient for production.
-
-        IMPORTANT: We DO NOT mutate the caller's `options` dict in place.
-        Mutating user-supplied state is a footgun (the caller may reuse the
-        same dict for telemetry, a second session, etc., and would silently
-        find `audio: False`). Instead we mutate a defensive copy if needed
-        — but since LiveKit's RecorderIO checks `options.get("audio", ...)`
-        from the same dict we're handed, the only honest way to disable it
-        is to clear the audio flag. We do this on the live dict but document
-        the side effect, and we restore the original on session end so the
-        caller's dict round-trips.
+        AgentServer/AudioStreamServer own the transport-level recorder so the
+        exact file path can be passed to the LiveKit SDK upload helper. This
+        hook only disables LiveKit RecorderIO's Python-level audio recording to
+        avoid duplicate audio capture. The original audio flag is restored when
+        the session ends.
         """
         if not options.get("audio", False):
             return
 
-        ep = self._room._ep if self._room else None
-        session_id = self._room._sid if self._room else None
-        if ep is None or session_id is None:
-            return
-
-        # Rust recording: stereo OGG/Opus at the transport layer.
-        # Captures agent voice + background audio + user audio (all mixed).
-        # The Rust call is fast (just creates the encoder state); the actual
-        # encoding runs on a dedicated OS thread inside Rust without GIL hold.
-        try:
-            import os
-            rec_dir = str(self.session_directory)
-            os.makedirs(rec_dir, exist_ok=True)
-            rec_path = os.path.join(rec_dir, f"recording_{session_id}.ogg")
-            ep.start_recording(session_id, rec_path, True)
-            logger.debug("Recording started (Rust OGG/Opus): %s", rec_path)
-            # Disable RecorderIO — Rust handles recording with full audio mix.
-            # Save the original so we can restore on session end (see
-            # _on_session_end below).
-            self._original_audio_recording_flag = options.get("audio")
-            self._recording_options_ref = options
-            options["audio"] = False
-        except Exception:
-            logger.warning("Rust recording failed, falling back to RecorderIO", exc_info=True)
+        self._original_audio_recording_flag = options.get("audio")
+        self._recording_options_ref = options
+        options["audio"] = False
 
     async def connect(self):
         """No-op — no real room to connect to.
@@ -638,9 +609,6 @@ class _StubJobContext:
                 ep.stop_recording(session_id)
             except Exception:
                 pass
-        # Restore the user's `options["audio"]` flag if init_recording
-        # mutated it. The caller's dict round-trips cleanly across the
-        # session lifecycle.
         opts_ref = getattr(self, "_recording_options_ref", None)
         if opts_ref is not None and hasattr(self, "_original_audio_recording_flag"):
             try:
@@ -909,22 +877,72 @@ class _StubJobContext:
     def local_participant_identity(self):
         return self._room._local_participant.identity if self._room else ""
 
-    def make_session_report(self, *args, **kwargs):
-        # LiveKit uses this for cloud session telemetry. We don't ship to
-        # LiveKit Cloud, so this is a no-op. Tools that read the return
-        # value should not depend on it being non-None.
-        return None
+    def make_session_report(
+        self,
+        session=None,
+        *,
+        recording_path: str | Path | None = None,
+        recording_started_at: float | None = None,
+        recording_options: dict[str, bool] | None = None,
+    ):
+        """Build a LiveKit SessionReport for post-conversation evals.
+
+        LiveKit's RecorderIO is disabled for agent-transport because the Rust
+        transport recorder owns the mixed SIP/audio_stream recording. These
+        optional overrides let the report keep the SDK shape while pointing at
+        the transport-owned audio file.
+        """
+        from livekit.agents.voice.report import SessionReport
+
+        session = session or self._primary_agent_session
+        if not session:
+            raise RuntimeError("Cannot prepare report, no AgentSession was found")
+
+        recorder_io = getattr(session, "_recorder_io", None)
+        if recorder_io and getattr(recorder_io, "recording", False):
+            raise RuntimeError("Cannot create the AgentSession report, the RecorderIO is still recording")
+
+        if recording_options is None:
+            recording_options = dict(
+                getattr(
+                    session,
+                    "_recording_options",
+                    {"audio": True, "traces": True, "logs": True, "transcript": True},
+                )
+            )
+        else:
+            recording_options = dict(recording_options)
+
+        audio_path = recording_path
+        if audio_path is None and recorder_io:
+            audio_path = getattr(recorder_io, "output_path", None)
+        if audio_path is not None and not isinstance(audio_path, Path):
+            audio_path = Path(audio_path)
+
+        audio_started_at = recording_started_at
+        if audio_started_at is None and recorder_io:
+            audio_started_at = getattr(recorder_io, "recording_started_at", None)
+
+        report = SessionReport(
+            recording_options=recording_options,
+            job_id=self.job.id,
+            room_id=self.job.room.sid,
+            room=self.job.room.name,
+            options=session.options,
+            audio_recording_path=audio_path,
+            audio_recording_started_at=audio_started_at,
+            started_at=getattr(session, "_started_at", None),
+            events=getattr(session, "_recorded_events", []),
+            chat_history=session.history.copy(),
+            model_usage=getattr(getattr(session, "usage", None), "model_usage", None),
+        )
+        if audio_started_at is not None:
+            report.duration = report.timestamp - audio_started_at
+        return report
 
     @property
     def tagger(self):
-        """Returns a no-op Tagger shim.
-
-        LiveKit's Tagger sends success/fail/eval signals to LiveKit Cloud.
-        We don't have cloud connectivity, so any user code that calls
-        `ctx.tagger.success()` / `.fail()` / `.add()` / `._evaluation()`
-        gets a silent no-op via `_NoopTagger.__getattr__`. Returning None
-        would crash on attribute access; the shim is required for parity.
-        """
+        """Returns the session Tagger used by JudgeGroup.evaluate()."""
         return self._tagger
 
     def token_claims(self):
@@ -949,8 +967,13 @@ class _StubJobContext:
         return self._room.local_participant if self._room else None
 
 
-def create_transport_context(room: TransportRoom, agent_name: str = "agent",
-                             inference_executor=None) -> tuple:
+def create_transport_context(
+    room: TransportRoom,
+    agent_name: str = "agent",
+    inference_executor=None,
+    *,
+    enable_recording: bool = True,
+) -> tuple:
     """Create a stub JobContext and set it on _JobContextVar.
 
     Returns (stub_context, context_token) — caller must reset token on cleanup.
@@ -964,7 +987,11 @@ def create_transport_context(room: TransportRoom, agent_name: str = "agent",
     """
     from livekit.agents.job import _JobContextVar
 
-    stub = _StubJobContext(room=room, agent_name=agent_name)
+    stub = _StubJobContext(
+        room=room,
+        agent_name=agent_name,
+        enable_recording=enable_recording,
+    )
     if inference_executor:
         stub._inf_executor = inference_executor
     token = _JobContextVar.set(stub)

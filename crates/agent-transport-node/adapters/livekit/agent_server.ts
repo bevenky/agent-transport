@@ -507,35 +507,20 @@ export class AgentServer {
       callEnded,
       resolveCallEnded: resolveEnded,
       proc: this.proc,
+      inferenceExecutor: this.inferenceExecutor,
+      enableRecording: false,
     });
 
     const runCall = async () => {
       this.sipCallsTotal[direction]++;
       const callStart = performance.now();
 
-      const sessionDir = `/tmp/agent-sessions`;
+      const sessionDir = ctx.sessionDirectory;
+      let recPath: string | undefined;
+      let recordingStartedAt: number | undefined;
       try {
-        // Wrap in runWithJobContext so getJobContext().room works inside handler
-        // (matches LiveKit WebRTC where entrypoint runs inside job context)
-        const stub = {
-          room: ctx.room,
-          job: { id: `job-${sessionId}`, agentName: this.agentName, enableRecording: false, room: { sid: ctx.room.sid, name: ctx.room.name } },
-          _primaryAgentSession: undefined as any,
-          sessionDirectory: sessionDir,
-          proc: { executorType: null },
-          inferenceExecutor: this.inferenceExecutor,
-          initRecording: () => {},
-          connect: async () => {},
-          addShutdownCallback: () => {},
-          shutdown: () => {},
-          is_fake_job: () => false,
-          isFakeJob: () => false,
-          worker_id: 'local',
-          workerId: 'local',
-        };
-
         if (runWithJobContext) {
-          await runWithJobContext(stub as any, () => this.entrypointFn!(ctx));
+          await runWithJobContext(ctx as any, () => this.entrypointFn!(ctx));
         } else {
           await this.entrypointFn!(ctx);
         }
@@ -552,7 +537,9 @@ export class AgentServer {
         // Captures full mix: agent voice + background audio + user audio
         try {
           mkdirSync(sessionDir, { recursive: true });
-          this.ep!.startRecording(sessionId, `${sessionDir}/recording_${sessionId}.ogg`, true);
+          recPath = `${sessionDir}/recording_${sessionId}.ogg`;
+          recordingStartedAt = Date.now();
+          this.ep!.startRecording(sessionId, recPath, true);
         } catch {}
 
         // Entrypoint returned — session.start() is non-blocking,
@@ -586,9 +573,10 @@ export class AgentServer {
 
           // Stop recording and wait for file to be finalized
           try { this.ep!.stopRecording(sessionId); } catch {}
-          const recPath = `${sessionDir}/recording_${sessionId}.ogg`;
-          for (let i = 0; i < 20; i++) {
-            if (existsSync(recPath)) break; await new Promise(r => setTimeout(r, 100));
+          if (recPath) {
+            for (let i = 0; i < 20; i++) {
+              if (existsSync(recPath)) break; await new Promise(r => setTimeout(r, 100));
+            }
           }
 
           // Upload session report (transcript, audio, metrics)
@@ -598,8 +586,10 @@ export class AgentServer {
               session: ctx.session,
               callId: sessionId,
               accountId: ctx.accountId,
+              metadata: ctx.metadata,
+              direction: ctx.direction,
               recordingPath: recPath,
-              recordingStartedAt: Date.now() / 1000,
+              recordingStartedAt,
               transport: 'sip',
             });
           } catch (e) {
@@ -607,7 +597,7 @@ export class AgentServer {
           }
 
           // Clean up local recording after upload attempt
-          if (getObservabilityUrl()) {
+          if (getObservabilityUrl() && recPath) {
             try { const { unlinkSync } = await import('node:fs'); unlinkSync(recPath); } catch (e) {
               console.warn(`Failed to clean up recording ${recPath}:`, e);
             }
