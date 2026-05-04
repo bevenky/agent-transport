@@ -52,6 +52,17 @@ async def run_configured_judges(
         tagger = getattr(job_context, "tagger", None)
         previous_eval_count = len(getattr(tagger, "evaluations", []) or []) if tagger else 0
 
+        # Mark the session as evaluation-capable BEFORE judges run so the obs
+        # UI can show the Evaluation button even when JudgeGroup fails or its
+        # results haven't merged yet. Node sessions never reach this branch
+        # (no JudgeGroup support), so the flag stays Python-only.
+        add_tag = getattr(tagger, "add", None) if tagger else None
+        if callable(add_tag):
+            try:
+                add_tag("evaluations:enabled", metadata=None)
+            except Exception:
+                pass
+
         group = JudgeGroup(llm=evaluation.judge_llm, judges=judges)
         result = await group.evaluate(report.chat_history)
 

@@ -67,6 +67,10 @@ def _ensure_transport_tags(
         add(f"transport:{transport}", metadata={"transport": transport})
     if direction:
         add(f"direction:{direction}", metadata={"direction": direction})
+    # Escape hatch: caller can flag a session as evaluation-capable from app
+    # code without registering a JudgeGroup (e.g., custom eval pipeline).
+    if metadata and metadata.get("evaluations"):
+        add("evaluations:enabled", metadata=None)
 
 
 def _get_sdk_tagger() -> Any:
