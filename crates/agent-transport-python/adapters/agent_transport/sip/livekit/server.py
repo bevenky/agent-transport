@@ -40,6 +40,8 @@ from livekit.rtc.room import SipDTMF
 from .sip_io import SipAudioInput, SipAudioOutput
 from ._room_facade import TransportRoom, create_transport_context
 from ._aio_utils import call_setup as _call_setup
+from .judging import EvaluationConfig, run_configured_judges
+from .observability import _ensure_transport_tags, _get_observability_url
 
 logger = logging.getLogger("agent_transport.server")
 
@@ -199,11 +201,18 @@ class JobContext:
     endpoint: SipEndpoint
     userdata: dict[str, Any] = field(default_factory=dict)
     extra_headers: dict[str, str] = field(default_factory=dict)
+    metadata: dict[str, Any] = field(default_factory=dict)
+    """Session metadata to attach to native LiveKit observability tags."""
+    account_id: str | None = None
+    """Account ID for multi-tenancy — set by the consumer per session."""
+    evaluation: EvaluationConfig | None = None
+    """Post-conversation evaluation config for this session."""
 
     _agent_name: str = field(default="sip-agent", repr=False)
     _session: Any = field(default=None, repr=False)
     _call_ended: asyncio.Event | None = field(default=None, repr=False)
     _room: Any = field(default=None, repr=False)
+    _job_stub: Any = field(default=None, repr=False)
     _job_ctx_token: Any = field(default=None, repr=False)
     _event_listeners: dict = field(default_factory=dict, repr=False)
     _proc: Any = field(default=None, repr=False)
@@ -213,6 +222,26 @@ class JobContext:
     def session(self):
         return self._session
 
+    @property
+    def tagger(self):
+        return getattr(self._job_stub, "tagger", None)
+
+    def set_metadata(self, metadata: dict[str, Any]) -> None:
+        """Attach session metadata to native LiveKit observability tags."""
+        self.metadata.update({str(key): value for key, value in metadata.items() if value is not None})
+        if account_id := self.metadata.get("account_id"):
+            self.account_id = str(account_id)
+            self.metadata["account_id"] = self.account_id
+
+        _ensure_transport_tags(
+            self.tagger,
+            account_id=self.account_id,
+            transport="sip",
+            direction=self.direction,
+            agent_name=self._agent_name,
+            metadata=self.metadata,
+        )
+
     @session.setter
     def session(self, session: Any) -> None:
         """Set the agent session — automatically wires SIP audio I/O.
@@ -221,6 +250,8 @@ class JobContext:
         call session.start(agent=, room=ctx.room) directly.
         """
         self._session = session
+        if self._job_stub is not None:
+            self._job_stub._primary_agent_session = session
 
         # Wire SIP audio I/O before session.start() is called
         session.input.audio = SipAudioInput(self.endpoint, self.session_id)
@@ -293,6 +324,9 @@ class AgentServer:
         port: int | None = None,
         agent_name: str = "sip-agent",
         auth: Callable[..., bool | Coroutine] | None = None,
+        recording: bool = True,
+        recording_dir: str = "/tmp/agent-sessions",
+        recording_stereo: bool = True,
     ) -> None:
         self._sip_server = sip_server or os.environ.get("SIP_DOMAIN", "phone.plivo.com")
         self._sip_port = sip_port or int(os.environ.get("SIP_PORT", "5060"))
@@ -302,6 +336,9 @@ class AgentServer:
         self._port = port or int(os.environ.get("PORT", "8080"))
         self._agent_name = agent_name
         self._auth = auth
+        self._recording = recording
+        self._recording_dir = recording_dir
+        self._recording_stereo = recording_stereo
         self._entrypoint_fnc: Callable[..., Coroutine] | None = None
         self._setup_fnc: Callable | None = None
         self._proc = JobProcess()
@@ -526,6 +563,10 @@ class AgentServer:
             sys.exit(1)
 
         logger.info("Registered as %s@%s:%d", self._sip_username, self._sip_server, self._sip_port)
+
+        obs_url = _get_observability_url()
+        if obs_url:
+            logger.info("Observability enabled, target %s", obs_url)
 
         # Start HTTP server
         http_app = self._build_http_app()
@@ -789,16 +830,39 @@ class AgentServer:
                     reason = ev.get("reason", "unknown")
                     logger.info("Call %s terminated (reason=%s)", session_id, reason)
 
-                    # Clear audio buffer immediately to abort any pending playout
-                    # (prevents 5s "speech not done in time" timeout)
-                    try:
-                        self._ep.clear_buffer(session_id)
-                    except Exception:
-                        pass
+                    # Clear audio buffer to abort pending playout — but skip when
+                    # recording so the RTP send loop can drain remaining audio
+                    # into the recorder before shutdown.
+                    if not self._recording:
+                        try:
+                            self._ep.clear_buffer(session_id)
+                        except Exception:
+                            pass
 
-                    # Emit participant_disconnected on Room facade (matches LiveKit WebRTC)
-                    # RoomIO._on_participant_disconnected will call _close_soon() → session closes
+                    # Shut down the session gracefully BEFORE emitting
+                    # participant_disconnected. LiveKit's default handler calls
+                    # `_close_soon(drain=False)`, which force-interrupts any
+                    # in-flight LLM/TTS response — the final assistant message
+                    # (e.g. the reply after a tool call) would never land in
+                    # chat_history. Calling `shutdown(drain=True)` first sets
+                    # `_closing_task` so the subsequent `_close_soon` becomes a
+                    # no-op and the session drains normally, letting in-flight
+                    # speech finalize into history.
                     ctx = self._call_contexts.get(session_id)
+                    if ctx and ctx._session is not None:
+                        try:
+                            ctx._session.shutdown(drain=True)
+                        except Exception:
+                            logger.warning(
+                                "Graceful session shutdown failed; falling back "
+                                "to default close",
+                                exc_info=True,
+                            )
+
+                    # Emit participant_disconnected on Room facade (matches
+                    # LiveKit WebRTC). RoomIO._on_participant_disconnected calls
+                    # `_close_soon(drain=False)`, which is a no-op here because
+                    # `_closing_task` was already set above.
                     if ctx and ctx._room:
                         remote = ctx._room._remote
                         remote.disconnect_reason = 1  # CLIENT_INITIATED
@@ -855,6 +919,26 @@ class AgentServer:
             except Exception:
                 logger.exception("Error handling sip event %r", ev.get("type") if isinstance(ev, dict) else ev)
 
+    async def _upload_report(
+        self, session, session_id: str, obs_url: str,
+        recording_path: str | None = None, recording_started_at: float | None = None,
+        account_id: str | None = None,
+        direction: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        tagger: Any = None,
+        job_context: Any = None,
+    ) -> None:
+        from .observability import upload_session_report
+        await upload_session_report(
+            session, session_id, obs_url, self._agent_name,
+            recording_path, recording_started_at, account_id,
+            transport="sip",
+            direction=direction,
+            metadata=metadata,
+            tagger=tagger,
+            job_context=job_context,
+        )
+
     async def _start_call(self, session_id: str, remote_uri: str, direction: str) -> None:
         call_ended = asyncio.Event()
         self._call_ended_events[session_id] = call_ended
@@ -866,7 +950,11 @@ class AgentServer:
             caller_identity=remote_uri,
         )
         job_stub, job_ctx_token = create_transport_context(
-            room, agent_name=self._agent_name)
+            room,
+            agent_name=self._agent_name,
+            inference_executor=getattr(self, "_inference_executor", None),
+            enable_recording=self._recording,
+        )
 
         ctx = JobContext(
             session_id=session_id,
@@ -877,6 +965,7 @@ class AgentServer:
             _agent_name=self._agent_name,
             _call_ended=call_ended,
             _room=room,
+            _job_stub=job_stub,
             _job_ctx_token=job_ctx_token,
             _proc=self._proc,
         )
@@ -886,6 +975,19 @@ class AgentServer:
             node = _nodename()
             SIP_CALLS_TOTAL.labels(nodename=node, direction=direction).inc()
             call_start = time.monotonic()
+
+            # Start recording if enabled
+            rec_path = None
+            rec_started_at = None
+            if self._recording:
+                try:
+                    os.makedirs(self._recording_dir, exist_ok=True)
+                    rec_path = os.path.join(self._recording_dir, f"recording_{session_id}.ogg")
+                    self._ep.start_recording(session_id, rec_path, self._recording_stereo)
+                    rec_started_at = time.time()
+                except Exception:
+                    rec_path = None
+                    logger.warning("Failed to start recording for call %s", session_id, exc_info=True)
 
             try:
                 await self._entrypoint_fnc(ctx)
@@ -897,6 +999,7 @@ class AgentServer:
                 logger.exception("Call %s handler failed", session_id)
             finally:
                 SIP_CALL_DURATION.labels(nodename=node).observe(time.monotonic() - call_start)
+                logger.info("Call %s cleanup: session=%s", session_id, "set" if ctx._session is not None else "None")
 
                 if ctx._session is not None:
                     try:
@@ -905,10 +1008,69 @@ class AgentServer:
                             logger.info("Call %s usage: %s", session_id, usage)
                     except Exception:
                         pass
+
+                    # Stop recording and wait for file to be finalized
+                    if rec_path:
+                        try:
+                            self._ep.stop_recording(session_id)
+                            # Rust recorder finalizes on a background thread;
+                            # poll until the file appears (up to 2s)
+                            for _ in range(20):
+                                if os.path.exists(rec_path):
+                                    break
+                                await asyncio.sleep(0.1)
+                        except Exception:
+                            pass
+
+                    # Wait for session close (triggered by participant_disconnected
+                    # → _close_soon) rather than calling aclose() which cancels
+                    # in-progress LLM/TTS and discards the response from history.
+                    # The session's close event was wired in the session setter to
+                    # set call_ended — by the time we're here, it may already be
+                    # closing. Give it a few seconds to finalize in-flight responses.
                     try:
-                        await ctx._session.aclose()
+                        close_event = asyncio.Event()
+                        ctx._session.on("close", lambda *_: close_event.set())
+                        try:
+                            await asyncio.wait_for(close_event.wait(), timeout=5.0)
+                        except asyncio.TimeoutError:
+                            # Force close if graceful close didn't happen
+                            await ctx._session.aclose()
                     except Exception:
-                        pass
+                        try:
+                            await ctx._session.aclose()
+                        except Exception:
+                            pass
+
+                    # Upload session report after session close so history is complete
+                    obs_url = _get_observability_url()
+                    if obs_url:
+                        try:
+                            await run_configured_judges(
+                                session=ctx._session,
+                                job_context=ctx._job_stub,
+                                evaluation=ctx.evaluation,
+                                session_id=session_id,
+                                logger=logger,
+                            )
+                            await self._upload_report(
+                                ctx._session, session_id, obs_url, rec_path, rec_started_at,
+                                account_id=ctx.account_id,
+                                direction=ctx.direction,
+                                metadata=ctx.metadata,
+                                tagger=ctx.tagger,
+                                job_context=ctx._job_stub,
+                            )
+                        except Exception:
+                            logger.warning("Failed to upload session report for call %s", session_id, exc_info=True)
+
+                        # Clean up local recording after upload attempt
+                        if rec_path:
+                            try:
+                                os.remove(rec_path)
+                            except Exception:
+                                logger.warning("Failed to clean up recording %s", rec_path, exc_info=True)
+
                 for cb in ctx._shutdown_callbacks:
                     try:
                         result = cb()
