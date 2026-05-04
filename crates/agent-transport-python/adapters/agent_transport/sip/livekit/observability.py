@@ -78,18 +78,24 @@ def _get_sdk_tagger() -> Any:
 def _emit_runtime_events(session: Any, report: Any) -> None:
     """Ship the runtime event log the SDK leaves out of the wire format.
 
-    `livekit.agents.telemetry.traces._upload_session_report` only emits OTLP
-    records for chat_history.items, options/tags/usage, and tagger
-    evaluations — it does NOT serialize ``session._recorded_events``, even
-    though that list contains every state change, user transcription,
-    function-tool execution, etc. that fired during the call.
+    Mirrors the Node SDK's ``sessionReportToJSON`` behavior, which embeds
+    ``report.events`` (state changes, transcribed input, function-tool
+    execution, etc.) inside the session-report record's payload. The
+    Python SDK's ``_upload_session_report`` deliberately omits
+    ``session._recorded_events`` from the wire format — so we emit one
+    extra OTLP record with ``body="session report"`` and the missing
+    events nested under ``attributes["session.report"]``. The obs
+    server's existing session-report branch spreads that payload into
+    ``raw_report``, picking up the events alongside the SDK's records
+    with no new ingest code.
 
-    To get parity with the legacy multipart uploader (which built its own
-    rich event log by subscribing to runtime callbacks), we walk
-    ``session._recorded_events`` after the SDK upload and emit one extra
-    OTLP record per non-conversation-item event. The obs server merges
-    them into the session's events array via the ``"runtime event"`` body
-    branch in ``persistLiveKitOtlpLogs``.
+    Filter mirrors Node's:
+      - skip ``metrics_collected`` / ``session_usage_updated`` (covered
+        by the SDK's ``usage`` attribute)
+      - additionally skip ``conversation_item_added`` for Python only
+        (the SDK already emits one ``"chat item"`` record per item;
+        re-shipping them here would duplicate every message in the
+        dashboard's events list).
     """
     import time
 
@@ -102,8 +108,24 @@ def _emit_runtime_events(session: Any, report: Any) -> None:
     if not events:
         return
 
+    serialized: list[dict[str, Any]] = []
+    for ev in events:
+        ev_type = getattr(ev, "type", None)
+        if not ev_type:
+            continue
+        if ev_type in ("metrics_collected", "session_usage_updated", "conversation_item_added"):
+            continue
+        try:
+            payload = ev.model_dump(mode="json")
+        except Exception:
+            payload = {"type": ev_type}
+        serialized.append(payload)
+
+    if not serialized:
+        return
+
     rt_logger = get_logger_provider().get_logger(
-        name="runtime_events",
+        name="chat_history",
         attributes={
             "room_id": report.room_id,
             "job_id": report.job_id,
@@ -111,34 +133,20 @@ def _emit_runtime_events(session: Any, report: Any) -> None:
         },
     )
 
-    for ev in events:
-        ev_type = getattr(ev, "type", None)
-        # The SDK already ships conversation_item_added items via "chat item"
-        # records — re-emitting them here would duplicate every message,
-        # tool call, and handoff in the dashboard.
-        if not ev_type or ev_type == "conversation_item_added":
-            continue
-        try:
-            payload = ev.model_dump(mode="json")
-        except Exception:
-            payload = {"type": ev_type}
-
-        ts_seconds = payload.get("created_at") if isinstance(payload, dict) else None
-        try:
-            timestamp_ns = int(float(ts_seconds) * 1e9) if ts_seconds is not None else int(time.time() * 1e9)
-        except (TypeError, ValueError):
-            timestamp_ns = int(time.time() * 1e9)
-
-        try:
-            rt_logger.emit(
-                body="runtime event",
-                timestamp=timestamp_ns,
-                attributes={"event.type": ev_type, "event": payload},
-                severity_number=SeverityNumber.UNSPECIFIED,
-                severity_text="unspecified",
-            )
-        except Exception:
-            logger.warning("Failed to emit runtime event of type %s", ev_type, exc_info=True)
+    try:
+        rt_logger.emit(
+            body="session report",
+            timestamp=int((report.started_at or report.timestamp or time.time()) * 1e9),
+            attributes={"session.report": {"events": serialized}},
+            severity_number=SeverityNumber.UNSPECIFIED,
+            severity_text="unspecified",
+        )
+    except Exception:
+        logger.warning(
+            "Failed to emit runtime events session-report record (%d events)",
+            len(serialized),
+            exc_info=True,
+        )
 
 
 async def upload_session_report(
