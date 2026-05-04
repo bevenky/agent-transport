@@ -160,6 +160,24 @@ npm install agent-transport @livekit/agents @livekit/rtc-node
 
 See also: [Feature Flags & CLI Phone docs](docs/features.md)
 
+## Observability
+
+Both Python and Node LiveKit adapters can upload session recordings + OTLP logs (events, options, usage, chat history) to an [`agent-observability`](https://github.com/plivo-labs/agent-observability) server. Set:
+
+```bash
+AGENT_OBSERVABILITY_URL=https://obs.example.com
+LIVEKIT_API_KEY=<key>
+LIVEKIT_API_SECRET=<secret>   # signs the Bearer JWT used for upload auth
+AGENT_ACCOUNT_ID=<account>    # optional, surfaces in the dashboard for tenant correlation
+```
+
+Python additionally supports:
+
+- **Post-session judging** — register a `JudgeGroup` on the session (see [`examples/livekit/sip_agent_with_judges.py`](examples/livekit/sip_agent_with_judges.py)); verdicts and outcome upload via the SDK telemetry channel.
+- **Eval-button gating** — pass `metadata={"evaluations": True}` to flag a session as evaluation-capable in the dashboard, even when judging runs outside `JudgeGroup`.
+
+Node ships SessionReport + OTLP only; the Node SDK has no `Tagger`/`JudgeGroup` equivalent.
+
 ## Releasing
 
 Publishing is label-driven. Bump the version, add `release-python-sdk` or `release-node-sdk` label to your PR, and merge — CI handles the rest. Python and Node releases are independent.
