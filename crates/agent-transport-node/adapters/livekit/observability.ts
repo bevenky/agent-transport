@@ -191,7 +191,7 @@ function buildOtlpJsonPayload(
   };
 }
 
-function buildOtlpLogRecords(
+export function buildOtlpLogRecords(
   report: voice.SessionReport,
   agentName: string,
   roomTags: Record<string, string>,
