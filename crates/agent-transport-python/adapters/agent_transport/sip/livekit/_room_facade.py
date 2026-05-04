@@ -358,7 +358,7 @@ class TransportRoom(EventEmitter):
         self._remote = _TransportRemoteParticipant(
             caller_identity, str(session_id), kind=remote_kind)
         self._remote_participants = {caller_identity: self._remote}
-        self._name = f"transport-{session_id}"
+        self._name = str(session_id)
         self._creation_time = datetime.datetime.now(datetime.timezone.utc)
         self._text_stream_handlers: dict[str, Any] = {}
         self._byte_stream_handlers: dict[str, Any] = {}
