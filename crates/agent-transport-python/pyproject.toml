@@ -11,7 +11,7 @@ requires-python = ">=3.10"
 license = "MIT"
 
 [project.optional-dependencies]
-livekit = ["aiohttp", "livekit-agents>=1.5"]
+livekit = ["aiohttp", "livekit-agents>=1.5.2"]
 pipecat = ["pipecat-ai>=0.0.108"]
 all = ["agent-transport[livekit,pipecat]"]
 

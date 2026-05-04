@@ -150,6 +150,8 @@ npm install agent-transport @livekit/agents @livekit/rtc-node
 | [`livekit/audio_stream_agent.ts`](examples/livekit/audio_stream_agent.ts) | TypeScript agent over Plivo audio streaming |
 | [`livekit/audio_stream_multi_agent.py`](examples/livekit/audio_stream_multi_agent.py) | Audio streaming multi-agent with handoff and tool calling |
 | [`livekit/audio_stream_multi_agent.ts`](examples/livekit/audio_stream_multi_agent.ts) | TypeScript audio streaming multi-agent |
+| [`livekit/sip_agent_with_judges.py`](examples/livekit/sip_agent_with_judges.py) | SIP agent with post-session `JudgeGroup` evaluations uploaded via the SDK telemetry channel |
+| [`livekit/audio_stream_agent_with_judges.py`](examples/livekit/audio_stream_agent_with_judges.py) | Audio-streaming variant of the post-session judging example |
 | [`pipecat/sip_agent.py`](examples/pipecat/sip_agent.py) | Pipecat pipeline over SIP/RTP with VAD |
 | [`pipecat/sip_multi_agent.py`](examples/pipecat/sip_multi_agent.py) | Pipecat multi-agent with greeter → sales/support handoff |
 | [`pipecat/audio_stream_agent.py`](examples/pipecat/audio_stream_agent.py) | Pipecat over Plivo audio streaming with Rust recorder + mixer |

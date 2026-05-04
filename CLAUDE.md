@@ -34,6 +34,15 @@ crates/
 └── beep-detector/            # Standalone beep detection
 ```
 
+### Observability adapters
+
+The Python LiveKit adapters carry a thin observability layer:
+
+- `agent_transport/sip/livekit/observability.py` (and the `audio_stream/livekit` mirror) — builds a `voice.SessionReport` from the JobContext, attaches transport tags via the SDK `Tagger`, and delegates the upload to LiveKit's telemetry helpers. Uploads land at `agent-observability` (recordings + OTLP). Auth: Bearer JWT signed with `LIVEKIT_API_KEY` / `LIVEKIT_API_SECRET`.
+- `agent_transport/sip/livekit/judging.py` — runs LiveKit's `JudgeGroup` post-session and uploads outcomes via the SDK telemetry channel. Hook fires once per call from both SIP and audio_stream cleanup paths.
+
+Node side is intentionally lighter: `crates/agent-transport-node/adapters/livekit/observability.ts` covers the SessionReport / OTLP construction (since the Node SDK has no `Tagger`), but there's no `JudgeGroup` integration — the Node SDK doesn't expose one. Do not port the Python `judging.py` to Node without first adding upstream support.
+
 ## Build
 
 System dependencies: `cmake` (for audiopus_sys/aws-lc-sys).

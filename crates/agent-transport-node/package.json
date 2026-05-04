@@ -54,6 +54,10 @@
       "optional": true
     }
   },
+  "dependencies": {
+    "@livekit/protocol": "^1.45.1",
+    "livekit-server-sdk": "^2.14.1"
+  },
   "devDependencies": {
     "@napi-rs/cli": "^3",
     "typescript": "^5.0.0",

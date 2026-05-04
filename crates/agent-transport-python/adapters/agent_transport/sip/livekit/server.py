@@ -40,7 +40,8 @@ from livekit.rtc.room import SipDTMF
 from .sip_io import SipAudioInput, SipAudioOutput
 from ._room_facade import TransportRoom, create_transport_context
 from ._aio_utils import call_setup as _call_setup
-from .observability import _get_observability_url
+from .judging import EvaluationConfig, run_configured_judges
+from .observability import _ensure_transport_tags, _get_observability_url
 
 logger = logging.getLogger("agent_transport.server")
 
@@ -200,13 +201,18 @@ class JobContext:
     endpoint: SipEndpoint
     userdata: dict[str, Any] = field(default_factory=dict)
     extra_headers: dict[str, str] = field(default_factory=dict)
+    metadata: dict[str, Any] = field(default_factory=dict)
+    """Session metadata to attach to native LiveKit observability tags."""
     account_id: str | None = None
     """Account ID for multi-tenancy — set by the consumer per session."""
+    evaluation: EvaluationConfig | None = None
+    """Post-conversation evaluation config for this session."""
 
     _agent_name: str = field(default="sip-agent", repr=False)
     _session: Any = field(default=None, repr=False)
     _call_ended: asyncio.Event | None = field(default=None, repr=False)
     _room: Any = field(default=None, repr=False)
+    _job_stub: Any = field(default=None, repr=False)
     _job_ctx_token: Any = field(default=None, repr=False)
     _event_listeners: dict = field(default_factory=dict, repr=False)
     _proc: Any = field(default=None, repr=False)
@@ -216,6 +222,26 @@ class JobContext:
     def session(self):
         return self._session
 
+    @property
+    def tagger(self):
+        return getattr(self._job_stub, "tagger", None)
+
+    def set_metadata(self, metadata: dict[str, Any]) -> None:
+        """Attach session metadata to native LiveKit observability tags."""
+        self.metadata.update({str(key): value for key, value in metadata.items() if value is not None})
+        if account_id := self.metadata.get("account_id"):
+            self.account_id = str(account_id)
+            self.metadata["account_id"] = self.account_id
+
+        _ensure_transport_tags(
+            self.tagger,
+            account_id=self.account_id,
+            transport="sip",
+            direction=self.direction,
+            agent_name=self._agent_name,
+            metadata=self.metadata,
+        )
+
     @session.setter
     def session(self, session: Any) -> None:
         """Set the agent session — automatically wires SIP audio I/O.
@@ -224,6 +250,8 @@ class JobContext:
         call session.start(agent=, room=ctx.room) directly.
         """
         self._session = session
+        if self._job_stub is not None:
+            self._job_stub._primary_agent_session = session
 
         # Wire SIP audio I/O before session.start() is called
         session.input.audio = SipAudioInput(self.endpoint, self.session_id)
@@ -895,12 +923,20 @@ class AgentServer:
         self, session, session_id: str, obs_url: str,
         recording_path: str | None = None, recording_started_at: float | None = None,
         account_id: str | None = None,
+        direction: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        tagger: Any = None,
+        job_context: Any = None,
     ) -> None:
         from .observability import upload_session_report
         await upload_session_report(
             session, session_id, obs_url, self._agent_name,
             recording_path, recording_started_at, account_id,
             transport="sip",
+            direction=direction,
+            metadata=metadata,
+            tagger=tagger,
+            job_context=job_context,
         )
 
     async def _start_call(self, session_id: str, remote_uri: str, direction: str) -> None:
@@ -914,7 +950,11 @@ class AgentServer:
             caller_identity=remote_uri,
         )
         job_stub, job_ctx_token = create_transport_context(
-            room, agent_name=self._agent_name)
+            room,
+            agent_name=self._agent_name,
+            inference_executor=getattr(self, "_inference_executor", None),
+            enable_recording=self._recording,
+        )
 
         ctx = JobContext(
             session_id=session_id,
@@ -925,6 +965,7 @@ class AgentServer:
             _agent_name=self._agent_name,
             _call_ended=call_ended,
             _room=room,
+            _job_stub=job_stub,
             _job_ctx_token=job_ctx_token,
             _proc=self._proc,
         )
@@ -1005,9 +1046,20 @@ class AgentServer:
                     obs_url = _get_observability_url()
                     if obs_url:
                         try:
+                            await run_configured_judges(
+                                session=ctx._session,
+                                job_context=ctx._job_stub,
+                                evaluation=ctx.evaluation,
+                                session_id=session_id,
+                                logger=logger,
+                            )
                             await self._upload_report(
                                 ctx._session, session_id, obs_url, rec_path, rec_started_at,
                                 account_id=ctx.account_id,
+                                direction=ctx.direction,
+                                metadata=ctx.metadata,
+                                tagger=ctx.tagger,
+                                job_context=ctx._job_stub,
                             )
                         except Exception:
                             logger.warning("Failed to upload session report for call %s", session_id, exc_info=True)

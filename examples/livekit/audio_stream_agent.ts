@@ -109,6 +109,8 @@ const agent = new voice.Agent({
 });
 
 server.audioStreamSession(async (ctx: AudioStreamJobContext) => {
+  ctx.setMetadata({ account_id: process.env.AGENT_ACCOUNT_ID ?? 'demo-account' });
+
   const session = new voice.AgentSession({
     vad: ctx.proc.userData.vad as silero.VAD,
     stt: new deepgram.STT({ model: 'nova-3' }),
