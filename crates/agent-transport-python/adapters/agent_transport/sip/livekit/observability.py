@@ -75,6 +75,72 @@ def _get_sdk_tagger() -> Any:
     return Tagger()
 
 
+def _emit_runtime_events(session: Any, report: Any) -> None:
+    """Ship the runtime event log the SDK leaves out of the wire format.
+
+    `livekit.agents.telemetry.traces._upload_session_report` only emits OTLP
+    records for chat_history.items, options/tags/usage, and tagger
+    evaluations — it does NOT serialize ``session._recorded_events``, even
+    though that list contains every state change, user transcription,
+    function-tool execution, etc. that fired during the call.
+
+    To get parity with the legacy multipart uploader (which built its own
+    rich event log by subscribing to runtime callbacks), we walk
+    ``session._recorded_events`` after the SDK upload and emit one extra
+    OTLP record per non-conversation-item event. The obs server merges
+    them into the session's events array via the ``"runtime event"`` body
+    branch in ``persistLiveKitOtlpLogs``.
+    """
+    import time
+
+    try:
+        from opentelemetry._logs import SeverityNumber, get_logger_provider
+    except Exception:
+        return
+
+    events = getattr(session, "_recorded_events", None) or []
+    if not events:
+        return
+
+    rt_logger = get_logger_provider().get_logger(
+        name="runtime_events",
+        attributes={
+            "room_id": report.room_id,
+            "job_id": report.job_id,
+            "room": report.room,
+        },
+    )
+
+    for ev in events:
+        ev_type = getattr(ev, "type", None)
+        # The SDK already ships conversation_item_added items via "chat item"
+        # records — re-emitting them here would duplicate every message,
+        # tool call, and handoff in the dashboard.
+        if not ev_type or ev_type == "conversation_item_added":
+            continue
+        try:
+            payload = ev.model_dump(mode="json")
+        except Exception:
+            payload = {"type": ev_type}
+
+        ts_seconds = payload.get("created_at") if isinstance(payload, dict) else None
+        try:
+            timestamp_ns = int(float(ts_seconds) * 1e9) if ts_seconds is not None else int(time.time() * 1e9)
+        except (TypeError, ValueError):
+            timestamp_ns = int(time.time() * 1e9)
+
+        try:
+            rt_logger.emit(
+                body="runtime event",
+                timestamp=timestamp_ns,
+                attributes={"event.type": ev_type, "event": payload},
+                severity_number=SeverityNumber.UNSPECIFIED,
+                severity_text="unspecified",
+            )
+        except Exception:
+            logger.warning("Failed to emit runtime event of type %s", ev_type, exc_info=True)
+
+
 async def upload_session_report(
     session: Any,
     session_id: str,
@@ -147,6 +213,10 @@ async def upload_session_report(
                     tagger=tagger,
                     http_session=http_session,
                 )
+                # Emit runtime events into the same OTLP pipeline so they
+                # ride to obs alongside the SDK's records. _shutdown_telemetry
+                # below flushes everything out.
+                _emit_runtime_events(session, report)
         finally:
             _shutdown_telemetry()
 
