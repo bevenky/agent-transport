@@ -407,15 +407,23 @@ export class AudioStreamServer {
           await this.entrypointFn!(ctx);
         }
 
-        // Start Rust recording (stereo OGG/Opus at transport layer)
-        try {
-          const { mkdirSync } = await import('node:fs');
-          mkdirSync(sessionDir, { recursive: true });
-          recPath = `${sessionDir}/recording_${sessionId}.ogg`;
-          recordingStartedAt = Date.now();
-          this.ep!.startRecording(sessionId, recPath, true);
-          console.log(`Recording started: ${recPath}`);
-        } catch {}
+        // Start Rust recording (stereo OGG/Opus at transport layer) — only when
+        // observability is configured, since the recording's only purpose is to be
+        // uploaded as part of the session report. Without observability there's
+        // nowhere to send it and nothing would clean up the file.
+        if (getObservabilityUrl()) {
+          try {
+            const { mkdirSync } = await import('node:fs');
+            mkdirSync(sessionDir, { recursive: true });
+            recPath = `${sessionDir}/recording_${sessionId}.ogg`;
+            recordingStartedAt = Date.now();
+            this.ep!.startRecording(sessionId, recPath, true);
+            console.log(`Recording started: ${recPath}`);
+          } catch {
+            recPath = undefined;
+            recordingStartedAt = undefined;
+          }
+        }
 
         // Hook user state changes for debug logging
         if (ctx.session) {
@@ -452,16 +460,18 @@ export class AudioStreamServer {
           }
 
           // Stop recording and wait for file to be finalized
-          try { this.ep!.stopRecording(sessionId); } catch {}
-          const { existsSync } = await import('node:fs');
           if (recPath) {
+            try { this.ep!.stopRecording(sessionId); } catch {}
+            const { existsSync } = await import('node:fs');
             for (let i = 0; i < 20; i++) {
               if (existsSync(recPath)) break;
               await new Promise(r => setTimeout(r, 100));
             }
           }
 
-          // Upload session report (transcript, audio, metrics)
+          // Upload session report (transcript, audio, metrics).
+          // Cleanup runs in finally so the on-disk recording is always removed
+          // after an upload attempt — including when the upload fails.
           try {
             await uploadReport({
               agentName: this.agentName,
@@ -476,12 +486,11 @@ export class AudioStreamServer {
             });
           } catch (e) {
             console.warn(`Failed to upload session report for session ${sessionId}:`, e);
-          }
-
-          // Clean up local recording after upload attempt
-          if (getObservabilityUrl() && recPath) {
-            try { const { unlinkSync } = await import('node:fs'); unlinkSync(recPath); } catch (e) {
-              console.warn(`Failed to clean up recording ${recPath}:`, e);
+          } finally {
+            if (recPath) {
+              try { const { unlinkSync } = await import('node:fs'); unlinkSync(recPath); } catch (e) {
+                console.warn(`Failed to clean up recording ${recPath}:`, e);
+              }
             }
           }
         }

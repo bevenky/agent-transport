@@ -813,10 +813,13 @@ class AudioStreamServer:
             STREAM_SESSIONS_TOTAL.labels(nodename=node).inc()
             session_start = time.monotonic()
 
-            # Start recording if enabled
+            # Start recording if enabled — only when observability is configured,
+            # since the recording's only purpose is to be uploaded as part of the
+            # session report. Without observability there's nowhere to send it
+            # and nothing would clean up the file.
             rec_path = None
             rec_started_at = None
-            if self._recording:
+            if self._recording and _get_observability_url():
                 try:
                     os.makedirs(self._recording_dir, exist_ok=True)
                     rec_path = os.path.join(self._recording_dir, f"recording_{session_id}.ogg")
@@ -870,32 +873,34 @@ class AudioStreamServer:
                         except Exception:
                             pass
 
-                    # Upload session report (transcript, audio, metrics)
+                    # Upload session report (transcript, audio, metrics).
+                    # Cleanup runs in finally so the on-disk recording is always removed
+                    # after an upload attempt — including when the upload fails.
                     obs_url = _get_observability_url()
-                    if obs_url:
-                        try:
-                            from .observability import upload_session_report
-                            await run_configured_judges(
-                                session=ctx._session,
-                                job_context=ctx._job_stub,
-                                evaluation=ctx.evaluation,
-                                session_id=session_id,
-                                logger=logger,
-                            )
-                            await upload_session_report(
-                                ctx._session, session_id, obs_url, self._agent_name,
-                                rec_path, rec_started_at,
-                                account_id=ctx.account_id,
-                                transport="audio_stream",
-                                direction=ctx.direction,
-                                metadata=ctx.metadata,
-                                tagger=ctx.tagger,
-                                job_context=ctx._job_stub,
-                            )
-                        except Exception:
-                            logger.warning("Failed to upload session report for session %s", session_id, exc_info=True)
-
-                        # Clean up local recording after upload attempt
+                    try:
+                        if obs_url:
+                            try:
+                                from .observability import upload_session_report
+                                await run_configured_judges(
+                                    session=ctx._session,
+                                    job_context=ctx._job_stub,
+                                    evaluation=ctx.evaluation,
+                                    session_id=session_id,
+                                    logger=logger,
+                                )
+                                await upload_session_report(
+                                    ctx._session, session_id, obs_url, self._agent_name,
+                                    rec_path, rec_started_at,
+                                    account_id=ctx.account_id,
+                                    transport="audio_stream",
+                                    direction=ctx.direction,
+                                    metadata=ctx.metadata,
+                                    tagger=ctx.tagger,
+                                    job_context=ctx._job_stub,
+                                )
+                            except Exception:
+                                logger.warning("Failed to upload session report for session %s", session_id, exc_info=True)
+                    finally:
                         if rec_path:
                             try:
                                 os.remove(rec_path)

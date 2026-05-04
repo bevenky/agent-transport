@@ -533,14 +533,21 @@ export class AgentServer {
           });
         }
 
-        // Start Rust recording (stereo OGG/Opus at transport layer)
-        // Captures full mix: agent voice + background audio + user audio
-        try {
-          mkdirSync(sessionDir, { recursive: true });
-          recPath = `${sessionDir}/recording_${sessionId}.ogg`;
-          recordingStartedAt = Date.now();
-          this.ep!.startRecording(sessionId, recPath, true);
-        } catch {}
+        // Start Rust recording (stereo OGG/Opus at transport layer) — only when
+        // observability is configured, since the recording's only purpose is to be
+        // uploaded as part of the session report. Without observability there's
+        // nowhere to send it and nothing would clean up the file.
+        if (getObservabilityUrl()) {
+          try {
+            mkdirSync(sessionDir, { recursive: true });
+            recPath = `${sessionDir}/recording_${sessionId}.ogg`;
+            recordingStartedAt = Date.now();
+            this.ep!.startRecording(sessionId, recPath, true);
+          } catch {
+            recPath = undefined;
+            recordingStartedAt = undefined;
+          }
+        }
 
         // Entrypoint returned — session.start() is non-blocking,
         // so wait for call to actually end (BYE or agent shutdown)
@@ -572,14 +579,17 @@ export class AgentServer {
           }
 
           // Stop recording and wait for file to be finalized
-          try { this.ep!.stopRecording(sessionId); } catch {}
           if (recPath) {
+            try { this.ep!.stopRecording(sessionId); } catch {}
             for (let i = 0; i < 20; i++) {
-              if (existsSync(recPath)) break; await new Promise(r => setTimeout(r, 100));
+              if (existsSync(recPath)) break;
+              await new Promise(r => setTimeout(r, 100));
             }
           }
 
-          // Upload session report (transcript, audio, metrics)
+          // Upload session report (transcript, audio, metrics).
+          // Cleanup runs in finally so the on-disk recording is always removed
+          // after an upload attempt — including when the upload fails.
           try {
             await uploadReport({
               agentName: this.agentName,
@@ -594,12 +604,11 @@ export class AgentServer {
             });
           } catch (e) {
             console.warn(`Failed to upload session report for call ${sessionId}:`, e);
-          }
-
-          // Clean up local recording after upload attempt
-          if (getObservabilityUrl() && recPath) {
-            try { const { unlinkSync } = await import('node:fs'); unlinkSync(recPath); } catch (e) {
-              console.warn(`Failed to clean up recording ${recPath}:`, e);
+          } finally {
+            if (recPath) {
+              try { const { unlinkSync } = await import('node:fs'); unlinkSync(recPath); } catch (e) {
+                console.warn(`Failed to clean up recording ${recPath}:`, e);
+              }
             }
           }
         }
