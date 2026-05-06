@@ -32,7 +32,7 @@ except ImportError:
     raise ImportError("livekit-agents is required: pip install livekit-agents")
 
 from .sip_io import _to_livekit_frame
-from ._audio_source import AudioStreamAudioSource
+from ._audio_source import AudioStreamAudioSource, _is_call_not_active_error
 from ._channel import Chan
 from ._aio_utils import cancel_and_wait
 
@@ -175,6 +175,7 @@ class AudioStreamOutput(AudioOutput):
             sample_rate=_sample_rate,
             num_channels=num_channels,
             queue_size_ms=200,  # matches _ParticipantAudioOutput production (not rtc.AudioSource default of 1000)
+            on_terminal_error=self.mark_transport_closed,
         )
 
         self._audio_buf: Chan[rtc.AudioFrame] = Chan()
@@ -195,6 +196,8 @@ class AudioStreamOutput(AudioOutput):
         self._rust_paused = False
 
         self._ready = asyncio.Event()
+        self._transport_closed = False
+        self._playback_segment_active = False
 
     @property
     def sample_rate(self) -> int | None:
@@ -213,16 +216,24 @@ class AudioStreamOutput(AudioOutput):
         await self._audio_source.aclose()
 
     async def capture_frame(self, frame: rtc.AudioFrame) -> None:
+        if self._transport_closed:
+            return
+
         if self._forwarding_task is None:
             await self.start()
 
         await self._ready.wait()
 
         await super().capture_frame(frame)
+        self._playback_segment_active = True
 
         if self._flush_task and not self._flush_task.done():
             logger.error("capture_frame called while flush is in progress")
             await self._flush_task
+
+        if self._transport_closed:
+            self._ensure_interrupted_playout_task()
+            return
 
         for f in self._audio_bstream.push(frame.data):
             try:
@@ -234,6 +245,10 @@ class AudioStreamOutput(AudioOutput):
 
     def flush(self) -> None:
         super().flush()
+
+        if self._transport_closed:
+            self._ensure_interrupted_playout_task()
+            return
 
         for f in self._audio_bstream.flush():
             try:
@@ -258,7 +273,7 @@ class AudioStreamOutput(AudioOutput):
         logger.info("AudioStreamOutput.clear_buffer: clearing bstream, pushed_dur=%.3fs", self._pushed_duration)
         self._audio_bstream.clear()
 
-        if not self._pushed_duration:
+        if not self._pushed_duration and not self._playback_segment_active:
             logger.info("AudioStreamOutput.clear_buffer: no pushed_duration, skipping interrupt")
             return
         logger.info("AudioStreamOutput.clear_buffer: setting _interrupted_event")
@@ -271,7 +286,9 @@ class AudioStreamOutput(AudioOutput):
             try:
                 self._ep.pause(self._sid)
                 self._rust_paused = True
-            except Exception:
+            except Exception as exc:
+                if _is_call_not_active_error(exc):
+                    self.mark_transport_closed()
                 logger.warning("AudioStreamOutput.pause failed for session %s", self._sid, exc_info=True)
 
     def resume(self) -> None:
@@ -282,8 +299,26 @@ class AudioStreamOutput(AudioOutput):
             try:
                 self._ep.resume(self._sid)
                 self._rust_paused = False
-            except Exception:
+            except Exception as exc:
+                if _is_call_not_active_error(exc):
+                    self.mark_transport_closed()
                 logger.warning("AudioStreamOutput.resume failed for session %s", self._sid, exc_info=True)
+
+    def mark_transport_closed(self) -> None:
+        """Abort pending playout because the provider-side stream is gone."""
+        self._transport_closed = True
+        self._playback_enabled.set()
+        self._audio_bstream.clear()
+        self._audio_source.mark_transport_closed()
+        self._ensure_interrupted_playout_task()
+
+    def _ensure_interrupted_playout_task(self) -> None:
+        self._interrupted_event.set()
+        if not self._pushed_duration and not self._playback_segment_active:
+            return
+        if self._flush_task and not self._flush_task.done():
+            return
+        self._flush_task = asyncio.create_task(self._wait_for_playout())
 
     async def _wait_for_playout(self) -> None:
         logger.debug("_wait_for_playout: starting (pushed=%.3fs)", self._pushed_duration)
@@ -291,11 +326,15 @@ class AudioStreamOutput(AudioOutput):
 
         async def _wait_buffered_audio() -> None:
             while not self._audio_buf.empty():
+                if self._interrupted_event.is_set():
+                    return
                 if not self._playback_enabled.is_set():
                     await self._playback_enabled.wait()
                 await asyncio.sleep(0.01)
             # All frames forwarded to Rust's AudioBuffer.
             # Wait for Rust send loop to flush to provider and get confirmation.
+            if self._interrupted_event.is_set() or self._transport_closed:
+                return
             logger.debug("_wait_buffered_audio: chan empty, waiting for playout confirmation")
             await self._audio_source.wait_for_playout()
             logger.debug("_wait_buffered_audio: playout confirmed")
@@ -327,6 +366,7 @@ class AudioStreamOutput(AudioOutput):
         self._pushed_duration = 0
         self._interrupted_event.clear()
         self._first_frame_event.clear()
+        self._playback_segment_active = False
         self.on_playback_finished(playback_position=pushed_duration, interrupted=interrupted)
 
     async def _forward_audio(self) -> None:

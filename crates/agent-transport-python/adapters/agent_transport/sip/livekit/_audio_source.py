@@ -11,10 +11,15 @@ No timer heuristics — all playout tracking comes from Rust.
 
 import asyncio
 import logging
+from typing import Callable
 
 from livekit import rtc
 
 logger = logging.getLogger(__name__)
+
+
+def _is_call_not_active_error(exc: BaseException) -> bool:
+    return "call not active" in str(exc).lower()
 
 
 class SipAudioSource:
@@ -31,6 +36,7 @@ class SipAudioSource:
         num_channels: int = 1,
         queue_size_ms: int = 1000,
         loop: asyncio.AbstractEventLoop | None = None,
+        on_terminal_error: Callable[[], None] | None = None,
     ) -> None:
         self._ep = endpoint
         self._id = call_or_session_id
@@ -40,6 +46,29 @@ class SipAudioSource:
         self._loop = loop or asyncio.get_event_loop()
         self._disposed = False
         self._playout_fut: asyncio.Future[None] | None = None
+        self._pending_capture_futs: set[asyncio.Future[None]] = set()
+        self._on_terminal_error = on_terminal_error
+
+    def _notify_terminal_error(self) -> None:
+        cb = getattr(self, "_on_terminal_error", None)
+        if cb is None:
+            return
+        try:
+            cb()
+        except Exception:
+            logger.exception("Audio source terminal-error callback failed")
+
+    def _resolve_future(self, fut: asyncio.Future[None] | None) -> None:
+        if fut is not None and not fut.done():
+            fut.set_result(None)
+
+    def mark_transport_closed(self) -> None:
+        """Resolve in-flight waits that can no longer complete from Rust."""
+        self._disposed = True
+        for fut in list(getattr(self, "_pending_capture_futs", ())):
+            self._resolve_future(fut)
+        self._resolve_future(getattr(self, "_playout_fut", None))
+        self._playout_fut = None
 
     @property
     def sample_rate(self) -> int:
@@ -96,19 +125,30 @@ class SipAudioSource:
 
         # Push audio to Rust — Rust fires _on_complete immediately if below
         # threshold, or defers it until RTP loop drains
+        self._pending_capture_futs.add(capture_fut)
         try:
-            self._ep.send_audio_notify(
-                self._id,
-                bytes(frame.data),
-                frame.sample_rate,
-                frame.num_channels,
-                _on_complete,
-            )
-        except Exception:
-            raise
+            try:
+                self._ep.send_audio_notify(
+                    self._id,
+                    bytes(frame.data),
+                    frame.sample_rate,
+                    frame.num_channels,
+                    _on_complete,
+                )
+            except Exception as exc:
+                if (
+                    _is_call_not_active_error(exc)
+                    and getattr(self, "_on_terminal_error", None) is not None
+                ):
+                    self._notify_terminal_error()
+                    self._resolve_future(capture_fut)
+                    return
+                raise
 
-        # Await completion — instant if below threshold, suspends if above
-        await capture_fut
+            # Await completion — instant if below threshold, suspends if above
+            await capture_fut
+        finally:
+            self._pending_capture_futs.discard(capture_fut)
 
     async def wait_for_playout(self) -> None:
         """Wait for all queued audio to finish playing out.
@@ -139,12 +179,13 @@ class SipAudioSource:
 
             try:
                 self._ep.wait_for_playout_notify(self._id, _on_playout)
-            except Exception:
+            except Exception as exc:
+                if _is_call_not_active_error(exc):
+                    self._notify_terminal_error()
                 # Resolve the orphaned future so any concurrent awaiters
                 # don't hang on a future that will never fire.
                 fut = self._playout_fut
-                if fut is not None and not fut.done():
-                    fut.set_result(None)
+                self._resolve_future(fut)
                 self._playout_fut = None
                 return
 
@@ -172,6 +213,11 @@ class AudioStreamAudioSource(SipAudioSource):
         super().__init__(*args, **kwargs)
         self._plivo_playout_fut: asyncio.Future[None] | None = None
 
+    def mark_transport_closed(self) -> None:
+        super().mark_transport_closed()
+        self._resolve_future(getattr(self, "_plivo_playout_fut", None))
+        self._plivo_playout_fut = None
+
     async def wait_for_playout(self) -> None:
         """Wait for Plivo server confirmation that queued audio has been played.
 
@@ -185,7 +231,9 @@ class AudioStreamAudioSource(SipAudioSource):
                 try:
                     try:
                         self._ep.flush(self._id)
-                    except Exception:
+                    except Exception as exc:
+                        if _is_call_not_active_error(exc):
+                            self._notify_terminal_error()
                         logger.warning("AudioStreamAudioSource: flush failed for session %s", self._id, exc_info=True)
                         return
 
@@ -196,13 +244,14 @@ class AudioStreamAudioSource(SipAudioSource):
                         )
                         if not confirmed:
                             logger.warning("AudioStreamAudioSource: wait_for_playout timed out on session %s", self._id)
-                    except Exception:
+                    except Exception as exc:
+                        if _is_call_not_active_error(exc):
+                            self._notify_terminal_error()
                         logger.warning("AudioStreamAudioSource: wait_for_playout error on session %s", self._id, exc_info=True)
                 finally:
                     # Always resolve the shared future so concurrent awaiters don't hang.
                     fut = self._plivo_playout_fut
-                    if fut is not None and not fut.done():
-                        fut.set_result(None)
+                    self._resolve_future(fut)
                     self._plivo_playout_fut = None
 
             # Store a strong reference until the task completes — Python's
@@ -218,8 +267,13 @@ class AudioStreamAudioSource(SipAudioSource):
 
     def clear_queue(self) -> None:
         """Clear buffer — sends clearAudio to Plivo + clears local AudioBuffer."""
-        self._ep.clear_buffer(self._id)
+        try:
+            self._ep.clear_buffer(self._id)
+        except Exception as exc:
+            if _is_call_not_active_error(exc):
+                self._notify_terminal_error()
+            else:
+                raise
         # Resolve any pending playout future (interrupt cancels the checkpoint wait)
-        if self._plivo_playout_fut is not None and not self._plivo_playout_fut.done():
-            self._plivo_playout_fut.set_result(None)
+        self._resolve_future(self._plivo_playout_fut)
         self._plivo_playout_fut = None
