@@ -49,6 +49,9 @@ jobs:
       - name: Dry-run Node audio stream SDK config
         run: node e2e/audio_stream_node_smoke.mjs --dry-run --ci
 
+      - name: Dry-run Node headless SIP config
+        run: node e2e/headless_sip_node_smoke.mjs --dry-run --ci
+
       - uses: dtolnay/rust-toolchain@1.94.0
 
       - uses: Swatinem/rust-cache@v2
@@ -139,6 +142,31 @@ jobs:
         run: |
           echo "::warning::Headless SIP smoke failed on a quarantined PR run. Manual runs still fail hard."
 
+      - name: Run Node headless SIP smoke
+        if: steps.sip_secrets.outcome == 'success'
+        id: node_sip_smoke
+        continue-on-error: ${{ github.event_name == 'pull_request' }}
+        shell: bash
+        run: |
+          set -o pipefail
+          mkdir -p "$RUNNER_TEMP/e2e"
+          timeout --preserve-status 140s \
+            node e2e/headless_sip_node_smoke.mjs \
+              --ci \
+              --output "$RUNNER_TEMP/e2e/received_audio_node.wav" \
+              --max-register-seconds 10 \
+              --max-answer-seconds 30 \
+              --max-call-seconds 90 \
+              --max-hangup-seconds 10 \
+              --min-received-seconds 1.0 \
+              --min-speech-percent 1.0 \
+            2>&1 | tee "$RUNNER_TEMP/e2e/headless-node-e2e.log"
+
+      - name: Report quarantined Node SIP failure
+        if: github.event_name == 'pull_request' && steps.node_sip_smoke.outcome == 'failure'
+        run: |
+          echo "::warning::Node headless SIP smoke failed on a quarantined PR run. Manual runs still fail hard."
+
       - name: Upload E2E artifacts
         if: always()
         uses: actions/upload-artifact@v4
@@ -148,6 +176,8 @@ jobs:
             ${{ runner.temp }}/e2e/audio-stream-e2e.log
             ${{ runner.temp }}/e2e/audio-stream-node-e2e.log
             ${{ runner.temp }}/e2e/headless-e2e.log
+            ${{ runner.temp }}/e2e/headless-node-e2e.log
             ${{ runner.temp }}/e2e/received_audio.wav
+            ${{ runner.temp }}/e2e/received_audio_node.wav
           if-no-files-found: ignore
           retention-days: 7

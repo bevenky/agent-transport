@@ -1,7 +1,7 @@
 # E2E Smoke Tests
 
-This folder contains CI-oriented e2e smoke tests that exercise the Python
-bindings against real transport surfaces. They are intentionally separate from
+This folder contains CI-oriented e2e smoke tests that exercise the Python and
+Node bindings against real transport surfaces. They are intentionally separate from
 `examples/cli`: examples stay user-facing, while these scripts own CI policy,
 timeouts, artifact paths, strict exit codes, and `E2E_` environment names.
 
@@ -33,11 +33,13 @@ is a hard failure on manual runs.
 
 ## Local Commands
 
-Dry-run both scripts without network or package imports:
+Dry-run all scripts without network or package imports:
 
 ```bash
 python e2e/headless_sip_smoke.py --dry-run --ci
 python e2e/audio_stream_smoke.py --dry-run --ci
+node e2e/headless_sip_node_smoke.mjs --dry-run --ci
+node e2e/audio_stream_node_smoke.mjs --dry-run --ci
 ```
 
 Run the local audio-stream matrix after installing the Python package:
@@ -58,7 +60,7 @@ cd ../..
 node e2e/audio_stream_node_smoke.mjs --ci --timeout-seconds 10
 ```
 
-Run the live SIP smoke with credentials:
+Run the live Python SIP smoke with credentials:
 
 ```bash
 E2E_SIP_USERNAME=... \
@@ -67,11 +69,20 @@ E2E_SIP_DEST_URI=... \
 python e2e/headless_sip_smoke.py --ci --output /tmp/received_audio.wav
 ```
 
+Run the live Node SIP smoke after building the Node package:
+
+```bash
+E2E_SIP_USERNAME=... \
+E2E_SIP_PASSWORD=... \
+E2E_SIP_DEST_URI=... \
+node e2e/headless_sip_node_smoke.mjs --ci --output /tmp/received_audio_node.wav
+```
+
 ## Coverage Checklist
 
 ### SIP
 
-Covered by `headless_sip_smoke.py`:
+Covered by `headless_sip_smoke.py` and `headless_sip_node_smoke.mjs`:
 
 - [x] Loads only `E2E_` SIP configuration in CI mode.
 - [x] Registers the SIP account through `SipEndpoint`.
@@ -82,6 +93,7 @@ Covered by `headless_sip_smoke.py`:
 - [x] Receives media from the remote endpoint and writes a WAV artifact.
 - [x] Fails on insufficient received duration or speech.
 - [x] Hangs up and fails on unclean shutdown/termination paths.
+- [x] Node SDK parity smoke for registration, outbound call, RTP media send/receive, DTMF send, hangup, and shutdown.
 
 Not covered yet:
 
@@ -92,6 +104,7 @@ Not covered yet:
 - [ ] Codec negotiation beyond the configured 8 kHz smoke path.
 - [ ] NAT, packet loss, jitter, and provider failover behavior.
 - [ ] Carrier-specific busy/no-answer cases as a hard PR gate.
+- [ ] Full Node SIP parity across advanced SIP controls such as hold/resume, transfer, SIP INFO, recording, and beep detection.
 
 ### Audio Stream
 
