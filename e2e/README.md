@@ -23,14 +23,13 @@ Optional repository secrets or variables:
 The workflow runs on:
 
 - `workflow_dispatch`
-- daily schedule
 - pull requests labeled `e2e-headless`
 
 The workflow uses a global concurrency group because the SIP smoke is expected
 to use a dedicated SIP account. Audio-stream e2e is local and runs as the hard
 PR signal. Live SIP is quarantined on pull requests because carrier/provider
 state can return valid failures such as busy destinations; the same SIP smoke
-is a hard failure on scheduled and manual runs.
+is a hard failure on manual runs.
 
 ## Local Commands
 

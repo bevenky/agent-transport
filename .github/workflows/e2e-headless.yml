@@ -2,8 +2,6 @@ name: Headless SIP E2E
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: "17 3 * * *"
   pull_request:
     types: [opened, synchronize, reopened, labeled]
     branches: [main]
