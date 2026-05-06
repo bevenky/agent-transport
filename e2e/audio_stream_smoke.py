@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Local audio-stream e2e smoke for CI.
+"""Local audio-stream e2e matrix for CI.
 
 This exercises the Rust-backed AudioStreamEndpoint through the Python binding
-using a local Plivo-protocol WebSocket client. It needs no SIP credentials and
+using local Plivo-protocol WebSocket clients. It needs no SIP credentials and
 does not dial an external provider.
 """
 
@@ -18,10 +18,28 @@ import socket
 import sys
 import time
 from dataclasses import dataclass
+from typing import Callable
 
 
 class E2EFailure(RuntimeError):
     pass
+
+
+@dataclass(frozen=True)
+class Scenario:
+    name: str
+    wire_encoding: str
+    wire_sample_rate: int
+    input_sample_rate: int
+    output_sample_rate: int
+    controls: bool = False
+    disconnect: bool = False
+
+    @property
+    def content_type(self) -> str:
+        if self.wire_encoding == "mulaw":
+            return "audio/x-mulaw"
+        return "audio/x-l16"
 
 
 @dataclass(frozen=True)
@@ -36,19 +54,38 @@ class AudioStats:
         return 100.0 * self.speech_samples / self.samples
 
 
+SCENARIOS: dict[str, Scenario] = {
+    "l16-8k": Scenario("l16-8k", "l16", 8000, 8000, 8000),
+    "l16-16k": Scenario("l16-16k", "l16", 16000, 8000, 8000),
+    "mulaw-8k": Scenario("mulaw-8k", "mulaw", 8000, 8000, 8000),
+    "controls": Scenario("controls", "l16", 8000, 8000, 8000, controls=True),
+    "disconnect": Scenario("disconnect", "l16", 8000, 8000, 8000, disconnect=True),
+}
+
+
 def parse_args(argv):
-    parser = argparse.ArgumentParser(description="Audio-stream WebSocket e2e smoke")
+    parser = argparse.ArgumentParser(description="Audio-stream WebSocket e2e matrix")
     parser.add_argument("--ci", action="store_true", help="Accepted for workflow readability")
-    parser.add_argument("--dry-run", action="store_true", help="Validate CLI/import shape without opening a socket")
+    parser.add_argument("--dry-run", action="store_true", help="Validate CLI shape without opening a socket")
     parser.add_argument("--listen-host", default="127.0.0.1")
     parser.add_argument("--listen-port", type=int, default=0)
-    parser.add_argument("--input-sample-rate", type=int, default=8000)
-    parser.add_argument("--output-sample-rate", type=int, default=8000)
+    parser.add_argument(
+        "--scenario",
+        action="append",
+        choices=sorted([*SCENARIOS.keys(), "matrix"]),
+        help="Scenario to run. May be repeated. Default: matrix.",
+    )
     parser.add_argument("--min-inbound-seconds", type=float, default=0.25)
     parser.add_argument("--min-outbound-seconds", type=float, default=0.25)
     parser.add_argument("--speech-threshold", type=int, default=500)
     parser.add_argument("--timeout-seconds", type=float, default=10.0)
     return parser.parse_args(argv)
+
+
+def selected_scenarios(names: list[str] | None) -> list[Scenario]:
+    if not names or "matrix" in names:
+        return [SCENARIOS[name] for name in ("l16-8k", "l16-16k", "mulaw-8k", "controls", "disconnect")]
+    return [SCENARIOS[name] for name in names]
 
 
 def load_deps():
@@ -83,8 +120,50 @@ def pcm16le(samples: list[int]) -> bytes:
     return b"".join(int(sample).to_bytes(2, "little", signed=True) for sample in samples)
 
 
-def b64_pcm16le(samples: list[int]) -> str:
-    return base64.b64encode(pcm16le(samples)).decode("ascii")
+def linear_to_ulaw(sample: int) -> int:
+    bias = 0x84
+    clip = 32635
+    sample = max(-clip, min(clip, sample))
+    sign = 0x80 if sample < 0 else 0x00
+    if sample < 0:
+        sample = -sample
+    sample += bias
+    exponent = 7
+    mask = 0x4000
+    while exponent > 0 and not (sample & mask):
+        exponent -= 1
+        mask >>= 1
+    mantissa = (sample >> (exponent + 3)) & 0x0F
+    return ~(sign | (exponent << 4) | mantissa) & 0xFF
+
+
+def ulaw_to_linear(byte: int) -> int:
+    byte = (~byte) & 0xFF
+    sign = byte & 0x80
+    exponent = (byte >> 4) & 0x07
+    mantissa = byte & 0x0F
+    sample = ((mantissa << 3) + 0x84) << exponent
+    sample -= 0x84
+    return -sample if sign else sample
+
+
+def encode_wire(samples: list[int], scenario: Scenario) -> bytes:
+    if scenario.wire_encoding == "mulaw":
+        return bytes(linear_to_ulaw(sample) for sample in samples)
+    return pcm16le(samples)
+
+
+def decode_wire(raw: bytes, scenario: Scenario) -> list[int]:
+    if scenario.wire_encoding == "mulaw":
+        return [ulaw_to_linear(byte) for byte in raw]
+    return [
+        int.from_bytes(raw[idx : idx + 2], "little", signed=True)
+        for idx in range(0, len(raw) - 1, 2)
+    ]
+
+
+def b64_wire(samples: list[int], scenario: Scenario) -> str:
+    return base64.b64encode(encode_wire(samples, scenario)).decode("ascii")
 
 
 def audio_stats(samples: list[int], threshold: int) -> AudioStats:
@@ -92,7 +171,12 @@ def audio_stats(samples: list[int], threshold: int) -> AudioStats:
     return AudioStats(samples=len(samples), speech_samples=speech)
 
 
-async def wait_event(ep, event_type: str, timeout_seconds: float):
+async def wait_event(
+    ep,
+    event_type: str,
+    timeout_seconds: float,
+    predicate: Callable[[dict], bool] | None = None,
+):
     deadline = time.monotonic() + timeout_seconds
     while time.monotonic() < deadline:
         remaining_ms = max(1, int((deadline - time.monotonic()) * 1000))
@@ -100,10 +184,11 @@ async def wait_event(ep, event_type: str, timeout_seconds: float):
         if event is None:
             continue
         print(f"event={event.get('type')}")
-        if event.get("type") == event_type:
+        if event.get("type") == event_type and (predicate is None or predicate(event)):
             return event
         if event.get("type") in {"call_terminated", "shutdown"} and event_type != event.get("type"):
-            raise E2EFailure(f"Unexpected terminal event while waiting for {event_type}: {event}")
+            if predicate is None or predicate(event):
+                raise E2EFailure(f"Unexpected terminal event while waiting for {event_type}: {event}")
     raise E2EFailure(f"Timed out waiting for event: {event_type}")
 
 
@@ -124,7 +209,7 @@ async def recv_endpoint_audio(ep, session_id: str, sample_rate: int, min_seconds
     return stats
 
 
-def start_message(call_id: str, stream_id: str, sample_rate: int) -> str:
+def start_message(call_id: str, stream_id: str, scenario: Scenario) -> str:
     return json.dumps(
         {
             "event": "start",
@@ -132,8 +217,8 @@ def start_message(call_id: str, stream_id: str, sample_rate: int) -> str:
                 "callId": call_id,
                 "streamId": stream_id,
                 "mediaFormat": {
-                    "encoding": "audio/x-l16",
-                    "sampleRate": sample_rate,
+                    "encoding": scenario.content_type,
+                    "sampleRate": scenario.wire_sample_rate,
                 },
             },
             "extra_headers": '{"X-PH-e2e": "audio-stream"}',
@@ -141,8 +226,8 @@ def start_message(call_id: str, stream_id: str, sample_rate: int) -> str:
     )
 
 
-def media_message(samples: list[int]) -> str:
-    return json.dumps({"event": "media", "media": {"payload": b64_pcm16le(samples)}})
+def media_message(samples: list[int], scenario: Scenario) -> str:
+    return json.dumps({"event": "media", "media": {"payload": b64_wire(samples, scenario)}})
 
 
 async def read_json(ws, timeout_seconds: float):
@@ -174,126 +259,236 @@ async def connect_with_retry(websockets, uri: str, timeout_seconds: float):
     raise E2EFailure(f"Timed out connecting to {uri}: {last_error}")
 
 
-async def run_smoke(args):
-    websockets, AudioFrame, AudioStreamEndpoint, init_logging = load_deps()
-    rust_log = os.environ.get("E2E_RUST_LOG", "info")
-    init_logging(rust_log)
+async def start_session(websockets, ep, uri: str, scenario: Scenario, timeout_seconds: float):
+    ws = await connect_with_retry(websockets, uri, timeout_seconds)
+    call_id = f"audio-stream-e2e-call-{scenario.name}"
+    stream_id = f"audio-stream-e2e-stream-{scenario.name}"
+    await ws.send(start_message(call_id, stream_id, scenario))
+    answered = await wait_event(
+        ep,
+        "call_answered",
+        timeout_seconds,
+        lambda event: getattr(event.get("session"), "call_uuid", None) == call_id,
+    )
+    session_id = answered["session"].session_id
+    print(f"session_id={session_id}")
+    return ws, session_id
 
+
+async def send_inbound_audio(ws, scenario: Scenario, seconds: float):
+    inbound = sine_samples(scenario.wire_sample_rate, seconds, freq=440.0)
+    frame_size = int(scenario.wire_sample_rate * 0.02)
+    for idx in range(0, len(inbound), frame_size):
+        await ws.send(media_message(inbound[idx : idx + frame_size], scenario))
+        await asyncio.sleep(0.005)
+
+
+async def send_outbound_audio(ep, AudioFrame, session_id: str, scenario: Scenario, seconds: float):
+    outbound = sine_samples(scenario.output_sample_rate, seconds, freq=660.0)
+    outbound_frame_size = int(scenario.output_sample_rate * 0.02)
+    for idx in range(0, len(outbound), outbound_frame_size):
+        ep.send_audio(
+            session_id,
+            AudioFrame(outbound[idx : idx + outbound_frame_size], scenario.output_sample_rate, 1),
+        )
+        await asyncio.sleep(0.02)
+
+
+async def verify_outbound_audio(ws, ep, session_id: str, scenario: Scenario, min_seconds: float, threshold: int, timeout_seconds: float):
+    ep.flush(session_id)
+    expected_wire_bytes_per_second = scenario.wire_sample_rate
+    if scenario.wire_encoding == "l16":
+        expected_wire_bytes_per_second *= 2
+    required_outbound_bytes = int(expected_wire_bytes_per_second * min_seconds)
+    outbound_bytes = bytearray()
+    checkpoint_name = None
+    deadline = time.monotonic() + timeout_seconds
+    while (len(outbound_bytes) < required_outbound_bytes or checkpoint_name is None) and time.monotonic() < deadline:
+        msg = await read_json(ws, max(0.1, deadline - time.monotonic()))
+        event = msg.get("event")
+        print(f"ws_event={event}")
+        if event == "playAudio":
+            media = msg.get("media") or {}
+            if media.get("contentType") != scenario.content_type:
+                raise E2EFailure(f"Unexpected outbound contentType: {media.get('contentType')}")
+            if media.get("sampleRate") != scenario.wire_sample_rate:
+                raise E2EFailure(f"Unexpected outbound sampleRate: {media.get('sampleRate')}")
+            outbound_bytes.extend(base64.b64decode(media.get("payload", "")))
+        elif event == "checkpoint":
+            checkpoint_name = msg.get("name")
+            await ws.send(json.dumps({"event": "playedStream", "name": checkpoint_name}))
+
+    if len(outbound_bytes) < required_outbound_bytes:
+        raise E2EFailure(
+            f"Insufficient outbound audio: got {len(outbound_bytes)} bytes, need {required_outbound_bytes}"
+        )
+    if checkpoint_name is None:
+        raise E2EFailure("Did not receive outbound checkpoint")
+    if not await asyncio.to_thread(ep.wait_for_playout, session_id, int(timeout_seconds * 1000)):
+        raise E2EFailure("Timed out waiting for playout acknowledgement")
+
+    outbound_samples = decode_wire(bytes(outbound_bytes), scenario)
+    outbound_stats = audio_stats(outbound_samples, threshold)
+    if outbound_stats.speech_percent < 1.0:
+        raise E2EFailure(f"Insufficient outbound speech: {outbound_stats.speech_percent:.2f}%")
+    print(
+        "outbound_audio="
+        f"{len(outbound_samples) / scenario.wire_sample_rate:.3f}s "
+        f"speech={outbound_stats.speech_percent:.2f}%"
+    )
+
+
+async def run_media_roundtrip(websockets, AudioFrame, ep, uri: str, scenario: Scenario, args):
+    ws, session_id = await start_session(websockets, ep, uri, scenario, args.timeout_seconds)
+    try:
+        await send_inbound_audio(ws, scenario, args.min_inbound_seconds + 0.1)
+        inbound_stats = await recv_endpoint_audio(
+            ep,
+            session_id,
+            scenario.input_sample_rate,
+            args.min_inbound_seconds,
+            args.speech_threshold,
+            args.timeout_seconds,
+        )
+        print(
+            "inbound_audio="
+            f"{inbound_stats.samples / scenario.input_sample_rate:.3f}s "
+            f"speech={inbound_stats.speech_percent:.2f}%"
+        )
+
+        await ws.send(json.dumps({"event": "dtmf", "dtmf": {"digit": "7"}}))
+        dtmf = await wait_event(
+            ep,
+            "dtmf_received",
+            args.timeout_seconds,
+            lambda event: event.get("session_id") == session_id,
+        )
+        if dtmf.get("digit") != "7" or dtmf.get("method") != "audio_stream":
+            raise E2EFailure(f"Unexpected DTMF event: {dtmf}")
+        print("dtmf_received=7")
+
+        await send_outbound_audio(ep, AudioFrame, session_id, scenario, args.min_outbound_seconds + 0.25)
+        await verify_outbound_audio(
+            ws,
+            ep,
+            session_id,
+            scenario,
+            args.min_outbound_seconds,
+            args.speech_threshold,
+            args.timeout_seconds,
+        )
+
+        await ws.send(json.dumps({"event": "stop"}))
+        await wait_event(
+            ep,
+            "call_terminated",
+            args.timeout_seconds,
+            lambda event: getattr(event.get("session"), "session_id", None) == session_id,
+        )
+    finally:
+        await ws.close()
+
+
+async def run_controls(websockets, AudioFrame, ep, uri: str, scenario: Scenario, args):
+    ws, session_id = await start_session(websockets, ep, uri, scenario, args.timeout_seconds)
+    try:
+        ep.pause(session_id)
+        msg = await read_until(ws, lambda m: m.get("event") == "clearAudio", args.timeout_seconds)
+        if msg.get("streamId") != f"audio-stream-e2e-stream-{scenario.name}":
+            raise E2EFailure(f"Unexpected clearAudio streamId: {msg}")
+        await ws.send(json.dumps({"event": "clearedAudio"}))
+
+        ep.resume(session_id)
+        await send_outbound_audio(ep, AudioFrame, session_id, scenario, 0.08)
+        ep.clear_buffer(session_id)
+        await read_until(ws, lambda m: m.get("event") == "clearAudio", args.timeout_seconds)
+
+        ep.send_dtmf(session_id, "42")
+        dtmf_msg = await read_until(ws, lambda m: m.get("event") == "sendDTMF", args.timeout_seconds)
+        if dtmf_msg.get("dtmf") != "42":
+            raise E2EFailure(f"Unexpected outbound DTMF payload: {dtmf_msg}")
+
+        cp_name = ep.checkpoint(session_id, "manual-cp")
+        cp_msg = await read_until(ws, lambda m: m.get("event") == "checkpoint", args.timeout_seconds)
+        if cp_msg.get("name") != cp_name:
+            raise E2EFailure(f"Unexpected checkpoint payload: {cp_msg}")
+        await ws.send(json.dumps({"event": "playedStream", "name": cp_name}))
+
+        await ws.send(json.dumps({"event": "stop"}))
+        await wait_event(
+            ep,
+            "call_terminated",
+            args.timeout_seconds,
+            lambda event: getattr(event.get("session"), "session_id", None) == session_id,
+        )
+    finally:
+        await ws.close()
+
+
+async def run_disconnect(websockets, ep, uri: str, scenario: Scenario, args):
+    ws, session_id = await start_session(websockets, ep, uri, scenario, args.timeout_seconds)
+    await ws.close()
+    await wait_event(
+        ep,
+        "call_terminated",
+        args.timeout_seconds,
+        lambda event: getattr(event.get("session"), "session_id", None) == session_id,
+    )
+    try:
+        ep.send_dtmf(session_id, "1")
+    except Exception:
+        print("post_disconnect_send_failed=true")
+    else:
+        raise E2EFailure("send_dtmf unexpectedly succeeded after websocket disconnect")
+
+
+async def run_scenario(websockets, AudioFrame, AudioStreamEndpoint, scenario: Scenario, args):
     port = args.listen_port or choose_port(args.listen_host)
     listen_addr = f"{args.listen_host}:{port}"
     uri = f"ws://{listen_addr}"
+    print(f"scenario={scenario.name}")
     print(f"listen_addr={listen_addr}")
+    print(f"wire={scenario.content_type}/{scenario.wire_sample_rate}")
+    print(f"pipeline_in={scenario.input_sample_rate} pipeline_out={scenario.output_sample_rate}")
 
     ep = AudioStreamEndpoint(
         listen_addr,
         "",
         "",
-        args.input_sample_rate,
-        args.output_sample_rate,
+        scenario.input_sample_rate,
+        scenario.output_sample_rate,
         False,
     )
 
     try:
-        async with await connect_with_retry(websockets, uri, args.timeout_seconds) as ws:
-            call_id = "audio-stream-e2e-call"
-            stream_id = "audio-stream-e2e-stream"
-            await ws.send(start_message(call_id, stream_id, args.input_sample_rate))
-
-            answered = await wait_event(ep, "call_answered", args.timeout_seconds)
-            session = answered["session"]
-            session_id = session.session_id
-            print(f"session_id={session_id}")
-
-            inbound = sine_samples(args.input_sample_rate, args.min_inbound_seconds + 0.1)
-            frame_size = int(args.input_sample_rate * 0.02)
-            for idx in range(0, len(inbound), frame_size):
-                await ws.send(media_message(inbound[idx : idx + frame_size]))
-                await asyncio.sleep(0.005)
-
-            inbound_stats = await recv_endpoint_audio(
-                ep,
-                session_id,
-                args.input_sample_rate,
-                args.min_inbound_seconds,
-                args.speech_threshold,
-                args.timeout_seconds,
-            )
-            print(
-                "inbound_audio="
-                f"{inbound_stats.samples / args.input_sample_rate:.3f}s "
-                f"speech={inbound_stats.speech_percent:.2f}%"
-            )
-
-            await ws.send(json.dumps({"event": "dtmf", "dtmf": {"digit": "7"}}))
-            dtmf = await wait_event(ep, "dtmf_received", args.timeout_seconds)
-            if dtmf.get("digit") != "7" or dtmf.get("method") != "audio_stream":
-                raise E2EFailure(f"Unexpected DTMF event: {dtmf}")
-            print("dtmf_received=7")
-
-            outbound = sine_samples(args.output_sample_rate, args.min_outbound_seconds + 0.25, freq=660.0)
-            outbound_frame_size = int(args.output_sample_rate * 0.02)
-            for idx in range(0, len(outbound), outbound_frame_size):
-                ep.send_audio(
-                    session_id,
-                    AudioFrame(outbound[idx : idx + outbound_frame_size], args.output_sample_rate, 1),
-                )
-                await asyncio.sleep(0.02)
-            ep.flush(session_id)
-
-            required_outbound_bytes = int(args.output_sample_rate * args.min_outbound_seconds * 2)
-            outbound_bytes = bytearray()
-            checkpoint_name = None
-            deadline = time.monotonic() + args.timeout_seconds
-            while (len(outbound_bytes) < required_outbound_bytes or checkpoint_name is None) and time.monotonic() < deadline:
-                msg = await read_json(ws, max(0.1, deadline - time.monotonic()))
-                event = msg.get("event")
-                print(f"ws_event={event}")
-                if event == "playAudio":
-                    media = msg.get("media") or {}
-                    if media.get("contentType") != "audio/x-l16":
-                        raise E2EFailure(f"Unexpected outbound contentType: {media.get('contentType')}")
-                    outbound_bytes.extend(base64.b64decode(media.get("payload", "")))
-                elif event == "checkpoint":
-                    checkpoint_name = msg.get("name")
-                    await ws.send(json.dumps({"event": "playedStream", "name": checkpoint_name}))
-
-            if len(outbound_bytes) < required_outbound_bytes:
-                raise E2EFailure(
-                    f"Insufficient outbound audio: got {len(outbound_bytes)} bytes, need {required_outbound_bytes}"
-                )
-            if checkpoint_name is None:
-                raise E2EFailure("Did not receive outbound checkpoint")
-            if not await asyncio.to_thread(ep.wait_for_playout, session_id, int(args.timeout_seconds * 1000)):
-                raise E2EFailure("Timed out waiting for playout acknowledgement")
-
-            outbound_samples = [
-                int.from_bytes(outbound_bytes[idx : idx + 2], "little", signed=True)
-                for idx in range(0, len(outbound_bytes) - 1, 2)
-            ]
-            outbound_stats = audio_stats(outbound_samples, args.speech_threshold)
-            if outbound_stats.speech_percent < 1.0:
-                raise E2EFailure(f"Insufficient outbound speech: {outbound_stats.speech_percent:.2f}%")
-            print(
-                "outbound_audio="
-                f"{len(outbound_bytes) / 2 / args.output_sample_rate:.3f}s "
-                f"speech={outbound_stats.speech_percent:.2f}%"
-            )
-
-            await ws.send(json.dumps({"event": "stop"}))
-            await wait_event(ep, "call_terminated", args.timeout_seconds)
+        if scenario.controls:
+            await run_controls(websockets, AudioFrame, ep, uri, scenario, args)
+        elif scenario.disconnect:
+            await run_disconnect(websockets, ep, uri, scenario, args)
+        else:
+            await run_media_roundtrip(websockets, AudioFrame, ep, uri, scenario, args)
     finally:
         await asyncio.to_thread(ep.shutdown)
+    print(f"scenario_passed={scenario.name}")
+
+
+async def run_matrix(args):
+    websockets, AudioFrame, AudioStreamEndpoint, init_logging = load_deps()
+    rust_log = os.environ.get("E2E_RUST_LOG", "info")
+    init_logging(rust_log)
+    for scenario in selected_scenarios(args.scenario):
+        await run_scenario(websockets, AudioFrame, AudioStreamEndpoint, scenario, args)
 
 
 def run(args):
+    scenarios = selected_scenarios(args.scenario)
     print(f"dry_run={args.dry_run}")
-    print(f"input_sample_rate={args.input_sample_rate}")
-    print(f"output_sample_rate={args.output_sample_rate}")
+    print("scenarios=" + ",".join(scenario.name for scenario in scenarios))
     if args.dry_run:
         print("dry run passed")
         return 0
-    asyncio.run(run_smoke(args))
-    print("audio stream smoke passed")
+    asyncio.run(run_matrix(args))
+    print("audio stream matrix passed")
     return 0
 
 
