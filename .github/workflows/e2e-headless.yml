@@ -1,4 +1,4 @@
-name: Headless SIP E2E
+name: Headless Transport E2E
 
 on:
   workflow_dispatch:
@@ -7,7 +7,7 @@ on:
     branches: [main]
 
 concurrency:
-  group: headless-sip-e2e
+  group: headless-transport-e2e
   cancel-in-progress: false
 
 permissions:
@@ -171,7 +171,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: headless-sip-e2e-${{ github.run_id }}
+          name: headless-transport-e2e-${{ github.run_id }}
           path: |
             ${{ runner.temp }}/e2e/audio-stream-e2e.log
             ${{ runner.temp }}/e2e/audio-stream-node-e2e.log
