@@ -44,7 +44,7 @@ from livekit.agents.inference_runner import _InferenceRunner
 from livekit.agents.utils.hw import get_cpu_monitor
 from livekit.agents.utils import MovingAverage
 from .audio_stream_io import AudioStreamInput, AudioStreamOutput
-from ._room_facade import TransportRoom, create_transport_context
+from ._room_facade import TransportJobContextMixin, TransportRoom, create_transport_context
 from ._aio_utils import call_setup as _call_setup
 from livekit.rtc.room import SipDTMF
 from .server import JobProcess
@@ -161,7 +161,7 @@ class _LoadMonitor:
 # ─── JobContext ───────────────────────────────────────────────────
 
 @dataclass
-class JobContext:
+class JobContext(TransportJobContextMixin):
     """Context passed to the @audio_stream_session handler.
 
     Matches LiveKit's standard pattern exactly:
@@ -262,7 +262,7 @@ class JobContext:
 
     def add_shutdown_callback(self, callback):
         """Register a callback to run when the session ends."""
-        self._shutdown_callbacks.append(callback)
+        super().add_shutdown_callback(callback)
 
 
 # ─── AudioStreamServer ───────────────────────────────────────────────────────
@@ -722,10 +722,6 @@ class AudioStreamServer:
             caller_identity=plivo_call_uuid,
             remote_kind=0,
         )
-        # Set on JobContext so get_job_context().room works inside handler
-        job_stub, job_ctx_token = create_transport_context(
-            room, agent_name=self._agent_name)
-
         ctx = JobContext(
             session_id=session_id,
             plivo_call_uuid=plivo_call_uuid,
@@ -737,10 +733,15 @@ class AudioStreamServer:
             _agent_name=self._agent_name,
             _call_ended=session_ended,
             _room=room,
-            _job_stub=job_stub,
-            _job_ctx_token=job_ctx_token,
             _proc=self._proc,
         )
+        _, job_ctx_token = create_transport_context(
+            room,
+            agent_name=self._agent_name,
+            inference_executor=getattr(self, "_inference_executor", None),
+            context=ctx,
+        )
+        ctx._job_ctx_token = job_ctx_token
         self._session_contexts[session_id] = ctx
 
         async def _run_session():
@@ -770,13 +771,7 @@ class AudioStreamServer:
                         await ctx._session.aclose()
                     except Exception:
                         pass
-                for cb in ctx._shutdown_callbacks:
-                    try:
-                        result = cb()
-                        if asyncio.iscoroutine(result):
-                            await result
-                    except Exception:
-                        logger.exception("Shutdown callback failed")
+                await ctx._run_shutdown_callbacks("session ended")
                 try:
                     self._ep.hangup(session_id)
                 except Exception:
