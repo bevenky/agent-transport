@@ -5,6 +5,14 @@
 #![cfg(feature = "audio-stream")]
 
 use agent_transport::AudioFrame;
+use agent_transport::audio_stream::config::AudioStreamConfig;
+use agent_transport::audio_stream::endpoint::AudioStreamEndpoint;
+use agent_transport::audio_stream::plivo::PlivoProtocol;
+use agent_transport::EndpointError;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 
 #[test]
 fn test_audio_frame_to_bytes_roundtrip() {
@@ -118,4 +126,35 @@ fn test_plivo_clear_audio_json_format() {
     let json_str = serde_json::to_string(&msg).unwrap();
     assert!(json_str.contains("\"event\":\"clearAudio\""));
     assert!(json_str.contains("\"streamId\":\"test-stream-123\""));
+}
+
+#[test]
+fn test_missing_session_callback_send_returns_call_not_active() {
+    let ep = AudioStreamEndpoint::new(
+        AudioStreamConfig {
+            listen_addr: "127.0.0.1:0".into(),
+            auto_hangup: false,
+            ..Default::default()
+        },
+        Arc::new(PlivoProtocol::new("auth-id".into(), "auth-token".into())),
+    )
+    .unwrap();
+
+    let callback_called = Arc::new(AtomicBool::new(false));
+    let callback_called_inner = callback_called.clone();
+    let frame = AudioFrame::silence(8000, 1, 20);
+
+    let err = ep
+        .send_audio_with_callback(
+            "missing-session",
+            &frame,
+            Box::new(move || {
+                callback_called_inner.store(true, Ordering::SeqCst);
+            }),
+        )
+        .unwrap_err();
+
+    assert!(matches!(err, EndpointError::CallNotActive(id) if id == "missing-session"));
+    assert!(!callback_called.load(Ordering::SeqCst));
+    assert!(ep.clear_buffer("missing-session").is_ok());
 }

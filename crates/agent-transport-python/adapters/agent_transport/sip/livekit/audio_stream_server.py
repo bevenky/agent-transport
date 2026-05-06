@@ -653,6 +653,12 @@ class AudioStreamServer:
                     reason = ev.get("reason", "unknown")
                     logger.info("Session %s terminated (reason=%s)", session_id, reason)
 
+                    ctx = self._session_contexts.get(session_id)
+                    if ctx and ctx._session is not None:
+                        audio_output = getattr(getattr(ctx._session, "output", None), "audio", None)
+                        if hasattr(audio_output, "mark_transport_closed"):
+                            audio_output.mark_transport_closed()
+
                     # Clear audio buffer immediately to abort any pending playout
                     try:
                         self._ep.clear_buffer(session_id)
@@ -661,7 +667,6 @@ class AudioStreamServer:
 
                     # Emit participant_disconnected on Room facade (matches LiveKit WebRTC)
                     # RoomIO._on_participant_disconnected will call _close_soon() → session closes
-                    ctx = self._session_contexts.get(session_id)
                     if ctx and ctx._room:
                         remote = ctx._room._remote
                         remote.disconnect_reason = 1  # CLIENT_INITIATED

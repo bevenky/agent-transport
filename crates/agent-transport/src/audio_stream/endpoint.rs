@@ -207,7 +207,10 @@ impl AudioStreamEndpoint {
     /// Any audio already in the WS send queue will be overridden by the provider's clear.
     pub fn clear_buffer(&self, session_id: &str) -> Result<()> {
         let s = self.sessions.lock_or_recover();
-        let sess = s.get(session_id).ok_or_else(|| EndpointError::CallNotActive(session_id.to_string()))?;
+        let sess = match s.get(session_id) {
+            Some(sess) => sess,
+            None => return Ok(()),
+        };
         sess.audio_buf.clear();
         // Reset resampler to prevent stale filter artifacts on next speech
         *sess.input_resampler.lock_or_recover() = None;
