@@ -85,7 +85,7 @@ jobs:
       - name: Report quarantined SIP config failure
         if: github.event_name == 'pull_request' && steps.sip_secrets.outcome == 'failure'
         run: |
-          echo "::warning::SIP E2E secrets are missing on a quarantined PR run. Scheduled and manual runs still fail hard."
+          echo "::warning::SIP E2E secrets are missing on a quarantined PR run. Manual runs still fail hard."
 
       - name: Run headless SIP smoke
         if: steps.sip_secrets.outcome == 'success'
@@ -110,7 +110,7 @@ jobs:
       - name: Report quarantined SIP failure
         if: github.event_name == 'pull_request' && steps.sip_smoke.outcome == 'failure'
         run: |
-          echo "::warning::Headless SIP smoke failed on a quarantined PR run. Scheduled and manual runs still fail hard."
+          echo "::warning::Headless SIP smoke failed on a quarantined PR run. Manual runs still fail hard."
 
       - name: Upload E2E artifacts
         if: always()
