@@ -11,9 +11,20 @@ The headless workflow is `.github/workflows/e2e-headless.yml`.
 
 Required repository secrets:
 
-- `E2E_SIP_USERNAME`
-- `E2E_SIP_PASSWORD`
-- `E2E_SIP_DEST_URI`
+- `E2E_SIP_USERNAME_A`
+- `E2E_SIP_PASSWORD_A`
+- `E2E_SIP_DEST_URI_A`
+- `E2E_SIP_USERNAME_B`
+- `E2E_SIP_PASSWORD_B`
+- `E2E_SIP_DEST_URI_B`
+
+Account A is the primary test account. The regular outbound SIP smoke registers
+account A and calls `E2E_SIP_DEST_URI_A`.
+
+Account B is the controlled inbound caller. The inbound SIP smoke registers
+account A as the receiver, registers account B as the caller, and has B call
+`E2E_SIP_DEST_URI_B`. Configure `E2E_SIP_DEST_URI_B` as the URI that routes to
+account A.
 
 Optional repository secrets or variables:
 
@@ -31,14 +42,57 @@ PR signal. Live SIP is quarantined on pull requests because carrier/provider
 state can return valid failures such as busy destinations; the same SIP smoke
 is a hard failure on manual runs.
 
+## Test Setup
+
+```mermaid
+flowchart LR
+  subgraph gha["GitHub Actions e2e-smoke job"]
+    build["Build local Python and Node SDKs"]
+    pySip["Python SIP smoke"]
+    nodeSip["Node SIP smoke"]
+    pyAudio["Python AudioStream smoke"]
+    nodeAudio["Node AudioStream smoke"]
+  end
+
+  subgraph sip["Live SIP provider"]
+    accountA["Account A regular receiver and outbound caller"]
+    accountB["Account B inbound caller"]
+    outboundDest["E2E_SIP_DEST_URI_A echo or agent target"]
+    inboundDest["E2E_SIP_DEST_URI_B routes to account A"]
+  end
+
+  subgraph ws["Local AudioStream harness"]
+    wsServer["AudioStreamEndpoint WebSocket server"]
+    plivoClient["Simulated Plivo media client"]
+  end
+
+  build --> pySip
+  build --> nodeSip
+  build --> pyAudio
+  build --> nodeAudio
+
+  pySip --> accountA
+  nodeSip --> accountA
+  accountA --> outboundDest
+  accountB --> inboundDest
+  inboundDest --> accountA
+  accountA <--> accountB
+
+  pyAudio --> wsServer
+  nodeAudio --> wsServer
+  plivoClient <--> wsServer
+```
+
 ## Local Commands
 
 Dry-run all scripts without network or package imports:
 
 ```bash
 python e2e/headless_sip_smoke.py --dry-run --ci
+python e2e/headless_sip_smoke.py --dry-run --ci --direction inbound
 python e2e/audio_stream_smoke.py --dry-run --ci
 node e2e/headless_sip_node_smoke.mjs --dry-run --ci
+node e2e/headless_sip_node_smoke.mjs --dry-run --ci --direction inbound
 node e2e/audio_stream_node_smoke.mjs --dry-run --ci
 ```
 
@@ -63,19 +117,49 @@ node e2e/audio_stream_node_smoke.mjs --ci --timeout-seconds 10
 Run the live Python SIP smoke with credentials:
 
 ```bash
-E2E_SIP_USERNAME=... \
-E2E_SIP_PASSWORD=... \
-E2E_SIP_DEST_URI=... \
+E2E_SIP_USERNAME_A=... \
+E2E_SIP_PASSWORD_A=... \
+E2E_SIP_DEST_URI_A=... \
 python e2e/headless_sip_smoke.py --ci --output /tmp/received_audio.wav
+```
+
+Run the live Python inbound SIP smoke with two accounts:
+
+```bash
+E2E_SIP_USERNAME_A=... \
+E2E_SIP_PASSWORD_A=... \
+E2E_SIP_USERNAME_B=... \
+E2E_SIP_PASSWORD_B=... \
+E2E_SIP_DEST_URI_B=... \
+python e2e/headless_sip_smoke.py \
+  --ci \
+  --direction inbound \
+  --output /tmp/received_audio_inbound_a.wav \
+  --caller-output /tmp/received_audio_inbound_b.wav
 ```
 
 Run the live Node SIP smoke after building the Node package:
 
 ```bash
-E2E_SIP_USERNAME=... \
-E2E_SIP_PASSWORD=... \
-E2E_SIP_DEST_URI=... \
+E2E_SIP_USERNAME_A=... \
+E2E_SIP_PASSWORD_A=... \
+E2E_SIP_DEST_URI_A=... \
 node e2e/headless_sip_node_smoke.mjs --ci --output /tmp/received_audio_node.wav
+```
+
+Run the live Node inbound SIP smoke after building the Node package:
+
+```bash
+E2E_SIP_USERNAME_A=... \
+E2E_SIP_PASSWORD_A=... \
+E2E_SIP_USERNAME_B=... \
+E2E_SIP_PASSWORD_B=... \
+E2E_SIP_DEST_URI_B=... \
+node e2e/headless_sip_node_smoke.mjs \
+  --ci \
+  --direction inbound \
+  --output /tmp/received_audio_node_inbound_a.wav \
+  --caller-output /tmp/received_audio_node_inbound_b.wav
 ```
 
 ## Coverage Checklist
@@ -85,20 +169,23 @@ node e2e/headless_sip_node_smoke.mjs --ci --output /tmp/received_audio_node.wav
 Covered by `headless_sip_smoke.py` and `headless_sip_node_smoke.mjs`:
 
 - [x] Loads only `E2E_` SIP configuration in CI mode.
-- [x] Registers the SIP account through `SipEndpoint`.
-- [x] Places an outbound call to `E2E_SIP_DEST_URI`.
+- [x] Uses `_A` credentials for regular outbound SIP testing.
+- [x] Uses `_B` credentials as the controlled inbound SIP caller.
+- [x] Registers SIP accounts through `SipEndpoint`.
+- [x] Places an outbound call from account A to `E2E_SIP_DEST_URI_A`.
+- [x] Places an inbound test call from account B to `E2E_SIP_DEST_URI_B`, routed to account A.
 - [x] Waits for call answer with a bounded timeout.
-- [x] Sends real 8 kHz mono PCM audio from a WAV fixture.
+- [x] Sends real 8 kHz mono PCM audio from a WAV fixture on outbound and inbound call legs.
 - [x] Sends DTMF on the active call.
-- [x] Receives media from the remote endpoint and writes a WAV artifact.
+- [x] Receives media from the remote endpoint and writes WAV artifacts.
+- [x] On inbound, asserts media from B to A and from A to B.
 - [x] Fails on insufficient received duration or speech.
 - [x] Hangs up and fails on unclean shutdown/termination paths.
-- [x] Node SDK parity smoke for registration, outbound call, RTP media send/receive, DTMF send, hangup, and shutdown.
+- [x] Node SDK parity smoke for registration, outbound call, inbound call, RTP media send/receive, DTMF send, hangup, and shutdown.
 
 Not covered yet:
 
 - [ ] Deterministic local SIP registrar/dialog/RTP peer in CI.
-- [ ] Inbound SIP calls.
 - [ ] Multiple simultaneous SIP calls on the same endpoint/account.
 - [ ] SIP redirects, re-INVITE, hold/resume, transfer, or REFER flows.
 - [ ] Codec negotiation beyond the configured 8 kHz smoke path.

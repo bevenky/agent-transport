@@ -108,3 +108,7 @@ multi-session isolation.
 Do not add bespoke e2e tests for every PR. Prefer focused unit/integration
 tests for implementation details, and reserve e2e coverage for behavior that
 should never regress across transports, bindings, or adapters.
+
+When adding or extending e2e coverage for public SDK behavior, cover both
+Python and Node paths when the behavior is exposed in both bindings. If parity
+is intentionally deferred, document the gap in `e2e/README.md`.

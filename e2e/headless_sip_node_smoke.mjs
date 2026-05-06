@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * Headless SIP e2e smoke for the Node SDK.
+ * SIP e2e smoke for the Node SDK.
  *
  * This mirrors the Python SIP smoke while keeping CI policy local to e2e:
  * E2E_* environment names, bounded waits, strict exit codes, redacted logs,
@@ -19,6 +19,7 @@ const FRAME_SAMPLES = Math.floor((SAMPLE_RATE * 20) / 1000);
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const DEFAULT_CLIP = resolve(REPO_ROOT, "examples/audio/caller_greeting_8k.wav");
 const DEFAULT_OUTPUT = "/tmp/received_audio_node.wav";
+const DEFAULT_CALLER_OUTPUT = "/tmp/received_audio_node_caller.wav";
 
 class E2EFailure extends Error {}
 
@@ -26,8 +27,10 @@ function parseArgs(argv) {
   const args = {
     ci: false,
     dryRun: false,
+    direction: "outbound",
     clip: DEFAULT_CLIP,
     output: DEFAULT_OUTPUT,
+    callerOutput: DEFAULT_CALLER_OUTPUT,
     maxRegisterSeconds: 10,
     maxAnswerSeconds: 30,
     maxCallSeconds: 90,
@@ -47,9 +50,16 @@ function parseArgs(argv) {
     };
 
     if (arg === "--ci") args.ci = true;
+    else if (arg === "--direction") {
+      args.direction = next();
+      if (!["outbound", "inbound"].includes(args.direction)) {
+        throw new E2EFailure(`Unsupported --direction: ${args.direction}`);
+      }
+    }
     else if (arg === "--dry-run") args.dryRun = true;
     else if (arg === "--clip") args.clip = next();
     else if (arg === "--output") args.output = next();
+    else if (arg === "--caller-output") args.callerOutput = next();
     else if (arg === "--max-register-seconds") args.maxRegisterSeconds = Number(next());
     else if (arg === "--max-answer-seconds") args.maxAnswerSeconds = Number(next());
     else if (arg === "--max-call-seconds") args.maxCallSeconds = Number(next());
@@ -65,23 +75,38 @@ function parseArgs(argv) {
 }
 
 function e2eEnv(args) {
-  const username = process.env.E2E_SIP_USERNAME || "";
-  const password = process.env.E2E_SIP_PASSWORD || "";
-  const destUri = process.env.E2E_SIP_DEST_URI || "";
+  const env = {
+    a: {
+      username: process.env.E2E_SIP_USERNAME_A || "",
+      password: process.env.E2E_SIP_PASSWORD_A || "",
+      destUri: process.env.E2E_SIP_DEST_URI_A || "",
+    },
+    b: {
+      username: process.env.E2E_SIP_USERNAME_B || "",
+      password: process.env.E2E_SIP_PASSWORD_B || "",
+      destUri: process.env.E2E_SIP_DEST_URI_B || "",
+    },
+  };
   const sipDomain = process.env.E2E_SIP_DOMAIN || "phone.plivo.com";
   const rustLog = process.env.E2E_RUST_LOG || "info";
 
   const missing = [
-    ["E2E_SIP_USERNAME", username],
-    ["E2E_SIP_PASSWORD", password],
-    ["E2E_SIP_DEST_URI", destUri],
+    ["E2E_SIP_USERNAME_A", env.a.username],
+    ["E2E_SIP_PASSWORD_A", env.a.password],
+    ...(args.direction === "outbound"
+      ? [["E2E_SIP_DEST_URI_A", env.a.destUri]]
+      : [
+          ["E2E_SIP_USERNAME_B", env.b.username],
+          ["E2E_SIP_PASSWORD_B", env.b.password],
+          ["E2E_SIP_DEST_URI_B", env.b.destUri],
+        ]),
   ].filter(([, value]) => !value).map(([name]) => name);
 
   if (missing.length && !args.dryRun) {
     throw new E2EFailure(`Missing required env vars: ${missing.join(", ")}`);
   }
 
-  return { username, password, destUri, sipDomain, rustLog };
+  return { ...env, sipDomain, rustLog };
 }
 
 async function loadAgentTransport() {
@@ -201,13 +226,17 @@ function audioStats(samples, threshold = 500) {
   };
 }
 
-async function waitForEventType(endpoint, eventType, timeoutSeconds) {
+function sessionIdFromEvent(event) {
+  return event.sessionId || event.session?.sessionId || event.session?.session_id || "";
+}
+
+async function waitForEventType(endpoint, eventType, timeoutSeconds, label = "event") {
   const deadline = Date.now() + timeoutSeconds * 1000;
   while (Date.now() < deadline) {
     const remainingMs = Math.max(1, deadline - Date.now());
     const event = await endpoint.waitForEvent(Math.min(remainingMs, 500));
     if (!event) continue;
-    console.log(`event=${event.eventType}`);
+    console.log(`[${label}] event=${event.eventType}`);
     if (event.eventType === eventType) return event;
     if (event.eventType === "registration_failed") {
       throw new E2EFailure(`Registration failed: ${event.error || JSON.stringify(event)}`);
@@ -255,7 +284,7 @@ async function sendSilence(endpoint, sessionId, seconds, callState) {
   }
 }
 
-function startReceivers(endpoint, sessionId) {
+function startReceivers(endpoint, sessionId, label = "recv") {
   const state = {
     running: true,
     ended: false,
@@ -274,11 +303,11 @@ function startReceivers(endpoint, sessionId) {
         state.receivedSamples.push(...samples);
         frameCount += 1;
         if (frameCount === 1) {
-          console.log(`[recv] first frame: ${samples.length} samples at ${SAMPLE_RATE}Hz`);
+          console.log(`[${label}/recv] first frame: ${samples.length} samples at ${SAMPLE_RATE}Hz`);
         } else if (frameCount % 500 === 0) {
           const duration = state.receivedSamples.length / SAMPLE_RATE;
           const stats = audioStats(samples);
-          console.log(`[recv] ${frameCount} frames (${duration.toFixed(1)}s total, rms=${stats.rms.toFixed(0)})`);
+          console.log(`[${label}/recv] ${frameCount} frames (${duration.toFixed(1)}s total, rms=${stats.rms.toFixed(0)})`);
         }
       } catch (error) {
         if (state.running && !state.ended) state.errors.push(`recvAudioBytesAsync failed: ${error.message}`);
@@ -293,12 +322,12 @@ function startReceivers(endpoint, sessionId) {
         const event = await endpoint.waitForEvent(200);
         if (!event) continue;
         if (event.eventType === "call_terminated") {
-          console.log(`[event] call ended: ${event.reason || ""}`);
+          console.log(`[${label}/event] call ended: ${event.reason || ""}`);
           state.ended = true;
           break;
         }
         if (event.eventType === "dtmf_received") {
-          console.log(`[event] DTMF received: ${event.digit}`);
+          console.log(`[${label}/event] DTMF received: ${event.digit}`);
         }
       } catch (error) {
         if (state.running && !state.ended) state.errors.push(`waitForEvent failed: ${error.message}`);
@@ -310,14 +339,14 @@ function startReceivers(endpoint, sessionId) {
   return { state, recvTask, eventTask };
 }
 
-async function waitForReceivedAudio(state, minSeconds, timeoutSeconds) {
+async function waitForReceivedAudio(state, minSeconds, timeoutSeconds, label = "recv") {
   const deadline = Date.now() + timeoutSeconds * 1000;
   while (Date.now() < deadline && !state.ended) {
     const duration = state.receivedSamples.length / SAMPLE_RATE;
     if (duration >= minSeconds) return;
     await sleep(100);
   }
-  throw new E2EFailure(`Timed out waiting for ${minSeconds.toFixed(1)}s of received audio`);
+  throw new E2EFailure(`Timed out waiting for ${minSeconds.toFixed(1)}s of received audio on ${label}`);
 }
 
 async function waitForCallEnded(state, timeoutSeconds) {
@@ -329,58 +358,61 @@ async function waitForCallEnded(state, timeoutSeconds) {
   throw new E2EFailure("Timed out waiting for call termination after hangup");
 }
 
-function analyze(samples, outputPath, speechThreshold) {
+function analyze(samples, outputPath, speechThreshold, label = "received") {
   saveWav(outputPath, samples);
   const stats = audioStats(samples, speechThreshold);
   const duration = samples.length / SAMPLE_RATE;
-  console.log(`received=${duration.toFixed(2)}s peak=${stats.peak} rms=${stats.rms.toFixed(0)} speech=${stats.speechPercent.toFixed(2)}%`);
-  console.log(`artifact=${outputPath}`);
+  console.log(`[${label}] received=${duration.toFixed(2)}s peak=${stats.peak} rms=${stats.rms.toFixed(0)} speech=${stats.speechPercent.toFixed(2)}%`);
+  console.log(`[${label}] artifact=${outputPath}`);
   return { duration, speechPercent: stats.speechPercent };
 }
 
-async function run(args) {
-  const env = e2eEnv(args);
-  console.log(`dry_run=${args.dryRun}`);
-  console.log("sdk=node");
-  console.log("sip env loaded");
-  console.log(`clip=${args.clip}`);
-  console.log(`output=${args.output}`);
-
-  if (args.dryRun) {
-    console.log("dry run passed");
-    return;
+function assertAnalyzedAudio(samples, outputPath, args, label) {
+  const { duration, speechPercent } = analyze(samples, outputPath, args.speechThreshold, label);
+  if (duration < args.minReceivedSeconds) {
+    throw new E2EFailure(`${label} audio duration ${duration.toFixed(2)}s is below ${args.minReceivedSeconds.toFixed(2)}s`);
   }
+  if (speechPercent < args.minSpeechPercent) {
+    throw new E2EFailure(`${label} speech percent ${speechPercent.toFixed(2)}% is below ${args.minSpeechPercent.toFixed(2)}%`);
+  }
+}
 
-  const { SipEndpoint, initLogging } = await loadAgentTransport();
-  initLogging(env.rustLog);
+async function stopReceivers(receivers) {
+  if (!receivers) return;
+  receivers.state.running = false;
+  await Promise.race([
+    Promise.allSettled([receivers.recvTask, receivers.eventTask]),
+    sleep(500),
+  ]);
+}
 
-  const clip = loadWav(args.clip);
+async function runOutbound(args, SipEndpoint, env, clip) {
   const endpoint = new SipEndpoint({ sipServer: env.sipDomain, logLevel: 3 });
   let sessionId = null;
   let receivers = null;
 
   try {
-    console.log("registering SIP account");
-    endpoint.register(env.username, env.password);
-    await waitForEventType(endpoint, "registered", args.maxRegisterSeconds);
-    console.log("registered");
+    console.log("registering SIP account A");
+    endpoint.register(env.a.username, env.a.password);
+    await waitForEventType(endpoint, "registered", args.maxRegisterSeconds, "account-a");
+    console.log("registered account A");
 
-    console.log("calling E2E_SIP_DEST_URI");
+    console.log("account A calling E2E_SIP_DEST_URI_A");
     try {
-      sessionId = endpoint.call(env.destUri);
+      sessionId = endpoint.call(env.a.destUri);
     } catch (error) {
       throw new E2EFailure(`Call initiation failed: ${error.message}`);
     }
 
-    const answered = await waitForEventType(endpoint, "call_answered", args.maxAnswerSeconds);
-    sessionId = answered.session?.sessionId || sessionId;
+    const answered = await waitForEventType(endpoint, "call_answered", args.maxAnswerSeconds, "account-a");
+    sessionId = sessionIdFromEvent(answered) || sessionId;
     console.log(`connected session_id=${sessionId}`);
 
-    receivers = startReceivers(endpoint, sessionId);
+    receivers = startReceivers(endpoint, sessionId, "account-a");
     const deadline = Date.now() + args.maxCallSeconds * 1000;
 
     await sendSilence(endpoint, sessionId, 0.5, receivers.state);
-    await sendFramesRealtime(endpoint, sessionId, clip, "caller-clip", receivers.state);
+    await sendFramesRealtime(endpoint, sessionId, clip, "a-outbound-clip", receivers.state);
 
     console.log(`sending DTMF ${args.dtmfDigit}`);
     try {
@@ -393,6 +425,7 @@ async function run(args) {
       receivers.state,
       args.minReceivedSeconds,
       Math.min(15.0, Math.max(0.0, (deadline - Date.now()) / 1000)),
+      "account-a",
     );
     await sendSilence(endpoint, sessionId, 1.0, receivers.state);
 
@@ -405,13 +438,7 @@ async function run(args) {
     }
     await waitForCallEnded(receivers.state, args.maxHangupSeconds);
   } finally {
-    if (receivers) {
-      receivers.state.running = false;
-      await Promise.race([
-        Promise.allSettled([receivers.recvTask, receivers.eventTask]),
-        sleep(500),
-      ]);
-    }
+    await stopReceivers(receivers);
     try {
       endpoint.shutdown();
     } catch (error) {
@@ -422,14 +449,136 @@ async function run(args) {
   if (receivers?.state.errors.length) {
     throw new E2EFailure(receivers.state.errors.join("; "));
   }
+  assertAnalyzedAudio(receivers ? [...receivers.state.receivedSamples] : [], args.output, args, "account-a");
+}
 
-  const samples = receivers ? [...receivers.state.receivedSamples] : [];
-  const { duration, speechPercent } = analyze(samples, args.output, args.speechThreshold);
-  if (duration < args.minReceivedSeconds) {
-    throw new E2EFailure(`Received audio duration ${duration.toFixed(2)}s is below ${args.minReceivedSeconds.toFixed(2)}s`);
+async function runInbound(args, SipEndpoint, env, clip) {
+  const receiverEndpoint = new SipEndpoint({ sipServer: env.sipDomain, logLevel: 3 });
+  const callerEndpoint = new SipEndpoint({ sipServer: env.sipDomain, logLevel: 3 });
+  let receiverMedia = null;
+  let callerMedia = null;
+
+  try {
+    console.log("registering receiver account A");
+    receiverEndpoint.register(env.a.username, env.a.password);
+    await waitForEventType(receiverEndpoint, "registered", args.maxRegisterSeconds, "receiver-a");
+    console.log("registered receiver account A");
+
+    console.log("registering caller account B");
+    callerEndpoint.register(env.b.username, env.b.password);
+    await waitForEventType(callerEndpoint, "registered", args.maxRegisterSeconds, "caller-b");
+    console.log("registered caller account B");
+
+    console.log("caller B calling E2E_SIP_DEST_URI_B");
+    let callerSessionId = "";
+    try {
+      callerSessionId = callerEndpoint.call(env.b.destUri);
+    } catch (error) {
+      throw new E2EFailure(`Inbound caller initiation failed: ${error.message}`);
+    }
+
+    const ringing = await waitForEventType(receiverEndpoint, "call_ringing", args.maxAnswerSeconds, "receiver-a");
+    let receiverSessionId = sessionIdFromEvent(ringing);
+    const receiverAnswered = await waitForEventType(receiverEndpoint, "call_answered", args.maxAnswerSeconds, "receiver-a");
+    receiverSessionId = sessionIdFromEvent(receiverAnswered) || receiverSessionId;
+    const callerAnswered = await waitForEventType(callerEndpoint, "call_answered", args.maxAnswerSeconds, "caller-b");
+    callerSessionId = sessionIdFromEvent(callerAnswered) || callerSessionId;
+
+    if (!receiverSessionId) throw new E2EFailure("Inbound receiver did not expose a session id");
+    if (!callerSessionId) throw new E2EFailure("Inbound caller did not expose a session id");
+    console.log(`connected receiver_session_id=${receiverSessionId} caller_session_id=${callerSessionId}`);
+
+    receiverMedia = startReceivers(receiverEndpoint, receiverSessionId, "receiver-a");
+    callerMedia = startReceivers(callerEndpoint, callerSessionId, "caller-b");
+    const deadline = Date.now() + args.maxCallSeconds * 1000;
+
+    await sendSilence(callerEndpoint, callerSessionId, 0.5, callerMedia.state);
+    await sendFramesRealtime(callerEndpoint, callerSessionId, clip, "b-to-a-clip", callerMedia.state);
+    await waitForReceivedAudio(
+      receiverMedia.state,
+      args.minReceivedSeconds,
+      Math.min(15.0, Math.max(0.0, (deadline - Date.now()) / 1000)),
+      "receiver-a",
+    );
+
+    await sendSilence(receiverEndpoint, receiverSessionId, 0.5, receiverMedia.state);
+    await sendFramesRealtime(receiverEndpoint, receiverSessionId, clip, "a-to-b-clip", receiverMedia.state);
+    await waitForReceivedAudio(
+      callerMedia.state,
+      args.minReceivedSeconds,
+      Math.min(15.0, Math.max(0.0, (deadline - Date.now()) / 1000)),
+      "caller-b",
+    );
+
+    console.log(`caller B sending DTMF ${args.dtmfDigit}`);
+    try {
+      callerEndpoint.sendDtmf(callerSessionId, args.dtmfDigit);
+    } catch (error) {
+      throw new E2EFailure(`Inbound DTMF send failed: ${error.message}`);
+    }
+
+    await sendSilence(callerEndpoint, callerSessionId, 0.5, callerMedia.state);
+    await sendSilence(receiverEndpoint, receiverSessionId, 0.5, receiverMedia.state);
+
+    if (callerMedia.state.ended || receiverMedia.state.ended) {
+      throw new E2EFailure("Inbound call ended before scripted hangup");
+    }
+    console.log("caller B hanging up");
+    try {
+      callerEndpoint.hangup(callerSessionId);
+    } catch (error) {
+      throw new E2EFailure(`Inbound hangup failed: ${error.message}`);
+    }
+    await waitForCallEnded(callerMedia.state, args.maxHangupSeconds);
+    await waitForCallEnded(receiverMedia.state, args.maxHangupSeconds);
+  } finally {
+    await stopReceivers(callerMedia);
+    await stopReceivers(receiverMedia);
+    for (const [label, endpoint] of [["caller", callerEndpoint], ["receiver", receiverEndpoint]]) {
+      try {
+        endpoint.shutdown();
+      } catch (error) {
+        console.log(`warning: ${label} shutdown failed: ${error.message}`);
+      }
+    }
   }
-  if (speechPercent < args.minSpeechPercent) {
-    throw new E2EFailure(`Speech percent ${speechPercent.toFixed(2)}% is below ${args.minSpeechPercent.toFixed(2)}%`);
+
+  const errors = [
+    ...(receiverMedia?.state.errors || []),
+    ...(callerMedia?.state.errors || []),
+  ];
+  if (errors.length) {
+    throw new E2EFailure(errors.join("; "));
+  }
+  assertAnalyzedAudio(receiverMedia ? [...receiverMedia.state.receivedSamples] : [], args.output, args, "receiver-a");
+  assertAnalyzedAudio(callerMedia ? [...callerMedia.state.receivedSamples] : [], args.callerOutput, args, "caller-b");
+}
+
+async function run(args) {
+  const env = e2eEnv(args);
+  console.log(`dry_run=${args.dryRun}`);
+  console.log("sdk=node");
+  console.log(`direction=${args.direction}`);
+  console.log("sip env loaded");
+  console.log(`clip=${args.clip}`);
+  console.log(`output=${args.output}`);
+  if (args.direction === "inbound") {
+    console.log(`caller_output=${args.callerOutput}`);
+  }
+
+  if (args.dryRun) {
+    console.log("dry run passed");
+    return;
+  }
+
+  const { SipEndpoint, initLogging } = await loadAgentTransport();
+  initLogging(env.rustLog);
+
+  const clip = loadWav(args.clip);
+  if (args.direction === "outbound") {
+    await runOutbound(args, SipEndpoint, env, clip);
+  } else {
+    await runInbound(args, SipEndpoint, env, clip);
   }
 
   console.log("node SIP e2e smoke passed");
