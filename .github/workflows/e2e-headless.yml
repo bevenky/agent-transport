@@ -36,15 +36,24 @@ jobs:
         with:
           python-version: "3.11"
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
       - name: Dry-run headless scenario config
         run: python e2e/headless_sip_smoke.py --dry-run --ci
 
       - name: Dry-run audio stream matrix config
         run: python e2e/audio_stream_smoke.py --dry-run --ci
 
+      - name: Dry-run Node audio stream SDK config
+        run: node e2e/audio_stream_node_smoke.mjs --dry-run --ci
+
       - uses: dtolnay/rust-toolchain@1.94.0
 
       - uses: Swatinem/rust-cache@v2
+
+      - uses: oven-sh/setup-bun@v2
 
       - name: Install system dependencies
         run: |
@@ -57,6 +66,12 @@ jobs:
           python -m pip install websockets
           python -m pip install ./crates/agent-transport-python
 
+      - name: Build local Node package
+        working-directory: crates/agent-transport-node
+        run: |
+          bun install
+          bun run build
+
       - name: Run audio stream matrix
         shell: bash
         run: |
@@ -68,6 +83,18 @@ jobs:
             --min-outbound-seconds 0.25 \
             --timeout-seconds 10 \
             2>&1 | tee "$RUNNER_TEMP/e2e/audio-stream-e2e.log"
+
+      - name: Run Node audio stream SDK smoke
+        shell: bash
+        run: |
+          set -o pipefail
+          mkdir -p "$RUNNER_TEMP/e2e"
+          node e2e/audio_stream_node_smoke.mjs \
+            --ci \
+            --min-inbound-seconds 0.25 \
+            --min-outbound-seconds 0.25 \
+            --timeout-seconds 10 \
+            2>&1 | tee "$RUNNER_TEMP/e2e/audio-stream-node-e2e.log"
 
       - name: Check SIP E2E secrets
         id: sip_secrets
@@ -119,6 +146,7 @@ jobs:
           name: headless-sip-e2e-${{ github.run_id }}
           path: |
             ${{ runner.temp }}/e2e/audio-stream-e2e.log
+            ${{ runner.temp }}/e2e/audio-stream-node-e2e.log
             ${{ runner.temp }}/e2e/headless-e2e.log
             ${{ runner.temp }}/e2e/received_audio.wav
           if-no-files-found: ignore

@@ -48,6 +48,16 @@ python -m pip install ./crates/agent-transport-python
 python e2e/audio_stream_smoke.py --ci --timeout-seconds 10
 ```
 
+Run the Node SDK audio-stream parity smoke after building the Node package:
+
+```bash
+cd crates/agent-transport-node
+bun install
+bun run build
+cd ../..
+node e2e/audio_stream_node_smoke.mjs --ci --timeout-seconds 10
+```
+
 Run the live SIP smoke with credentials:
 
 ```bash
@@ -85,7 +95,7 @@ Not covered yet:
 
 ### Audio Stream
 
-Covered by `audio_stream_smoke.py`:
+Covered by `audio_stream_smoke.py` and `audio_stream_node_smoke.mjs`:
 
 - [x] Local Plivo-compatible WebSocket `start` and `stop` lifecycle.
 - [x] Inbound L16 8 kHz media into `AudioStreamEndpoint`.
@@ -99,6 +109,7 @@ Covered by `audio_stream_smoke.py`:
 - [x] Outbound `sendDTMF`.
 - [x] Manual checkpoint message emission.
 - [x] WebSocket disconnect cleanup and post-disconnect send failure.
+- [x] Node SDK parity smoke for L16 8 kHz media, DTMF/control, playout, and cleanup.
 
 Not covered yet:
 
@@ -110,3 +121,4 @@ Not covered yet:
 - [ ] Background audio mixing, recording, and beep detection paths.
 - [ ] Pipecat/LiveKit adapter-level behavior on top of the raw endpoint.
 - [ ] Non-8 kHz pipeline sample rates and multi-channel audio.
+- [ ] Full Node SDK parity across every Python matrix scenario.
