@@ -1,0 +1,127 @@
+name: Headless SIP E2E
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 3 * * *"
+  pull_request:
+    types: [opened, synchronize, reopened, labeled]
+    branches: [main]
+
+concurrency:
+  group: headless-sip-e2e
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  pull-requests: read
+
+env:
+  CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+  E2E_RUST_LOG: info
+
+jobs:
+  e2e-smoke:
+    name: e2e-smoke
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'e2e-headless')
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      E2E_SIP_USERNAME: ${{ secrets.E2E_SIP_USERNAME }}
+      E2E_SIP_PASSWORD: ${{ secrets.E2E_SIP_PASSWORD }}
+      E2E_SIP_DEST_URI: ${{ secrets.E2E_SIP_DEST_URI }}
+      E2E_SIP_DOMAIN: ${{ secrets.E2E_SIP_DOMAIN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Dry-run headless scenario config
+        run: python e2e/headless_sip_smoke.py --dry-run --ci
+
+      - name: Dry-run audio stream smoke config
+        run: python e2e/audio_stream_smoke.py --dry-run --ci
+
+      - uses: dtolnay/rust-toolchain@1.94.0
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake libopus-dev
+
+      - name: Install local Python package
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install websockets
+          python -m pip install ./crates/agent-transport-python
+
+      - name: Run audio stream smoke
+        shell: bash
+        run: |
+          set -o pipefail
+          mkdir -p "$RUNNER_TEMP/e2e"
+          python e2e/audio_stream_smoke.py \
+            --ci \
+            --min-inbound-seconds 0.25 \
+            --min-outbound-seconds 0.25 \
+            --timeout-seconds 10 \
+            2>&1 | tee "$RUNNER_TEMP/e2e/audio-stream-e2e.log"
+
+      - name: Check SIP E2E secrets
+        id: sip_secrets
+        continue-on-error: ${{ github.event_name == 'pull_request' }}
+        run: |
+          missing=0
+          for name in E2E_SIP_USERNAME E2E_SIP_PASSWORD E2E_SIP_DEST_URI; do
+            if [ -z "${!name}" ]; then
+              echo "::error::${name} secret is not set"
+              missing=1
+            fi
+          done
+          exit "$missing"
+
+      - name: Report quarantined SIP config failure
+        if: github.event_name == 'pull_request' && steps.sip_secrets.outcome == 'failure'
+        run: |
+          echo "::warning::SIP E2E secrets are missing on a quarantined PR run. Scheduled and manual runs still fail hard."
+
+      - name: Run headless SIP smoke
+        if: steps.sip_secrets.outcome == 'success'
+        id: sip_smoke
+        continue-on-error: ${{ github.event_name == 'pull_request' }}
+        shell: bash
+        run: |
+          set -o pipefail
+          mkdir -p "$RUNNER_TEMP/e2e"
+          timeout --preserve-status 140s \
+            python e2e/headless_sip_smoke.py \
+              --ci \
+              --output "$RUNNER_TEMP/e2e/received_audio.wav" \
+              --max-register-seconds 10 \
+              --max-answer-seconds 30 \
+              --max-call-seconds 90 \
+              --max-hangup-seconds 10 \
+              --min-received-seconds 1.0 \
+              --min-speech-percent 1.0 \
+            2>&1 | tee "$RUNNER_TEMP/e2e/headless-e2e.log"
+
+      - name: Report quarantined SIP failure
+        if: github.event_name == 'pull_request' && steps.sip_smoke.outcome == 'failure'
+        run: |
+          echo "::warning::Headless SIP smoke failed on a quarantined PR run. Scheduled and manual runs still fail hard."
+
+      - name: Upload E2E artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: headless-sip-e2e-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/e2e/audio-stream-e2e.log
+            ${{ runner.temp }}/e2e/headless-e2e.log
+            ${{ runner.temp }}/e2e/received_audio.wav
+          if-no-files-found: ignore
+          retention-days: 7
