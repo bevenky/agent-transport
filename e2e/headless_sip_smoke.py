@@ -87,19 +87,26 @@ def session_id_from_event(event):
     return getattr(session, "session_id", None)
 
 
-def wait_for_event_type(ep, event_type, timeout_s, label="event"):
+def wait_for_event_type(ep, event_type, timeout_s, label="event", expected_session_id=None):
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
         event = ep.wait_for_event(timeout_ms=500)
         if event is None:
             continue
         current_type = event.get("type")
+        event_session_id = session_id_from_event(event)
         print(f"[{label}] event={current_type}")
         if current_type == event_type:
+            if expected_session_id and event_session_id != expected_session_id:
+                print(f"[{label}] ignoring {event_type} for session_id={event_session_id}")
+                continue
             return event
         if current_type == "registration_failed":
             raise E2EFailure(f"Registration failed: {event.get('error') or event}")
         if current_type == "call_terminated":
+            if expected_session_id and event_session_id != expected_session_id:
+                print(f"[{label}] ignoring call_terminated for session_id={event_session_id}")
+                continue
             raise E2EFailure(f"Call terminated before {event_type}: {event.get('reason', '')}")
     raise E2EFailure(f"Timed out after {timeout_s:.0f}s waiting for {event_type}")
 
@@ -146,6 +153,7 @@ def start_receivers(ep, session_id, label="recv"):
     call_ended = threading.Event()
     recv_lock = threading.Lock()
     received_samples = []
+    received_dtmf = []
     errors = []
 
     def recv_loop():
@@ -154,7 +162,10 @@ def start_receivers(ep, session_id, label="recv"):
             try:
                 result = ep.recv_audio_bytes_blocking(session_id, 20)
             except Exception as exc:
-                errors.append(f"recv_audio_bytes_blocking failed: {exc}")
+                if "call not active" in str(exc).lower():
+                    call_ended.set()
+                elif running.is_set() and not call_ended.is_set():
+                    errors.append(f"recv_audio_bytes_blocking failed: {exc}")
                 break
             if result is None:
                 continue
@@ -184,26 +195,58 @@ def start_receivers(ep, session_id, label="recv"):
             if event is None:
                 continue
             if event.get("type") == "call_terminated":
+                event_session_id = session_id_from_event(event)
+                if event_session_id and event_session_id != session_id:
+                    print(f"[{label}/event] ignoring call end for session_id={event_session_id}")
+                    continue
                 print(f"[{label}/event] call ended: {event.get('reason', '')}")
                 call_ended.set()
                 break
             if event.get("type") == "dtmf_received":
-                print(f"[{label}/event] DTMF received: {event.get('digit')}")
+                event_session_id = session_id_from_event(event)
+                if not event_session_id or event_session_id == session_id:
+                    digit = event.get("digit")
+                    print(f"[{label}/event] DTMF received: {digit}")
+                    with recv_lock:
+                        received_dtmf.append(digit)
 
     threading.Thread(target=recv_loop, daemon=True).start()
     threading.Thread(target=event_loop, daemon=True).start()
-    return running, call_ended, recv_lock, received_samples, errors
+    return running, call_ended, recv_lock, received_samples, errors, received_dtmf
 
 
 def wait_for_received_audio(samples, recv_lock, min_seconds, timeout_s, call_ended, label="recv"):
+    if timeout_s <= 0:
+        raise E2EFailure(f"No remaining call budget to wait for {min_seconds:.1f}s of audio on {label}")
     deadline = time.monotonic() + timeout_s
-    while time.monotonic() < deadline and not call_ended.is_set():
+    while time.monotonic() < deadline:
+        if call_ended.is_set():
+            raise E2EFailure(f"Call ended before receiving {min_seconds:.1f}s of audio on {label}")
         with recv_lock:
             duration = len(samples) / SAMPLE_RATE
         if duration >= min_seconds:
             return
         time.sleep(0.1)
     raise E2EFailure(f"Timed out waiting for {min_seconds:.1f}s of received audio on {label}")
+
+
+def wait_for_dtmf_received(received_dtmf, recv_lock, expected_digit, timeout_s, call_ended, label="recv"):
+    if timeout_s <= 0:
+        raise E2EFailure(f"No remaining call budget to wait for DTMF {expected_digit} on {label}")
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if call_ended.is_set():
+            raise E2EFailure(f"Call ended before DTMF {expected_digit} arrived on {label}")
+        with recv_lock:
+            received = list(received_dtmf)
+        if any(str(d) == str(expected_digit) for d in received):
+            return
+        time.sleep(0.05)
+    with recv_lock:
+        seen = list(received_dtmf)
+    raise E2EFailure(
+        f"Timed out waiting for DTMF {expected_digit} on {label}; received={seen}"
+    )
 
 
 def analyze(samples, output_path, speech_threshold, label="received"):
@@ -267,6 +310,8 @@ def parse_args(argv):
     parser.add_argument("--max-answer-seconds", type=float, default=30.0)
     parser.add_argument("--max-call-seconds", type=float, default=90.0)
     parser.add_argument("--max-hangup-seconds", type=float, default=10.0)
+    parser.add_argument("--call-attempts", type=int, default=2)
+    parser.add_argument("--call-retry-seconds", type=float, default=3.0)
     parser.add_argument("--min-received-seconds", type=float, default=1.0)
     parser.add_argument("--min-speech-percent", type=float, default=1.0)
     parser.add_argument("--speech-threshold", type=int, default=500)
@@ -286,9 +331,24 @@ def assert_analyzed_audio(samples, output_path, args, label):
         )
 
 
+def call_with_retries(ep, dest_uri, args, label):
+    attempts = max(1, args.call_attempts)
+    last_error = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return ep.call(dest_uri)
+        except Exception as exc:
+            last_error = exc
+            if attempt >= attempts:
+                break
+            print(f"[{label}] call attempt {attempt} failed: {exc}; retrying")
+            time.sleep(args.call_retry_seconds)
+    raise E2EFailure(f"{label} call initiation failed: {last_error}")
+
+
 def stop_receiver(receiver):
     if receiver is not None:
-        running, _, _, _, _ = receiver
+        running, _, _, _, _, _ = receiver
         running.clear()
 
 
@@ -301,7 +361,7 @@ def receiver_errors(receiver):
 def receiver_samples(receiver):
     if receiver is None:
         return []
-    _, _, recv_lock, received_samples, _ = receiver
+    _, _, recv_lock, received_samples, _, _ = receiver
     with recv_lock:
         return list(received_samples)
 
@@ -319,16 +379,18 @@ def run_outbound(args, SipEndpoint, AudioFrame, env, sip_domain, clip):
         print("registered account A")
 
         print("account A calling E2E_SIP_DEST_URI_A")
-        try:
-            session_id = ep.call(account["dest_uri"])
-        except Exception as exc:
-            raise E2EFailure(f"Call initiation failed: {exc}") from exc
-        answered = wait_for_event_type(ep, "call_answered", args.max_answer_seconds, "account-a")
-        session_id = session_id_from_event(answered) or session_id
+        session_id = call_with_retries(ep, account["dest_uri"], args, "account-a")
+        wait_for_event_type(
+            ep,
+            "call_answered",
+            args.max_answer_seconds,
+            "account-a",
+            expected_session_id=session_id,
+        )
         print(f"connected session_id={session_id}")
 
         receiver = start_receivers(ep, session_id, "account-a")
-        _, call_ended, recv_lock, received_samples, _ = receiver
+        _, call_ended, recv_lock, received_samples, _, _ = receiver
         deadline = time.monotonic() + args.max_call_seconds
 
         send_silence(ep, AudioFrame, session_id, 0.5, call_ended)
@@ -396,16 +458,25 @@ def run_inbound(args, SipEndpoint, AudioFrame, env, sip_domain, clip):
         print("registered caller account B")
 
         print("caller B calling E2E_SIP_DEST_URI_B")
-        try:
-            caller_session_id = caller_ep.call(env["b"]["dest_uri"])
-        except Exception as exc:
-            raise E2EFailure(f"Inbound caller initiation failed: {exc}") from exc
+        caller_session_id = call_with_retries(caller_ep, env["b"]["dest_uri"], args, "caller-b")
 
         ringing = wait_for_event_type(receiver_ep, "call_ringing", args.max_answer_seconds, "receiver-a")
         receiver_session_id = session_id_from_event(ringing)
-        answered = wait_for_event_type(receiver_ep, "call_answered", args.max_answer_seconds, "receiver-a")
+        answered = wait_for_event_type(
+            receiver_ep,
+            "call_answered",
+            args.max_answer_seconds,
+            "receiver-a",
+            expected_session_id=receiver_session_id,
+        )
         receiver_session_id = session_id_from_event(answered) or receiver_session_id
-        caller_answered = wait_for_event_type(caller_ep, "call_answered", args.max_answer_seconds, "caller-b")
+        caller_answered = wait_for_event_type(
+            caller_ep,
+            "call_answered",
+            args.max_answer_seconds,
+            "caller-b",
+            expected_session_id=caller_session_id,
+        )
         caller_session_id = session_id_from_event(caller_answered) or caller_session_id
 
         if not receiver_session_id:
@@ -416,8 +487,8 @@ def run_inbound(args, SipEndpoint, AudioFrame, env, sip_domain, clip):
 
         receiver = start_receivers(receiver_ep, receiver_session_id, "receiver-a")
         caller_receiver = start_receivers(caller_ep, caller_session_id, "caller-b")
-        _, receiver_call_ended, receiver_lock, receiver_samples_list, _ = receiver
-        _, caller_call_ended, caller_lock, caller_samples_list, _ = caller_receiver
+        _, receiver_call_ended, receiver_lock, receiver_samples_list, _, receiver_dtmf = receiver
+        _, caller_call_ended, caller_lock, caller_samples_list, _, _ = caller_receiver
         deadline = time.monotonic() + args.max_call_seconds
 
         send_silence(caller_ep, AudioFrame, caller_session_id, 0.5, caller_call_ended)
@@ -451,6 +522,15 @@ def run_inbound(args, SipEndpoint, AudioFrame, env, sip_domain, clip):
         send_silence(caller_ep, AudioFrame, caller_session_id, 0.5, caller_call_ended)
         send_silence(receiver_ep, AudioFrame, receiver_session_id, 0.5, receiver_call_ended)
 
+        wait_for_dtmf_received(
+            receiver_dtmf,
+            receiver_lock,
+            args.dtmf_digit,
+            min(5.0, max(0.0, deadline - time.monotonic())),
+            receiver_call_ended,
+            "receiver-a",
+        )
+
         if caller_call_ended.is_set() or receiver_call_ended.is_set():
             raise E2EFailure("Inbound call ended before scripted hangup")
         print("caller B hanging up")
@@ -458,10 +538,16 @@ def run_inbound(args, SipEndpoint, AudioFrame, env, sip_domain, clip):
             caller_ep.hangup(caller_session_id)
         except Exception as exc:
             raise E2EFailure(f"Inbound hangup failed: {exc}") from exc
-        if not caller_call_ended.wait(timeout=args.max_hangup_seconds):
-            raise E2EFailure("Timed out waiting for caller-side call termination after hangup")
-        if not receiver_call_ended.wait(timeout=args.max_hangup_seconds):
-            raise E2EFailure("Timed out waiting for receiver-side call termination after hangup")
+        hangup_deadline = time.monotonic() + args.max_hangup_seconds
+        for waiter_label, waiter_event in (
+            ("receiver-a", receiver_call_ended),
+            ("caller-b", caller_call_ended),
+        ):
+            remaining = max(0.0, hangup_deadline - time.monotonic())
+            if not waiter_event.wait(timeout=remaining):
+                raise E2EFailure(
+                    f"Timed out waiting for {waiter_label} call termination after hangup"
+                )
     finally:
         stop_receiver(receiver)
         stop_receiver(caller_receiver)
