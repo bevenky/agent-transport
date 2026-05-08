@@ -23,21 +23,61 @@ export function withTimeout(p: Promise<unknown>, ms: number, label: string): Pro
   });
 }
 
+const ACTIVITY_INPUT_GUARD_INSTALLED = Symbol('agentTransportActivityInputGuardInstalled');
+
+function guardActivityInput(activity: any): void {
+  if (!activity || activity[ACTIVITY_INPUT_GUARD_INSTALLED]) return;
+
+  try {
+    Object.defineProperty(activity, ACTIVITY_INPUT_GUARD_INSTALLED, { value: true });
+  } catch {
+    activity[ACTIVITY_INPUT_GUARD_INSTALLED] = true;
+  }
+
+  if (typeof activity.onEndOfTurn === 'function') {
+    activity.onEndOfTurn = async function onEndOfTurnAfterTransportClose(_info: unknown) {
+      try {
+        if (typeof this.cancelPreemptiveGeneration === 'function') {
+          this.cancelPreemptiveGeneration();
+        }
+      } catch {}
+      return true;
+    };
+  }
+
+  if (typeof activity.onPreemptiveGeneration === 'function') {
+    activity.onPreemptiveGeneration = function onPreemptiveGenerationAfterTransportClose() {};
+  }
+}
+
 /**
  * Synchronously begin tearing down a LiveKit AgentSession on call termination.
  *
- * Closes the audio input (stops feeding STT), clears pending playout, and
- * calls `shutdown({ drain: false })` which synchronously unsubscribes the
- * `UserInputTranscribed` handler in its first microtask — before the next
- * I/O tick, so any STT transcript buffered at Deepgram is dropped before
- * it can trigger LLM/TTS on a dead call.
+ * Guards end-of-turn and preemptive-generation callbacks, closes the audio
+ * input (stops feeding STT), clears pending playout, and calls
+ * `shutdown({ drain: false })`. Guarding happens before the next I/O tick, so
+ * any STT transcript buffered at Deepgram is dropped before it can trigger
+ * LLM/TTS on a dead call.
  *
  * Verified against `@livekit/agents` 1.2.x. `session.shutdown()` is public;
- * `session.input.audio.close()` / `session.output.audio.clearBuffer()` are
- * the documented transport override points.
+ * `activity.onEndOfTurn` / `activity.onPreemptiveGeneration` are private
+ * LiveKit hooks; if upstream renames them, issue #83's race can return.
+ *
+ * Do not set `activity._schedulingPaused` directly on Node. LiveKit's
+ * `activity.drain()` treats that flag as "already drained" and skips
+ * `agent.onExit()`.
  */
 export function forceShutdownAgentSession(session: any): void {
   if (!session) return;
+
+  try {
+    const activities = new Set([session.activity, session.nextActivity].filter(Boolean));
+    for (const activity of activities) {
+      guardActivityInput(activity);
+    }
+  } catch (e) {
+    console.debug('[force-shutdown] activity input guard failed:', e);
+  }
 
   try {
     const audioIn = session.input?.audio;

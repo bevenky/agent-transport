@@ -4,14 +4,13 @@ Mirrors the Node side (``_session_teardown.ts``). Kept out of the pipecat
 adapters because Pipecat has no ``AgentSession`` equivalent.
 
 VERSION COUPLING:
-This module writes the private ``_closing`` attribute of LiveKit's
-``AgentSession`` to close a race between Plivo-side disconnect and
-STT-transcript delivery. The field is verified against
-``livekit-agents == 1.5.x`` (see ``pyproject.toml`` ``[livekit]`` extra).
-If the upstream library renames or removes ``_closing``, this helper
-silently becomes a no-op (the write is wrapped in ``try/except``) and the
-race in issue #83 returns — an integration test against the pinned
-version is the guardrail.
+This module writes private LiveKit ``AgentSession`` / ``AgentActivity`` state
+to close a race between Plivo-side disconnect and STT-transcript delivery.
+The fields are verified against ``livekit-agents == 1.5.x`` (see
+``pyproject.toml`` ``[livekit]`` extra). If upstream renames or removes
+``_closing`` / ``_scheduling_paused``, this helper silently becomes a no-op
+(the writes are wrapped in ``try/except``) and the race in issue #83 returns
+-- an integration test against the pinned version is the guardrail.
 """
 
 import asyncio
@@ -24,13 +23,15 @@ _logger = logging.getLogger("agent_transport.session_teardown")
 def force_shutdown_agent_session(session: Any, background_tasks: set[asyncio.Task]) -> None:
     """Synchronously begin tearing down a LiveKit AgentSession on call termination.
 
-    Sets ``_closing`` so buffered STT transcripts are dropped before they
-    trigger LLM/TTS on a dead call, closes the audio input to stop feeding
-    STT, clears pending playout, and schedules the async ``shutdown``.
+    Pauses activity scheduling so buffered STT transcripts are dropped before
+    they trigger LLM/TTS on a dead call, sets ``_closing``, closes the audio
+    input to stop feeding STT, clears pending playout, and schedules the async
+    ``shutdown``.
 
     RoomIO's ``_close_soon()`` is a fire-and-forget ``asyncio.Task`` — without
-    flipping ``_closing`` synchronously here, a transcript that arrives before
-    the close task runs would still reach the pipeline.
+    flipping the scheduling guard synchronously here, a transcript that
+    arrives before the close task pauses the activity would still reach the
+    pipeline.
     """
     if session is None:
         return
@@ -39,6 +40,16 @@ def force_shutdown_agent_session(session: Any, background_tasks: set[asyncio.Tas
         session._closing = True
     except Exception:
         _logger.debug("force_shutdown: failed to set _closing", exc_info=True)
+
+    try:
+        for activity in (
+            getattr(session, "_activity", None),
+            getattr(session, "_next_activity", None),
+        ):
+            if activity is not None:
+                activity._scheduling_paused = True
+    except Exception:
+        _logger.debug("force_shutdown: failed to pause activity scheduling", exc_info=True)
 
     try:
         audio_in = getattr(session.input, "audio", None)

@@ -20,6 +20,10 @@ def _make_session(*, with_audio_in=True, with_audio_out=True, shutdown_raises=Fa
     """Build a minimal mock matching the LiveKit AgentSession shape we rely on."""
     session = MagicMock()
     session._closing = False
+    session._activity = MagicMock()
+    session._activity._scheduling_paused = False
+    session._next_activity = MagicMock()
+    session._next_activity._scheduling_paused = False
 
     if with_audio_in:
         session.input.audio = MagicMock()
@@ -58,6 +62,27 @@ async def test_sets_closing_flag_synchronously():
     force_shutdown_agent_session(session, tasks)
 
     assert session._closing is True
+
+
+async def test_pauses_activity_scheduling_before_shutdown():
+    """The real LLM/TTS guard must flip before shutdown can yield."""
+    session = _make_session()
+    tasks: set[asyncio.Task] = set()
+    observed_at_shutdown = []
+    session.shutdown = MagicMock(
+        side_effect=lambda **_: observed_at_shutdown.append(
+            (
+                session._activity._scheduling_paused,
+                session._next_activity._scheduling_paused,
+            )
+        )
+    )
+
+    force_shutdown_agent_session(session, tasks)
+
+    assert session._activity._scheduling_paused is True
+    assert session._next_activity._scheduling_paused is True
+    assert observed_at_shutdown == [(True, True)]
 
 
 async def test_schedules_audio_input_aclose():

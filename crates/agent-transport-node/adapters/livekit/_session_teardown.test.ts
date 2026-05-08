@@ -59,9 +59,35 @@ function makeSession(opts: {
     audioClearBuffer: 0,
     shutdown: 0,
     shutdownArgs: undefined as unknown,
+    activityGuardedAtShutdown: false,
+    nextActivityGuardedAtShutdown: false,
+    preemptiveGeneration: 0,
+    nextPreemptiveGeneration: 0,
+    cancelPreemptiveGeneration: 0,
+  };
+  const originalOnEndOfTurn = async () => false;
+  const originalNextOnEndOfTurn = async () => false;
+  const originalOnPreemptiveGeneration = () => {
+    calls.preemptiveGeneration++;
+  };
+  const originalNextOnPreemptiveGeneration = () => {
+    calls.nextPreemptiveGeneration++;
   };
   const session: any = {
     _closing: false,
+    activity: {
+      _schedulingPaused: false,
+      onEndOfTurn: originalOnEndOfTurn,
+      onPreemptiveGeneration: originalOnPreemptiveGeneration,
+      cancelPreemptiveGeneration: () => {
+        calls.cancelPreemptiveGeneration++;
+      },
+    },
+    nextActivity: {
+      _schedulingPaused: false,
+      onEndOfTurn: originalNextOnEndOfTurn,
+      onPreemptiveGeneration: originalNextOnPreemptiveGeneration,
+    },
     input: { audio: null as any },
     output: { audio: null as any },
   };
@@ -83,6 +109,8 @@ function makeSession(opts: {
   session.shutdown = (args: unknown) => {
     calls.shutdown++;
     calls.shutdownArgs = args;
+    calls.activityGuardedAtShutdown = session.activity.onEndOfTurn !== originalOnEndOfTurn;
+    calls.nextActivityGuardedAtShutdown = session.nextActivity.onEndOfTurn !== originalNextOnEndOfTurn;
     if (opts.shutdownThrows) throw new Error('boom');
   };
 
@@ -108,6 +136,25 @@ test('forceShutdownAgentSession closes audio input, clears output, calls shutdow
   // let microtasks drain before asserting.
   await new Promise((r) => setImmediate(r));
   assert.equal(calls.audioClose, 1);
+});
+
+test('forceShutdownAgentSession guards activity input before shutdown', async () => {
+  const { session, calls } = makeSession();
+
+  forceShutdownAgentSession(session);
+
+  assert.equal(calls.activityGuardedAtShutdown, true);
+  assert.equal(calls.nextActivityGuardedAtShutdown, true);
+  assert.equal(session.activity._schedulingPaused, false);
+  assert.equal(session.nextActivity._schedulingPaused, false);
+
+  assert.equal(await session.activity.onEndOfTurn({ newTranscript: 'hello' }), true);
+  assert.equal(calls.cancelPreemptiveGeneration, 1);
+
+  session.activity.onPreemptiveGeneration({ newTranscript: 'hello' });
+  session.nextActivity.onPreemptiveGeneration({ newTranscript: 'hello' });
+  assert.equal(calls.preemptiveGeneration, 0);
+  assert.equal(calls.nextPreemptiveGeneration, 0);
 });
 
 test('forceShutdownAgentSession tolerates missing audio input', () => {
