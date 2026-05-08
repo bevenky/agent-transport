@@ -400,6 +400,38 @@ mod contact_refresh_tests {
         assert_eq!(dest.r#type, Some(rsip::Transport::Tcp));
         assert_eq!(dest.get_socketaddr().unwrap(), addr);
     }
+
+    #[test]
+    fn is_transport_dead_matches_known_kernel_errors() {
+        // Exact signatures produced by std::io::Error Display for the errnos
+        // observed on macOS/Linux when the TCP socket's local binding or the
+        // remote peer's state has gone away.
+        assert!(is_transport_dead("I/O error: Broken pipe (os error 32)"));
+        assert!(is_transport_dead(
+            "Error reading from stream error=Can't assign requested address (os error 49)"
+        ));
+        assert!(is_transport_dead(
+            "Cannot assign requested address (os error 99)"
+        ));
+        assert!(is_transport_dead("Connection reset by peer (os error 54)"));
+        assert!(is_transport_dead("Connection refused (os error 61)"));
+        assert!(is_transport_dead("Connection aborted"));
+        assert!(is_transport_dead("Host is unreachable"));
+        assert!(is_transport_dead("No route to host"));
+        assert!(is_transport_dead("Network is unreachable"));
+    }
+
+    #[test]
+    fn is_transport_dead_ignores_benign_errors() {
+        // These are register-level or application-level failures that should
+        // NOT trigger a TCP replace — replacing the socket would mask a real
+        // auth/config problem and thrash the connection.
+        assert!(!is_transport_dead("401 Unauthorized"));
+        assert!(!is_transport_dead("403 Forbidden"));
+        assert!(!is_transport_dead("SIP 503 Service Unavailable"));
+        assert!(!is_transport_dead("invalid credentials"));
+        assert!(!is_transport_dead(""));
+    }
 }
 
 /// Start session timer refresh (periodic Re-INVITE).
@@ -511,6 +543,71 @@ fn tcp_destination_for_addr(addr: SocketAddr) -> SipAddr {
     let mut dest = SipAddr::from(addr);
     dest.r#type = Some(rsip::Transport::Tcp);
     dest
+}
+
+/// Classifies a register-result error message as "the TCP socket to the SIP
+/// server is dead — replace it." The STUN-based public-IP compare misses cases
+/// where the socket breaks without a public IP change: NAT mapping timeout,
+/// Plivo-side idle close, local-interface rebind that keeps the same public
+/// NAT gateway (WiFi→WiFi within one ISP). When any of these happen, the
+/// kernel surfaces one of the signatures below on the next send/recv.
+fn is_transport_dead(err_msg: &str) -> bool {
+    let m = err_msg.to_ascii_lowercase();
+    m.contains("broken pipe")
+        || m.contains("can't assign requested address")
+        || m.contains("cannot assign requested address")
+        || m.contains("connection reset")
+        || m.contains("connection aborted")
+        || m.contains("connection refused")
+        || m.contains("not connected")
+        || m.contains("host is down")
+        || m.contains("host is unreachable")
+        || m.contains("network is unreachable")
+        || m.contains("no route to host")
+}
+
+/// Replace the cached TCP connection to the pinned SIP server with a fresh
+/// one. Returns the new local address.
+///
+/// Called from two paths:
+///   1. Public-IP-change detected via STUN (NAT migration).
+///   2. Re-register failed with a transport-dead signal (socket broke without
+///      a public-IP change — see `is_transport_dead`).
+///
+/// The replacement strategy is "connect first, then add_connection" so the
+/// HashMap key (remote addr) replaces the old entry in place. Evicting before
+/// connecting leaves `TransportLayer.listens` and `connections` both empty,
+/// and rsipstack's `get_via()` then fails with "not sipaddrs" before it
+/// attempts the new dial.
+async fn replace_server_tcp(
+    st: &Arc<Mutex<EndpointState>>,
+    cc: &CancellationToken,
+) -> std::result::Result<SipAddr, String> {
+    let (srv_addr, dl_opt, old_la) = {
+        let s = st.lock_or_recover();
+        (s.sip_server_addr, s.dialog_layer.clone(), s.local_addr.clone())
+    };
+    let addr = srv_addr.ok_or_else(|| "no pinned sip_server_addr".to_string())?;
+    let dl = dl_opt.ok_or_else(|| "no dialog layer".to_string())?;
+    let hp: rsip::HostWithPort = format!("{}:{}", addr.ip(), addr.port())
+        .try_into()
+        .map_err(|e| format!("could not build SipAddr for TCP replace: {:?}", e))?;
+    let server_sip = SipAddr::new(rsip::Transport::Tcp, hp);
+    let new_tcp = TcpConnection::connect(&server_sip, Some(cc.clone()))
+        .await
+        .map_err(|e| format!("TCP reconnect to {} failed: {}", addr, e))?;
+    let fresh_la = new_tcp.inner.local_addr.clone();
+    let conn: SipConnection = new_tcp.into();
+    dl.endpoint.transport_layer.add_connection(conn);
+    {
+        let mut s = st.lock_or_recover();
+        s.local_addr = Some(fresh_la.clone());
+    }
+    info!(
+        "replaced stale TCP: {:?} → {} (remote {})",
+        old_la, fresh_la, addr
+    );
+    Ok(fresh_la)
 }
 
 // ─── SipEndpoint ─────────────────────────────────────────────────────────────
@@ -744,49 +841,11 @@ impl SipEndpoint {
                                             s.public_addr = Some(new_addr);
                                         }
 
-                                        // Replace the stale TCP connection with a fresh
-                                        // one bound to the new source IP. We cannot just
-                                        // evict — `TransportLayer.listens` is empty in
-                                        // agent-transport (setup uses add_connection, not
-                                        // add_transport), so after eviction get_addrs()
-                                        // returns [] and rsipstack's get_via() fails with
-                                        // "not sipaddrs" before it even tries to dial a
-                                        // new socket. Connect first, then add_connection
-                                        // — the HashMap key is the remote addr, so the
-                                        // insert replaces the old entry in place and
-                                        // get_addrs() now reports our new local_addr.
-                                        let (srv_addr, dl_opt, new_la) = {
-                                            let s = st2.lock_or_recover();
-                                            (s.sip_server_addr, s.dialog_layer.clone(), s.local_addr.clone())
-                                        };
-                                        if let (Some(addr), Some(dl)) = (srv_addr, dl_opt) {
-                                            match format!("{}:{}", addr.ip(), addr.port()).try_into() {
-                                                Ok(hp) => {
-                                                    let server_sip = SipAddr::new(rsip::Transport::Tcp, hp);
-                                                    match TcpConnection::connect(&server_sip, Some(cc.clone())).await {
-                                                        Ok(new_tcp) => {
-                                                            let fresh_la = new_tcp.inner.local_addr.clone();
-                                                            let conn: SipConnection = new_tcp.into();
-                                                            dl.endpoint.transport_layer.add_connection(conn);
-                                                            {
-                                                                let mut s = st2.lock_or_recover();
-                                                                s.local_addr = Some(fresh_la.clone());
-                                                            }
-                                                            info!(
-                                                                "replaced stale TCP: {:?} → {} (remote {})",
-                                                                new_la, fresh_la, addr
-                                                            );
-                                                        }
-                                                        Err(e) => {
-                                                            warn!(
-                                                                "TCP reconnect to {} failed ({}); register will retry next cycle",
-                                                                addr, e
-                                                            );
-                                                        }
-                                                    }
-                                                }
-                                                Err(e) => warn!("could not build SipAddr for TCP replace: {:?}", e),
-                                            }
+                                        if let Err(e) = replace_server_tcp(&st2, &cc).await {
+                                            warn!(
+                                                "TCP replace after public-IP change failed: {}; register will retry next cycle",
+                                                e
+                                            );
                                         }
                                     }
                                     Err(e) => warn!("contact rebuild failed: {}", e),
@@ -794,7 +853,40 @@ impl SipEndpoint {
                             }
                         }
 
-                        match reg.register(server_uri.clone(), Some(exp)).await {
+                        // First register attempt. If it fails with a signal
+                        // that indicates the TCP socket is dead (broken pipe,
+                        // EADDRNOTAVAIL, timeout on a connection-oriented
+                        // transport), replace the connection and retry once
+                        // in-cycle. Otherwise waiting a full `register_expires`
+                        // tick means outbound calls over the same dead socket
+                        // also time out (408) until the next replace trigger.
+                        let mut outcome = reg.register(server_uri.clone(), Some(exp)).await;
+                        let replace_reason: Option<String> = match &outcome {
+                            Err(e) if is_transport_dead(&e.to_string()) => {
+                                Some(format!("error: {}", e))
+                            }
+                            Ok(r) if r.status_code == rsip::StatusCode::RequestTimeout => {
+                                Some(format!("status: {}", r.status_code))
+                            }
+                            _ => None,
+                        };
+                        if let Some(reason) = replace_reason {
+                            warn!(
+                                "re-register signals dead TCP ({}); replacing connection and retrying",
+                                reason
+                            );
+                            match replace_server_tcp(&st2, &cc).await {
+                                Ok(_) => {
+                                    outcome = reg.register(server_uri.clone(), Some(exp)).await;
+                                }
+                                Err(e) => warn!(
+                                    "TCP replace after dead-socket signal failed: {}; skipping retry",
+                                    e
+                                ),
+                            }
+                        }
+
+                        match outcome {
                             Ok(r) if r.status_code == rsip::StatusCode::OK => {
                                 let mut s = st2.lock_or_recover();
                                 if !s.registered {
