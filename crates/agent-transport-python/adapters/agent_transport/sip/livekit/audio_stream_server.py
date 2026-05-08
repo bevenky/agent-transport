@@ -24,6 +24,9 @@ CLI commands (matching LiveKit):
     python agent.py start   — production mode (INFO logging)
     python agent.py dev     — development mode (DEBUG for adapters/pipeline)
     python agent.py debug   — full debug (including Rust transport)
+
+Shutdown behavior: see ``server.py`` for the shutdown model. Same
+``os._exit(0)`` + per-session flush requirement applies here.
 """
 
 import asyncio
@@ -46,6 +49,7 @@ from livekit.agents.utils import MovingAverage
 from .audio_stream_io import AudioStreamInput, AudioStreamOutput
 from ._room_facade import TransportRoom, create_transport_context
 from ._aio_utils import call_setup as _call_setup
+from ._session_teardown import force_shutdown_agent_session
 from livekit.rtc.room import SipDTMF
 from .server import JobProcess
 
@@ -498,19 +502,45 @@ class AudioStreamServer:
 
         await stop.wait()
         logger.info("Shutting down...")
-        event_task.cancel()
 
-        if self._active_sessions:
-            logger.info("Draining %d active session(s)...", len(self._active_sessions))
-            await asyncio.gather(*self._active_sessions.values(), return_exceptions=True)
-
-        await runner.cleanup()
-        if self._inference_executor:
-            await self._inference_executor.aclose()
-        self._load_monitor.stop()
-        # ep.shutdown() does block_on for cancel + per-session hangup. Wrap
-        # in run_in_executor so the asyncio loop isn't blocked during teardown.
-        await loop.run_in_executor(None, self._ep.shutdown)
+        # Hang up everything, run critical cleanup with short timeouts, then
+        # force-exit. The Rust endpoint owns background threads that can pin
+        # the process — os._exit is the only reliable way out.
+        try:
+            if self._ep is not None:
+                for session_id in list(self._active_sessions.keys()):
+                    try:
+                        self._ep.hangup(session_id)
+                    except Exception:
+                        pass
+            event_task.cancel()
+            try:
+                await asyncio.wait_for(runner.cleanup(), timeout=2.0)
+            except Exception:
+                pass
+            if self._inference_executor:
+                try:
+                    await asyncio.wait_for(self._inference_executor.aclose(), timeout=2.0)
+                except Exception:
+                    pass
+            self._load_monitor.stop()
+            if self._ep is not None:
+                try:
+                    await asyncio.wait_for(
+                        loop.run_in_executor(None, self._ep.shutdown),
+                        timeout=2.0,
+                    )
+                except Exception:
+                    pass
+        finally:
+            # Flush stdio so the last log lines aren't lost —
+            # os._exit skips normal Python finalization.
+            try:
+                sys.stdout.flush()
+                sys.stderr.flush()
+            except Exception:
+                pass
+            os._exit(0)
 
     def _configure_logging(self, mode: str) -> None:
         if mode == "debug":
@@ -659,13 +689,15 @@ class AudioStreamServer:
                     except Exception:
                         pass
 
-                    # Emit participant_disconnected on Room facade (matches LiveKit WebRTC)
-                    # RoomIO._on_participant_disconnected will call _close_soon() → session closes
                     ctx = self._session_contexts.get(session_id)
-                    if ctx and ctx._room:
-                        remote = ctx._room._remote
-                        remote.disconnect_reason = 1  # CLIENT_INITIATED
-                        ctx._room.emit("participant_disconnected", remote)
+                    if ctx:
+                        force_shutdown_agent_session(ctx._session, self._background_tasks)
+
+                        if ctx._room:
+                            remote = ctx._room._remote
+                            remote.disconnect_reason = 1  # CLIENT_INITIATED
+                            ctx._room._connected = False
+                            ctx._room.emit("participant_disconnected", remote)
 
                     if session_id in self._session_ended_events:
                         self._session_ended_events[session_id].set()

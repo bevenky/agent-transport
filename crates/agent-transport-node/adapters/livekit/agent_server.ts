@@ -4,6 +4,13 @@
  * Handles SIP registration, call routing, HTTP server (health/worker/metrics/call),
  * CLI (start/dev/debug), and call lifecycle management.
  *
+ * Shutdown behavior (SIGINT/SIGTERM): active calls are hung up, cleanup is
+ * bounded by short timeouts, then the process force-exits via
+ * `process.exit(0)`. The Rust endpoint owns background threads that can pin
+ * libuv, so natural exit isn't reliable. Flush recordings / observability
+ * POSTs per-session (e.g., from `ctx.session.on("close", ...)`) — NOT at
+ * server shutdown.
+ *
  * Usage:
  *   const server = new AgentServer({ sipUsername: '...', sipPassword: '...' });
  *
@@ -22,6 +29,7 @@ import { mkdirSync } from 'node:fs';
 import { SipEndpoint } from 'agent-transport';
 import { initializeLogger, InferenceRunner, runWithJobContext, log as agentLog, voice } from '@livekit/agents';
 import { JobContext } from './session_context.js';
+import { forceShutdownAgentSession, withTimeout } from './_session_teardown.js';
 
 export class JobProcess {
   userData: Record<string, unknown> = {};
@@ -99,7 +107,7 @@ export class AgentServer {
   private userdata: Record<string, unknown> = {};
   private proc = new JobProcess();
   private ep?: SipEndpoint;
-  private activeCalls = new Map<string, { promise: Promise<void>; resolveEnded: () => void; room?: any }>();
+  private activeCalls = new Map<string, { promise: Promise<void>; resolveEnded: () => void; room?: any; ctx?: any }>();
   private httpServer?: Server;
   private loadMonitor = new LoadMonitor();
   private inferenceExecutor: any = null;
@@ -334,39 +342,35 @@ export class AgentServer {
     // Node's event loop forever.
     const eventLoopDone = this.sipEventLoop();
 
-    // Wait for shutdown signal
-    await new Promise<void>((resolve) => {
-      const onSignal = () => {
-        this.shutdownRequested = true;
-        resolve();
-      };
-      process.on('SIGINT', onSignal);
-      process.on('SIGTERM', onSignal);
-    });
-
-    console.log('Shutting down...');
-
-    // Drain active calls with 10-second timeout
-    if (this.activeCalls.size > 0) {
-      console.log(`Draining ${this.activeCalls.size} active call(s)...`);
-      await Promise.race([
-        Promise.allSettled([...this.activeCalls.values()].map((c) => c.promise)),
-        new Promise<void>((resolve) => setTimeout(() => {
-          console.warn('Shutdown timeout reached (10s), forcing exit');
-          resolve();
-        }, 10000)),
-      ]);
-    }
-
-    this.loadMonitor.stop();
-    if (this.inferenceExecutor) {
-      try { await this.inferenceExecutor.close(); } catch {}
-    }
-    this.httpServer?.close();
-    this.ep?.shutdown();
-    // Wait for the event loop to actually exit so Node can release the
-    // libuv handle and the process can terminate. The shutdown sentinel
-    // pushed by ep.shutdown() above wakes the loop immediately.
+    // On signal: hang up everything, run critical cleanup with short
+    // timeouts, then process.exit. The Rust endpoint owns a background
+    // thread that pins libuv, so natural exit isn't reliable — we force it.
+    const shutdown = async () => {
+      console.log('Shutting down...');
+      this.shutdownRequested = true;
+      try {
+        for (const sessionId of this.activeCalls.keys()) {
+          try { this.ep?.hangup(sessionId); } catch {}
+        }
+        this.loadMonitor.stop();
+        if (this.inferenceExecutor) {
+          await withTimeout(
+            this.inferenceExecutor.close().catch(() => {}),
+            2000,
+            'inferenceExecutor.close()',
+          );
+        }
+        if (this.httpServer) {
+          try { (this.httpServer as any).closeAllConnections?.(); } catch {}
+          try { this.httpServer.close(); } catch {}
+        }
+        this.ep?.shutdown();
+      } finally {
+        process.exit(0);
+      }
+    };
+    process.once('SIGINT', shutdown);
+    process.once('SIGTERM', shutdown);
     await eventLoopDone;
   }
 
@@ -430,9 +434,9 @@ export class AgentServer {
         const reason = ev.reason ?? 'unknown';
         console.log(`Call ${sessionId} terminated (reason=${reason})`);
 
-        // Emit participant_disconnected on Room facade (matches LiveKit WebRTC)
-        // RoomIO._on_participant_disconnected will call _close_soon() → session closes
         const active = this.activeCalls.get(sessionId);
+        forceShutdownAgentSession(active?.ctx?.session);
+
         if (active?.room) {
           active.room.emitParticipantDisconnected();
         }
@@ -571,7 +575,7 @@ export class AgentServer {
     };
 
     const callPromise = runCall();
-    this.activeCalls.set(sessionId, { promise: callPromise, resolveEnded, room: ctx.room });
+    this.activeCalls.set(sessionId, { promise: callPromise, resolveEnded, room: ctx.room, ctx });
   }
 
   // ─── HTTP server ────────────────────────────────────────────────
