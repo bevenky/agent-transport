@@ -17,6 +17,7 @@ function parseArgs(argv) {
   const args = {
     ci: false,
     dryRun: false,
+    direction: "both",
     listenHost: "127.0.0.1",
     listenPort: 0,
     minInboundSeconds: 0.25,
@@ -35,6 +36,12 @@ function parseArgs(argv) {
 
     if (arg === "--ci") args.ci = true;
     else if (arg === "--dry-run") args.dryRun = true;
+    else if (arg === "--direction") {
+      args.direction = next();
+      if (!["both", "inbound", "outbound"].includes(args.direction)) {
+        throw new E2EFailure(`Unsupported --direction: ${args.direction}`);
+      }
+    }
     else if (arg === "--listen-host") args.listenHost = next();
     else if (arg === "--listen-port") args.listenPort = Number(next());
     else if (arg === "--min-inbound-seconds") args.minInboundSeconds = Number(next());
@@ -377,55 +384,61 @@ async function runSmoke(args) {
     const sessionId = answered.session.sessionId;
     console.log(`session_id=${sessionId}`);
 
-    await sendInboundAudio(client, args.minInboundSeconds + 0.1);
-    const inbound = await recvEndpointAudio(
-      endpoint,
-      sessionId,
-      args.minInboundSeconds,
-      args.speechThreshold,
-      args.timeoutSeconds,
-    );
-    console.log(`inbound_audio=${(inbound.samples / 8000).toFixed(3)}s speech=${inbound.speechPercent.toFixed(2)}%`);
+    if (args.direction === "both" || args.direction === "inbound") {
+      await sendInboundAudio(client, args.minInboundSeconds + 0.1);
+      const inbound = await recvEndpointAudio(
+        endpoint,
+        sessionId,
+        args.minInboundSeconds,
+        args.speechThreshold,
+        args.timeoutSeconds,
+      );
+      console.log(`inbound_audio=${(inbound.samples / 8000).toFixed(3)}s speech=${inbound.speechPercent.toFixed(2)}%`);
 
-    client.sendJson({ event: "dtmf", dtmf: { digit: "7" } });
-    const dtmf = await waitEvent(
-      endpoint,
-      "dtmf_received",
-      args.timeoutSeconds,
-      (event) => event.sessionId === sessionId,
-    );
-    if (dtmf.digit !== "7" || dtmf.method !== "audio_stream") {
-      throw new E2EFailure(`Unexpected DTMF event: ${JSON.stringify(dtmf)}`);
+      client.sendJson({ event: "dtmf", dtmf: { digit: "7" } });
+      const dtmf = await waitEvent(
+        endpoint,
+        "dtmf_received",
+        args.timeoutSeconds,
+        (event) => event.sessionId === sessionId,
+      );
+      if (dtmf.digit !== "7" || dtmf.method !== "audio_stream") {
+        throw new E2EFailure(`Unexpected DTMF event: ${JSON.stringify(dtmf)}`);
+      }
+      console.log("dtmf_received=7");
     }
-    console.log("dtmf_received=7");
 
-    await sendOutboundAudio(endpoint, sessionId, args.minOutboundSeconds + 0.25);
-    await verifyOutboundAudio(
-      client,
-      endpoint,
-      sessionId,
-      args.minOutboundSeconds,
-      args.speechThreshold,
-      args.timeoutSeconds,
-    );
-
-    endpoint.pause(sessionId);
-    const clearOnPause = await client.readUntil((msg) => msg.event === "clearAudio", args.timeoutSeconds);
-    if (clearOnPause.streamId !== streamId) {
-      throw new E2EFailure(`Unexpected clearAudio streamId: ${JSON.stringify(clearOnPause)}`);
+    if (args.direction === "both" || args.direction === "outbound") {
+      await sendOutboundAudio(endpoint, sessionId, args.minOutboundSeconds + 0.25);
+      await verifyOutboundAudio(
+        client,
+        endpoint,
+        sessionId,
+        args.minOutboundSeconds,
+        args.speechThreshold,
+        args.timeoutSeconds,
+      );
     }
-    client.sendJson({ event: "clearedAudio" });
-    endpoint.resume(sessionId);
 
-    endpoint.clearBuffer(sessionId);
-    await client.readUntil((msg) => msg.event === "clearAudio", args.timeoutSeconds);
+    if (args.direction === "both") {
+      endpoint.pause(sessionId);
+      const clearOnPause = await client.readUntil((msg) => msg.event === "clearAudio", args.timeoutSeconds);
+      if (clearOnPause.streamId !== streamId) {
+        throw new E2EFailure(`Unexpected clearAudio streamId: ${JSON.stringify(clearOnPause)}`);
+      }
+      client.sendJson({ event: "clearedAudio" });
+      endpoint.resume(sessionId);
 
-    endpoint.sendDtmf(sessionId, "42");
-    const outboundDtmf = await client.readUntil((msg) => msg.event === "sendDTMF", args.timeoutSeconds);
-    if (outboundDtmf.dtmf !== "42") {
-      throw new E2EFailure(`Unexpected outbound DTMF payload: ${JSON.stringify(outboundDtmf)}`);
+      endpoint.clearBuffer(sessionId);
+      await client.readUntil((msg) => msg.event === "clearAudio", args.timeoutSeconds);
+
+      endpoint.sendDtmf(sessionId, "42");
+      const outboundDtmf = await client.readUntil((msg) => msg.event === "sendDTMF", args.timeoutSeconds);
+      if (outboundDtmf.dtmf !== "42") {
+        throw new E2EFailure(`Unexpected outbound DTMF payload: ${JSON.stringify(outboundDtmf)}`);
+      }
+      console.log("outbound_dtmf=42");
     }
-    console.log("outbound_dtmf=42");
 
     client.sendJson({ event: "stop" });
     await waitEvent(
@@ -444,6 +457,7 @@ async function main() {
   const args = parseArgs(process.argv.slice(2));
   console.log(`dry_run=${args.dryRun}`);
   console.log("sdk=node");
+  console.log(`direction=${args.direction}`);
   console.log("scenario=l16-8k-parity");
 
   if (args.dryRun) {
@@ -455,7 +469,8 @@ async function main() {
   }
 
   await runSmoke(args);
-  console.log("node audio stream smoke passed");
+  const label = args.direction === "both" ? "smoke" : args.direction;
+  console.log(`node audio stream ${label} passed`);
 }
 
 main().catch((error) => {

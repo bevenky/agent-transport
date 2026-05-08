@@ -75,6 +75,16 @@ def parse_args(argv):
         choices=sorted([*SCENARIOS.keys(), "matrix"]),
         help="Scenario to run. May be repeated. Default: matrix.",
     )
+    parser.add_argument(
+        "--direction",
+        choices=["both", "inbound", "outbound"],
+        default="both",
+        help=(
+            "Media direction to exercise. 'both' runs the full roundtrip "
+            "(default, matches the existing matrix). 'inbound' / 'outbound' "
+            "isolate one direction and skip non-media scenarios."
+        ),
+    )
     parser.add_argument("--min-inbound-seconds", type=float, default=0.25)
     parser.add_argument("--min-outbound-seconds", type=float, default=0.25)
     parser.add_argument("--speech-threshold", type=int, default=500)
@@ -82,10 +92,17 @@ def parse_args(argv):
     return parser.parse_args(argv)
 
 
-def selected_scenarios(names: list[str] | None) -> list[Scenario]:
+MEDIA_SCENARIO_NAMES = ("l16-8k", "l16-16k", "mulaw-8k")
+
+
+def selected_scenarios(names: list[str] | None, direction: str) -> list[Scenario]:
     if not names or "matrix" in names:
-        return [SCENARIOS[name] for name in ("l16-8k", "l16-16k", "mulaw-8k", "controls", "disconnect")]
-    return [SCENARIOS[name] for name in names]
+        chosen = list(MEDIA_SCENARIO_NAMES) + ["controls", "disconnect"]
+    else:
+        chosen = list(names)
+    if direction != "both":
+        chosen = [name for name in chosen if name in MEDIA_SCENARIO_NAMES]
+    return [SCENARIOS[name] for name in chosen]
 
 
 def load_deps():
@@ -341,42 +358,44 @@ async def verify_outbound_audio(ws, ep, session_id: str, scenario: Scenario, min
 async def run_media_roundtrip(websockets, AudioFrame, ep, uri: str, scenario: Scenario, args):
     ws, session_id = await start_session(websockets, ep, uri, scenario, args.timeout_seconds)
     try:
-        await send_inbound_audio(ws, scenario, args.min_inbound_seconds + 0.1)
-        inbound_stats = await recv_endpoint_audio(
-            ep,
-            session_id,
-            scenario.input_sample_rate,
-            args.min_inbound_seconds,
-            args.speech_threshold,
-            args.timeout_seconds,
-        )
-        print(
-            "inbound_audio="
-            f"{inbound_stats.samples / scenario.input_sample_rate:.3f}s "
-            f"speech={inbound_stats.speech_percent:.2f}%"
-        )
+        if args.direction in ("both", "inbound"):
+            await send_inbound_audio(ws, scenario, args.min_inbound_seconds + 0.1)
+            inbound_stats = await recv_endpoint_audio(
+                ep,
+                session_id,
+                scenario.input_sample_rate,
+                args.min_inbound_seconds,
+                args.speech_threshold,
+                args.timeout_seconds,
+            )
+            print(
+                "inbound_audio="
+                f"{inbound_stats.samples / scenario.input_sample_rate:.3f}s "
+                f"speech={inbound_stats.speech_percent:.2f}%"
+            )
 
-        await ws.send(json.dumps({"event": "dtmf", "dtmf": {"digit": "7"}}))
-        dtmf = await wait_event(
-            ep,
-            "dtmf_received",
-            args.timeout_seconds,
-            lambda event: event.get("session_id") == session_id,
-        )
-        if dtmf.get("digit") != "7" or dtmf.get("method") != "audio_stream":
-            raise E2EFailure(f"Unexpected DTMF event: {dtmf}")
-        print("dtmf_received=7")
+            await ws.send(json.dumps({"event": "dtmf", "dtmf": {"digit": "7"}}))
+            dtmf = await wait_event(
+                ep,
+                "dtmf_received",
+                args.timeout_seconds,
+                lambda event: event.get("session_id") == session_id,
+            )
+            if dtmf.get("digit") != "7" or dtmf.get("method") != "audio_stream":
+                raise E2EFailure(f"Unexpected DTMF event: {dtmf}")
+            print("dtmf_received=7")
 
-        await send_outbound_audio(ep, AudioFrame, session_id, scenario, args.min_outbound_seconds + 0.25)
-        await verify_outbound_audio(
-            ws,
-            ep,
-            session_id,
-            scenario,
-            args.min_outbound_seconds,
-            args.speech_threshold,
-            args.timeout_seconds,
-        )
+        if args.direction in ("both", "outbound"):
+            await send_outbound_audio(ep, AudioFrame, session_id, scenario, args.min_outbound_seconds + 0.25)
+            await verify_outbound_audio(
+                ws,
+                ep,
+                session_id,
+                scenario,
+                args.min_outbound_seconds,
+                args.speech_threshold,
+                args.timeout_seconds,
+            )
 
         await ws.send(json.dumps({"event": "stop"}))
         await wait_event(
@@ -472,23 +491,29 @@ async def run_scenario(websockets, AudioFrame, AudioStreamEndpoint, scenario: Sc
     print(f"scenario_passed={scenario.name}")
 
 
-async def run_matrix(args):
+async def run_matrix(args, scenarios):
     websockets, AudioFrame, AudioStreamEndpoint, init_logging = load_deps()
     rust_log = os.environ.get("E2E_RUST_LOG", "info")
     init_logging(rust_log)
-    for scenario in selected_scenarios(args.scenario):
+    for scenario in scenarios:
         await run_scenario(websockets, AudioFrame, AudioStreamEndpoint, scenario, args)
 
 
 def run(args):
-    scenarios = selected_scenarios(args.scenario)
+    scenarios = selected_scenarios(args.scenario, args.direction)
     print(f"dry_run={args.dry_run}")
+    print(f"direction={args.direction}")
     print("scenarios=" + ",".join(scenario.name for scenario in scenarios))
+    if not scenarios:
+        raise E2EFailure(
+            f"No scenarios selected for --direction {args.direction}; expected one of {MEDIA_SCENARIO_NAMES}"
+        )
     if args.dry_run:
         print("dry run passed")
         return 0
-    asyncio.run(run_matrix(args))
-    print("audio stream matrix passed")
+    asyncio.run(run_matrix(args, scenarios))
+    label = "matrix" if args.direction == "both" else args.direction
+    print(f"audio stream {label} passed")
     return 0
 
 
