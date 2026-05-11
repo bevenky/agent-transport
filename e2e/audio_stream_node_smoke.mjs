@@ -418,6 +418,13 @@ async function runSmoke(args) {
         args.speechThreshold,
         args.timeoutSeconds,
       );
+
+      endpoint.sendDtmf(sessionId, "42");
+      const outboundDtmf = await client.readUntil((msg) => msg.event === "sendDTMF", args.timeoutSeconds);
+      if (outboundDtmf.dtmf !== "42") {
+        throw new E2EFailure(`Unexpected outbound DTMF payload: ${JSON.stringify(outboundDtmf)}`);
+      }
+      console.log("outbound_dtmf=42");
     }
 
     if (args.direction === "both") {
@@ -431,13 +438,6 @@ async function runSmoke(args) {
 
       endpoint.clearBuffer(sessionId);
       await client.readUntil((msg) => msg.event === "clearAudio", args.timeoutSeconds);
-
-      endpoint.sendDtmf(sessionId, "42");
-      const outboundDtmf = await client.readUntil((msg) => msg.event === "sendDTMF", args.timeoutSeconds);
-      if (outboundDtmf.dtmf !== "42") {
-        throw new E2EFailure(`Unexpected outbound DTMF payload: ${JSON.stringify(outboundDtmf)}`);
-      }
-      console.log("outbound_dtmf=42");
     }
 
     client.sendJson({ event: "stop" });

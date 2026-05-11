@@ -42,6 +42,31 @@ PR signal. Live SIP is quarantined on pull requests because carrier/provider
 state can return valid failures such as busy destinations; the same SIP smoke
 is a hard failure on manual runs.
 
+## Plivo account prerequisites
+
+The live SIP smoke depends on more than just the secrets above. On a fresh
+Plivo account, inbound calls to a registered SIP endpoint return
+`486 USER_BUSY` until the account-level **Default Endpoint Application**
+(the one with `default_endpoint_app=true`, typically named `Direct-Dial`)
+has a reachable answer URL with method `GET`. Plivo invokes that URL for
+every inbound call to a registered SIP endpoint, regardless of the
+endpoint's own linked application.
+
+A working configuration for these smokes:
+
+- A SIP endpoint for account A (alias e.g. `agent_transport_e2e_a_do_not_delete`).
+- A SIP endpoint for account B (alias e.g. `agent_transport_e2e_b_do_not_delete`).
+- An XML application that returns `<Response><Dial><User>sip:USERNAME_A@phone.plivo.com</User></Dial></Response>`,
+  with `default_endpoint_app=true`. Inbound calls to either SIP endpoint
+  invoke this application's answer URL.
+- A second XML application that returns `<Response><Speak>…</Speak><Wait/></Response>`.
+  Configure `E2E_SIP_DEST_URI_A` as this application's SIP URI so A's outbound
+  smoke hears generated speech without dialing back to A.
+- `E2E_SIP_DEST_URI_B` set to A's alias-based SIP URI; Plivo routes via the
+  default endpoint app, which bridges B → A.
+- Both XML application answer URLs configured with method `GET`. GitHub gist
+  raw URLs work; they reject `POST` so the method matters.
+
 ## Test Setup
 
 ```mermaid
@@ -91,10 +116,21 @@ Dry-run all scripts without network or package imports:
 python e2e/headless_sip_smoke.py --dry-run --ci
 python e2e/headless_sip_smoke.py --dry-run --ci --direction inbound
 python e2e/audio_stream_smoke.py --dry-run --ci
+python e2e/audio_stream_smoke.py --dry-run --ci --direction inbound
+python e2e/audio_stream_smoke.py --dry-run --ci --direction outbound
 node e2e/headless_sip_node_smoke.mjs --dry-run --ci
 node e2e/headless_sip_node_smoke.mjs --dry-run --ci --direction inbound
 node e2e/audio_stream_node_smoke.mjs --dry-run --ci
+node e2e/audio_stream_node_smoke.mjs --dry-run --ci --direction inbound
+node e2e/audio_stream_node_smoke.mjs --dry-run --ci --direction outbound
 ```
+
+Note: for audio-stream, `--direction` selects which media direction to exercise
+within a single locally-simulated WebSocket session — `inbound` covers
+client→SDK media plus inbound DTMF, `outbound` covers SDK→client media plus
+outbound DTMF, and `both` (default) runs the full matrix including
+pause/resume/clear-buffer/checkpoint controls. For SIP, `--direction`
+selects which side initiates the real Plivo call.
 
 Run the local audio-stream matrix after installing the Python package:
 
@@ -102,6 +138,14 @@ Run the local audio-stream matrix after installing the Python package:
 python -m pip install websockets
 python -m pip install ./crates/agent-transport-python
 python e2e/audio_stream_smoke.py --ci --timeout-seconds 10
+```
+
+Run the direction-isolated Python audio-stream smokes against the locally
+running matrix scenarios:
+
+```bash
+python e2e/audio_stream_smoke.py --ci --direction inbound --timeout-seconds 10
+python e2e/audio_stream_smoke.py --ci --direction outbound --timeout-seconds 10
 ```
 
 Run the Node SDK audio-stream parity smoke after building the Node package:
@@ -112,6 +156,13 @@ bun install
 bun run build
 cd ../..
 node e2e/audio_stream_node_smoke.mjs --ci --timeout-seconds 10
+```
+
+Run the direction-isolated Node audio-stream smokes:
+
+```bash
+node e2e/audio_stream_node_smoke.mjs --ci --direction inbound --timeout-seconds 10
+node e2e/audio_stream_node_smoke.mjs --ci --direction outbound --timeout-seconds 10
 ```
 
 Run the live Python SIP smoke with credentials:
@@ -209,6 +260,9 @@ Covered by `audio_stream_smoke.py` and `audio_stream_node_smoke.mjs`:
 - [x] Outbound `sendDTMF`.
 - [x] Manual checkpoint message emission.
 - [x] WebSocket disconnect cleanup and post-disconnect send failure.
+- [x] Direction-isolated smokes (`--direction inbound` / `--direction outbound`)
+  cover their media + DTMF direction independently for sharper pass/fail
+  signal when one side regresses.
 - [x] Node SDK parity smoke for L16 8 kHz media, DTMF/control, playout, and cleanup.
 
 Not covered yet:

@@ -397,6 +397,16 @@ async def run_media_roundtrip(websockets, AudioFrame, ep, uri: str, scenario: Sc
                 args.timeout_seconds,
             )
 
+            ep.send_dtmf(session_id, "42")
+            outbound_dtmf = await read_until(
+                ws,
+                lambda m: m.get("event") == "sendDTMF",
+                args.timeout_seconds,
+            )
+            if outbound_dtmf.get("dtmf") != "42":
+                raise E2EFailure(f"Unexpected outbound DTMF payload: {outbound_dtmf}")
+            print("outbound_dtmf=42")
+
         await ws.send(json.dumps({"event": "stop"}))
         await wait_event(
             ep,
