@@ -197,6 +197,10 @@ class JobContext:
     """Post-conversation evaluation config for this session."""
 
     _agent_name: str = field(default="agent", repr=False)
+    # Stable developer-supplied id (typically UUID4). Set by the
+    # AudioStreamServer when creating the JobContext per session and
+    # threaded through to the observability emitter.
+    _agent_id: str = field(default="", repr=False)
     _session: Any = field(default=None, repr=False)
     _call_ended: asyncio.Event | None = field(default=None, repr=False)
     _room: Any = field(default=None, repr=False)
@@ -226,6 +230,7 @@ class JobContext:
             account_id=self.account_id,
             transport="audio_stream",
             direction=self.direction,
+            agent_id=self._agent_id,
             agent_name=self._agent_name,
             metadata=self.metadata,
         )
@@ -313,6 +318,11 @@ class AudioStreamServer:
         sample_rate: int = 8000,
         host: str = "0.0.0.0",
         port: int | None = None,
+        # `agent_id` is the stable developer-supplied identifier — a UUID4
+        # (or any opaque string) that names this deployment uniquely across
+        # accounts. Mandatory: obs's agents view keys on it, and downstream
+        # `agent_transport_sessions.agent_id` is now NOT NULL.
+        agent_id: str | None = None,
         agent_name: str = "audio-stream-agent",
         auth: Callable[..., bool | Coroutine] | None = None,
         recording: bool = True,
@@ -325,6 +335,19 @@ class AudioStreamServer:
         self._sample_rate = sample_rate
         self._host = host
         self._port = port or int(os.environ.get("PORT", "8080"))
+        # Accept agent_id from explicit kwarg or AGENT_ID env var. We raise
+        # if neither is set rather than silently substituting a slug — the
+        # whole point of making this mandatory is to surface missing IDs
+        # loudly at server-start time instead of corrupting telemetry
+        # downstream.
+        resolved_agent_id = agent_id or os.environ.get("AGENT_ID") or None
+        if not resolved_agent_id:
+            raise ValueError(
+                "AudioStreamServer requires `agent_id` — pass a stable identifier "
+                "(typically a UUID4) via the `agent_id=` kwarg or the AGENT_ID env "
+                "var. This is the value that keys the obs agents view."
+            )
+        self._agent_id = resolved_agent_id
         self._agent_name = agent_name
         self._auth = auth
         self._recording = recording
@@ -800,6 +823,7 @@ class AudioStreamServer:
             endpoint=self._ep,
             userdata=self._userdata,
             _agent_name=self._agent_name,
+            _agent_id=self._agent_id,
             _call_ended=session_ended,
             _room=room,
             _job_stub=job_stub,
@@ -886,6 +910,7 @@ class AudioStreamServer:
                                 ctx._session, session_id, obs_url, self._agent_name,
                                 rec_path, rec_started_at,
                                 account_id=ctx.account_id,
+                                agent_id=self._agent_id,
                                 transport="audio_stream",
                                 direction=ctx.direction,
                                 metadata=ctx.metadata,

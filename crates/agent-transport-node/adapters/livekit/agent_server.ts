@@ -35,6 +35,10 @@ export interface AgentServerOptions {
   sipPassword: string;
   host?: string;
   port?: number;
+  /** Stable developer-supplied identifier (typically UUID4). Mandatory:
+   * obs's agents view keys on it; agent_transport_sessions.agent_id is
+   * NOT NULL. Throws at construction if missing. */
+  agentId?: string;
   agentName?: string;
   auth?: (req: IncomingMessage) => boolean | Promise<boolean>;
 }
@@ -92,6 +96,7 @@ export class AgentServer {
   private sipPassword: string;
   private host: string;
   private port: number;
+  private agentId: string;
   private agentName: string;
   private authFn?: (req: IncomingMessage) => boolean | Promise<boolean>;
 
@@ -130,6 +135,17 @@ export class AgentServer {
     this.sipPassword = opts.sipPassword ?? process.env.SIP_PASSWORD ?? '';
     this.host = opts.host ?? '0.0.0.0';
     this.port = opts.port ?? parseInt(process.env.PORT ?? '8080', 10);
+    // Mandatory: same rationale as AudioStreamServer — surface missing
+    // agent_id loudly at boot rather than corrupting telemetry.
+    const resolvedAgentId = opts.agentId ?? process.env.AGENT_ID ?? '';
+    if (!resolvedAgentId) {
+      throw new Error(
+        'AgentServer requires `agentId` — pass a stable identifier ' +
+          '(typically a UUID4) via `agentId` in the constructor options or ' +
+          'the AGENT_ID env var. This is the value that keys the obs agents view.',
+      );
+    }
+    this.agentId = resolvedAgentId;
     this.agentName = opts.agentName ?? 'sip-agent';
     this.authFn = opts.auth;
   }
@@ -503,6 +519,7 @@ export class AgentServer {
       direction,
       endpoint: this.ep!,
       userdata: this.userdata,
+      agentId: this.agentId,
       agentName: this.agentName,
       callEnded,
       resolveCallEnded: resolveEnded,
@@ -582,6 +599,7 @@ export class AgentServer {
           // Upload session report (transcript, audio, metrics)
           try {
             await uploadReport({
+              agentId: this.agentId,
               agentName: this.agentName,
               session: ctx.session,
               callId: sessionId,

@@ -209,6 +209,10 @@ class JobContext:
     """Post-conversation evaluation config for this session."""
 
     _agent_name: str = field(default="sip-agent", repr=False)
+    # Stable developer-supplied id (typically UUID4). Set by AgentServer
+    # when creating the JobContext per call and threaded through to the
+    # observability emitter — same convention as AudioStreamServer.
+    _agent_id: str = field(default="", repr=False)
     _session: Any = field(default=None, repr=False)
     _call_ended: asyncio.Event | None = field(default=None, repr=False)
     _room: Any = field(default=None, repr=False)
@@ -238,6 +242,7 @@ class JobContext:
             account_id=self.account_id,
             transport="sip",
             direction=self.direction,
+            agent_id=self._agent_id,
             agent_name=self._agent_name,
             metadata=self.metadata,
         )
@@ -322,6 +327,11 @@ class AgentServer:
         sip_password: str | None = None,
         host: str = "0.0.0.0",
         port: int | None = None,
+        # `agent_id` is the stable developer-supplied identifier — a
+        # UUID4 (or any opaque string) that names this deployment
+        # uniquely across accounts. Mandatory: obs's agents view keys
+        # on it; agent_transport_sessions.agent_id is NOT NULL.
+        agent_id: str | None = None,
         agent_name: str = "sip-agent",
         auth: Callable[..., bool | Coroutine] | None = None,
         recording: bool = True,
@@ -334,6 +344,18 @@ class AgentServer:
         self._sip_password = sip_password or os.environ.get("SIP_PASSWORD", "")
         self._host = host
         self._port = port or int(os.environ.get("PORT", "8080"))
+        # Accept agent_id from kwarg or AGENT_ID env var. Raise on missing
+        # rather than substituting a slug — see AudioStreamServer for the
+        # full rationale; in short: surface the gap loudly at boot time
+        # instead of corrupting telemetry downstream.
+        resolved_agent_id = agent_id or os.environ.get("AGENT_ID") or None
+        if not resolved_agent_id:
+            raise ValueError(
+                "AgentServer requires `agent_id` — pass a stable identifier "
+                "(typically a UUID4) via the `agent_id=` kwarg or the AGENT_ID env "
+                "var. This is the value that keys the obs agents view."
+            )
+        self._agent_id = resolved_agent_id
         self._agent_name = agent_name
         self._auth = auth
         self._recording = recording
@@ -932,6 +954,7 @@ class AgentServer:
         await upload_session_report(
             session, session_id, obs_url, self._agent_name,
             recording_path, recording_started_at, account_id,
+            agent_id=self._agent_id,
             transport="sip",
             direction=direction,
             metadata=metadata,
@@ -963,6 +986,7 @@ class AgentServer:
             endpoint=self._ep,
             userdata=self._userdata,
             _agent_name=self._agent_name,
+            _agent_id=self._agent_id,
             _call_ended=call_ended,
             _room=room,
             _job_stub=job_stub,

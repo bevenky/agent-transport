@@ -26,6 +26,10 @@ export interface JobContextOptions {
   direction: 'inbound' | 'outbound';
   endpoint: SipEndpoint;
   userdata: Record<string, unknown>;
+  /** Stable developer-supplied identifier — plumbed through from the
+   * AgentServer constructor. Kept on the options shape so the per-
+   * session context can attach it to outgoing telemetry. */
+  agentId?: string;
   agentName?: string;
   callEnded: Promise<void>;
   resolveCallEnded: () => void;

@@ -54,6 +54,7 @@ function scalarMetadata(metadata?: Record<string, unknown>): Record<string, stri
 }
 
 export function buildRoomTags(options: {
+  agentId: string;
   agentName: string;
   accountId?: string;
   metadata?: Record<string, unknown>;
@@ -62,6 +63,7 @@ export function buildRoomTags(options: {
 }): Record<string, string> {
   return {
     ...scalarMetadata(options.metadata),
+    agent_id: options.agentId,
     agent_name: options.agentName,
     ...(options.accountId ? { account_id: options.accountId } : {}),
     ...(options.transport ? { transport: options.transport } : {}),
@@ -237,6 +239,7 @@ function normalizeEvents(events: unknown[]): unknown[] {
 
 export function buildOtlpLogRecords(
   report: voice.SessionReport,
+  agentId: string,
   agentName: string,
   roomTags: Record<string, string>,
 ): OtlpLogRecord[] {
@@ -253,6 +256,9 @@ export function buildOtlpLogRecords(
         job_id: report.jobId,
         'logger.name': 'chat_history',
         'session.report': sessionReportJson,
+        // Top-level attribute so the obs receiver's session-report
+        // branch reads it directly via `log.attributes.agent_id`.
+        agent_id: agentId,
         agent_name: agentName,
         sdk_version: sdkVersion,
         room_tags: roomTags,
@@ -337,6 +343,7 @@ async function uploadRecordingCallback(
 }
 
 export async function uploadReport(options: {
+  agentId: string;
   agentName: string;
   session: any;
   callId: string;
@@ -351,6 +358,7 @@ export async function uploadReport(options: {
   if (!obsUrl) return;
 
   const {
+    agentId,
     agentName,
     session,
     callId,
@@ -363,7 +371,7 @@ export async function uploadReport(options: {
   } = options;
 
   const report = buildReport(session, callId, recordingPath, recordingStartedAt);
-  const roomTags = buildRoomTags({ agentName, accountId, metadata, transport, direction });
+  const roomTags = buildRoomTags({ agentId, agentName, accountId, metadata, transport, direction });
   const authHeaders = await buildBearerAuthHeaders();
 
   console.log(`Uploading native LiveKit observability for ${callId} to ${obsUrl} (account_id=${accountId})`);
@@ -371,6 +379,6 @@ export async function uploadReport(options: {
   // events/options/usage onto it via UPDATE. If OTLP arrives first the UPDATE
   // no-ops and the patch is lost, leaving raw_report with only chat_history.
   await uploadRecordingCallback(obsUrl, authHeaders, report, roomTags);
-  await uploadOtlpLogs(obsUrl, authHeaders, report, buildOtlpLogRecords(report, agentName, roomTags));
+  await uploadOtlpLogs(obsUrl, authHeaders, report, buildOtlpLogRecords(report, agentId, agentName, roomTags));
   console.log(`Native LiveKit observability uploaded for ${callId}`);
 }

@@ -24,6 +24,9 @@ export interface AudioStreamJobContextOptions {
   extraHeaders: Record<string, string>;
   endpoint: AudioStreamEndpoint;
   userdata: Record<string, unknown>;
+  /** Stable developer-supplied identifier — plumbed through from the
+   * AudioStreamServer constructor. */
+  agentId?: string;
   agentName?: string;
   callEnded: Promise<void>;
   resolveCallEnded: () => void;
