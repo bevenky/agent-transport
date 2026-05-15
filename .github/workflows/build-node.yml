@@ -66,6 +66,10 @@ jobs:
           targets: ${{ matrix.target }}
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          # Workaround for Swatinem/rust-cache#341: new macOS runner image
+          # clobbers the cargo/rustup binaries when the bin cache is on.
+          cache-bin: 'false'
 
       - uses: oven-sh/setup-bun@v2
 
