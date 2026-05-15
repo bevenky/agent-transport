@@ -45,7 +45,7 @@ from livekit.agents.utils.hw import get_cpu_monitor
 from livekit.agents.utils import MovingAverage
 from .audio_stream_io import AudioStreamInput, AudioStreamOutput
 from ._room_facade import TransportRoom, create_transport_context
-from ._aio_utils import call_setup as _call_setup
+from ._aio_utils import call_setup as _call_setup, close_session_services
 from livekit.rtc.room import SipDTMF
 from .server import JobProcess
 
@@ -770,6 +770,7 @@ class AudioStreamServer:
                         await ctx._session.aclose()
                     except Exception:
                         pass
+                    await close_session_services(ctx._session, logger=logger)
                 for cb in ctx._shutdown_callbacks:
                     try:
                         result = cb()

@@ -22,6 +22,7 @@ import { mkdirSync } from 'node:fs';
 import { SipEndpoint } from 'agent-transport';
 import { initializeLogger, InferenceRunner, runWithJobContext, log as agentLog, voice } from '@livekit/agents';
 import { JobContext } from './session_context.js';
+import { closeSessionServices } from './_session_cleanup.js';
 
 export class JobProcess {
   userData: Record<string, unknown> = {};
@@ -554,6 +555,9 @@ export class AgentServer {
         // Close session
         if (ctx.session) {
           try { await (ctx.session as any).close(); } catch {}
+          await closeSessionServices(ctx.session, {
+            logger: (msg, err) => console.warn(`[call ${sessionId}] ${msg}`, err ?? ''),
+          });
         }
 
         // Hangup

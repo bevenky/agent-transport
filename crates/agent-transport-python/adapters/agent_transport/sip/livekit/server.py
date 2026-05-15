@@ -39,7 +39,7 @@ from livekit.agents.utils import MovingAverage
 from livekit.rtc.room import SipDTMF
 from .sip_io import SipAudioInput, SipAudioOutput
 from ._room_facade import TransportRoom, create_transport_context
-from ._aio_utils import call_setup as _call_setup
+from ._aio_utils import call_setup as _call_setup, close_session_services
 
 logger = logging.getLogger("agent_transport.server")
 
@@ -909,6 +909,7 @@ class AgentServer:
                         await ctx._session.aclose()
                     except Exception:
                         pass
+                    await close_session_services(ctx._session, logger=logger)
                 for cb in ctx._shutdown_callbacks:
                     try:
                         result = cb()
