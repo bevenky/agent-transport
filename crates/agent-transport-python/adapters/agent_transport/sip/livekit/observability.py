@@ -38,6 +38,41 @@ def _get_observability_url() -> str | None:
     return os.environ.get("AGENT_OBSERVABILITY_URL")
 
 
+def merge_tagger_tags_into_dict(
+    d: Any,
+    tagger_tags: Any,
+) -> Any:
+    """Merge tagger.tags into the chat_history dict's `tags[]` field.
+
+    The obs server's extractAgentId reads `agent_id:<value>` from
+    rawReport.tags[] (the multipart's chat_history JSON). LiveKit's
+    ``ChatContext.to_dict`` doesn't include tagger tags by default — they
+    only ride along on the OTLP "tag" body, which arrives *after* the
+    multipart. Without this merge, the recording multipart hits the obs
+    server first, INSERT runs with agent_id=null, the NOT NULL column
+    rejects the row, and the OTLP tag has no row to UPDATE.
+
+    Exported as a pure helper so tests can pin the contract without
+    setting up the full LiveKit upload pipeline.
+    """
+    if not isinstance(d, dict):
+        return d
+    tags = sorted(tagger_tags or [])
+    if not tags:
+        return d
+    existing = d.get("tags")
+    if isinstance(existing, list):
+        # Preserve any tags LiveKit may have already serialized (none
+        # today, but stay defensive about upstream changes).
+        seen = set(existing)
+        for t in tags:
+            if t not in seen:
+                existing.append(t)
+    else:
+        d["tags"] = list(tags)
+    return d
+
+
 def _ensure_transport_tags(
     tagger: Any,
     *,
@@ -242,23 +277,11 @@ async def upload_session_report(
         # session + upsertAgent merge).
         chat_ctx = report.chat_history
         original_to_dict = chat_ctx.to_dict
+
         def _patched_to_dict(*args, **kwargs):
             d = original_to_dict(*args, **kwargs)
-            if not isinstance(d, dict):
-                return d
-            tagger_tags = sorted(getattr(tagger, "tags", None) or [])
-            if tagger_tags:
-                existing = d.get("tags")
-                if isinstance(existing, list):
-                    # Preserve any tags LiveKit may have already serialized
-                    # (none today, but stay defensive about upstream changes).
-                    seen = set(existing)
-                    for t in tagger_tags:
-                        if t not in seen:
-                            existing.append(t)
-                else:
-                    d["tags"] = list(tagger_tags)
-            return d
+            return merge_tagger_tags_into_dict(d, getattr(tagger, "tags", None))
+
         chat_ctx.to_dict = _patched_to_dict  # type: ignore[assignment]
 
         try:

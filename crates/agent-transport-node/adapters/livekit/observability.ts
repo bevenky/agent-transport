@@ -305,6 +305,35 @@ function blobBytes(bytes: Uint8Array): ArrayBuffer {
   return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
 }
 
+/**
+ * Mirror Python's tagger-tags injection: the obs server's
+ * extractAgentId reads agent_id from rawReport.tags[] (looking for a
+ * `agent_id:<value>` prefix string), not from the protobuf recording
+ * header's roomTags. Without this, the multipart arrives first,
+ * INSERT INTO sessions runs with agent_id=null, the column is NOT
+ * NULL → 400 missing_agent_id, and the OTLP record landing moments
+ * later has no row to UPDATE. Stuffing the same prefix tags Python's
+ * Tagger emits (`agent_id:<uuid>`, `account_id:<v>`, `transport:<v>`,
+ * …) into the chat_history JSON's tags[] field makes obs's existing
+ * extractor work for the Node SDK too.
+ *
+ * Exported as a pure helper so tests can pin the contract without
+ * mocking the fetch boundary.
+ */
+export function injectRoomTagsIntoChatHistory(
+  chatHistoryJson: Record<string, unknown>,
+  roomTags: Record<string, string>,
+): Record<string, unknown> {
+  const prefixTags = Object.entries(roomTags).map(([k, v]) => `${k}:${v}`);
+  const existingTags = Array.isArray(chatHistoryJson.tags)
+    ? (chatHistoryJson.tags as unknown[]).filter((t): t is string => typeof t === 'string')
+    : [];
+  return {
+    ...chatHistoryJson,
+    tags: Array.from(new Set([...existingTags, ...prefixTags])),
+  };
+}
+
 async function uploadRecordingCallback(
   obsUrl: string,
   authHeaders: Record<string, string>,
@@ -313,9 +342,15 @@ async function uploadRecordingCallback(
 ): Promise<void> {
   const formData = new FormData();
   formData.append('header', new Blob([blobBytes(recordingHeader(report, roomTags))], { type: 'application/protobuf' }), 'header.binpb');
+
+  const chatHistoryJson = injectRoomTagsIntoChatHistory(
+    report.chatHistory.toJSON({ excludeTimestamp: false }) as Record<string, unknown>,
+    roomTags,
+  );
+
   formData.append(
     'chat_history',
-    new Blob([JSON.stringify(report.chatHistory.toJSON({ excludeTimestamp: false }))], { type: 'application/json' }),
+    new Blob([JSON.stringify(chatHistoryJson)], { type: 'application/json' }),
     'chat_history.json',
   );
 
