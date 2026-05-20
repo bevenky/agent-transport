@@ -46,8 +46,10 @@ from livekit.agents.utils import MovingAverage
 from .audio_stream_io import AudioStreamInput, AudioStreamOutput
 from ._room_facade import TransportRoom, create_transport_context
 from ._aio_utils import call_setup as _call_setup
+from .judging import EvaluationConfig, run_configured_judges
 from livekit.rtc.room import SipDTMF
 from .server import JobProcess
+from .observability import _ensure_transport_tags, _get_observability_url
 
 logger = logging.getLogger("agent_transport.audio_stream_server")
 
@@ -187,8 +189,18 @@ class JobContext:
     extra_headers: dict[str, str]
     endpoint: AudioStreamEndpoint
     userdata: dict[str, Any] = field(default_factory=dict)
+    metadata: dict[str, Any] = field(default_factory=dict)
+    """Session metadata to attach to native LiveKit observability tags."""
+    account_id: str | None = None
+    """Account ID for multi-tenancy — set by the consumer per session."""
+    evaluation: EvaluationConfig | None = None
+    """Post-conversation evaluation config for this session."""
 
     _agent_name: str = field(default="agent", repr=False)
+    # Stable developer-supplied id (typically UUID4). Set by the
+    # AudioStreamServer when creating the JobContext per session and
+    # threaded through to the observability emitter.
+    _agent_id: str = field(default="", repr=False)
     _session: Any = field(default=None, repr=False)
     _call_ended: asyncio.Event | None = field(default=None, repr=False)
     _room: Any = field(default=None, repr=False)
@@ -202,6 +214,27 @@ class JobContext:
     def session(self):
         return self._session
 
+    @property
+    def tagger(self):
+        return getattr(self._job_stub, "tagger", None)
+
+    def set_metadata(self, metadata: dict[str, Any]) -> None:
+        """Attach session metadata to native LiveKit observability tags."""
+        self.metadata.update({str(key): value for key, value in metadata.items() if value is not None})
+        if account_id := self.metadata.get("account_id"):
+            self.account_id = str(account_id)
+            self.metadata["account_id"] = self.account_id
+
+        _ensure_transport_tags(
+            self.tagger,
+            account_id=self.account_id,
+            transport="audio_stream",
+            direction=self.direction,
+            agent_id=self._agent_id,
+            agent_name=self._agent_name,
+            metadata=self.metadata,
+        )
+
     @session.setter
     def session(self, session: Any) -> None:
         """Set the agent session — automatically wires audio stream I/O.
@@ -210,6 +243,8 @@ class JobContext:
         call session.start(agent=, room=ctx.room) directly.
         """
         self._session = session
+        if self._job_stub is not None:
+            self._job_stub._primary_agent_session = session
 
         # Wire audio stream I/O before session.start() is called
         session.input.audio = AudioStreamInput(self.endpoint, self.session_id)
@@ -283,8 +318,16 @@ class AudioStreamServer:
         sample_rate: int = 8000,
         host: str = "0.0.0.0",
         port: int | None = None,
+        # `agent_id` is the stable developer-supplied identifier — a UUID4
+        # (or any opaque string) that names this deployment uniquely across
+        # accounts. Mandatory: obs's agents view keys on it, and downstream
+        # `agent_transport_sessions.agent_id` is now NOT NULL.
+        agent_id: str | None = None,
         agent_name: str = "audio-stream-agent",
         auth: Callable[..., bool | Coroutine] | None = None,
+        recording: bool = True,
+        recording_dir: str = "/tmp/agent-sessions",
+        recording_stereo: bool = True,
     ) -> None:
         self._listen_addr = listen_addr or os.environ.get("AUDIO_STREAM_ADDR", "0.0.0.0:8765")
         self._plivo_auth_id = plivo_auth_id or os.environ.get("PLIVO_AUTH_ID", "")
@@ -292,8 +335,24 @@ class AudioStreamServer:
         self._sample_rate = sample_rate
         self._host = host
         self._port = port or int(os.environ.get("PORT", "8080"))
+        # Accept agent_id from explicit kwarg or AGENT_ID env var. We raise
+        # if neither is set rather than silently substituting a slug — the
+        # whole point of making this mandatory is to surface missing IDs
+        # loudly at server-start time instead of corrupting telemetry
+        # downstream.
+        resolved_agent_id = agent_id or os.environ.get("AGENT_ID") or None
+        if not resolved_agent_id:
+            raise ValueError(
+                "AudioStreamServer requires `agent_id` — pass a stable identifier "
+                "(typically a UUID4) via the `agent_id=` kwarg or the AGENT_ID env "
+                "var. This is the value that keys the obs agents view."
+            )
+        self._agent_id = resolved_agent_id
         self._agent_name = agent_name
         self._auth = auth
+        self._recording = recording
+        self._recording_dir = recording_dir
+        self._recording_stereo = recording_stereo
         self._entrypoint_fnc: Callable[..., Coroutine] | None = None
         self._setup_fnc: Callable | None = None
         self._proc = JobProcess()
@@ -480,6 +539,10 @@ class AudioStreamServer:
         )
         logger.info("Audio stream WebSocket server on ws://%s", self._listen_addr)
 
+        obs_url = _get_observability_url()
+        if obs_url:
+            logger.info("Observability enabled, target %s", obs_url)
+
         # Start HTTP server
         http_app = self._build_http_app()
         runner = web.AppRunner(http_app)
@@ -659,9 +722,30 @@ class AudioStreamServer:
                     except Exception:
                         pass
 
-                    # Emit participant_disconnected on Room facade (matches LiveKit WebRTC)
-                    # RoomIO._on_participant_disconnected will call _close_soon() → session closes
+                    # Shut down the session gracefully BEFORE emitting
+                    # participant_disconnected. LiveKit's default handler calls
+                    # `_close_soon(drain=False)`, which force-interrupts any
+                    # in-flight LLM/TTS response — the final assistant message
+                    # (e.g. the reply after a tool call) would never land in
+                    # chat_history. Calling `shutdown(drain=True)` first sets
+                    # `_closing_task` so the subsequent `_close_soon` becomes a
+                    # no-op and the session drains normally, letting in-flight
+                    # speech finalize into history.
                     ctx = self._session_contexts.get(session_id)
+                    if ctx and ctx._session is not None:
+                        try:
+                            ctx._session.shutdown(drain=True)
+                        except Exception:
+                            logger.warning(
+                                "Graceful session shutdown failed; falling back "
+                                "to default close",
+                                exc_info=True,
+                            )
+
+                    # Emit participant_disconnected on Room facade (matches
+                    # LiveKit WebRTC). RoomIO._on_participant_disconnected calls
+                    # `_close_soon(drain=False)`, which is a no-op here because
+                    # `_closing_task` was already set above.
                     if ctx and ctx._room:
                         remote = ctx._room._remote
                         remote.disconnect_reason = 1  # CLIENT_INITIATED
@@ -724,7 +808,11 @@ class AudioStreamServer:
         )
         # Set on JobContext so get_job_context().room works inside handler
         job_stub, job_ctx_token = create_transport_context(
-            room, agent_name=self._agent_name)
+            room,
+            agent_name=self._agent_name,
+            inference_executor=getattr(self, "_inference_executor", None),
+            enable_recording=self._recording,
+        )
 
         ctx = JobContext(
             session_id=session_id,
@@ -735,6 +823,7 @@ class AudioStreamServer:
             endpoint=self._ep,
             userdata=self._userdata,
             _agent_name=self._agent_name,
+            _agent_id=self._agent_id,
             _call_ended=session_ended,
             _room=room,
             _job_stub=job_stub,
@@ -747,6 +836,19 @@ class AudioStreamServer:
             node = _nodename()
             STREAM_SESSIONS_TOTAL.labels(nodename=node).inc()
             session_start = time.monotonic()
+
+            # Start recording if enabled
+            rec_path = None
+            rec_started_at = None
+            if self._recording:
+                try:
+                    os.makedirs(self._recording_dir, exist_ok=True)
+                    rec_path = os.path.join(self._recording_dir, f"recording_{session_id}.ogg")
+                    self._ep.start_recording(session_id, rec_path, self._recording_stereo)
+                    rec_started_at = time.time()
+                except Exception:
+                    rec_path = None
+                    logger.warning("Failed to start recording for session %s", session_id, exc_info=True)
 
             try:
                 await self._entrypoint_fnc(ctx)
@@ -766,10 +868,65 @@ class AudioStreamServer:
                             logger.info("Session %s usage: %s", session_id, usage)
                     except Exception:
                         pass
+
+                    # Wait for session to fully close (preserves in-flight responses in history)
                     try:
-                        await ctx._session.aclose()
+                        close_event = asyncio.Event()
+                        ctx._session.on("close", lambda *_: close_event.set())
+                        try:
+                            await asyncio.wait_for(close_event.wait(), timeout=5.0)
+                        except asyncio.TimeoutError:
+                            await ctx._session.aclose()
                     except Exception:
-                        pass
+                        try:
+                            await ctx._session.aclose()
+                        except Exception:
+                            pass
+
+                    # Stop recording and wait for file to be finalized
+                    if rec_path:
+                        try:
+                            self._ep.stop_recording(session_id)
+                            for _ in range(20):
+                                if os.path.exists(rec_path):
+                                    break
+                                await asyncio.sleep(0.1)
+                        except Exception:
+                            pass
+
+                    # Upload session report (transcript, audio, metrics)
+                    obs_url = _get_observability_url()
+                    if obs_url:
+                        try:
+                            from .observability import upload_session_report
+                            await run_configured_judges(
+                                session=ctx._session,
+                                job_context=ctx._job_stub,
+                                evaluation=ctx.evaluation,
+                                session_id=session_id,
+                                logger=logger,
+                            )
+                            await upload_session_report(
+                                ctx._session, session_id, obs_url, self._agent_name,
+                                rec_path, rec_started_at,
+                                account_id=ctx.account_id,
+                                agent_id=self._agent_id,
+                                transport="audio_stream",
+                                direction=ctx.direction,
+                                metadata=ctx.metadata,
+                                tagger=ctx.tagger,
+                                job_context=ctx._job_stub,
+                            )
+                        except Exception:
+                            logger.warning("Failed to upload session report for session %s", session_id, exc_info=True)
+
+                        # Clean up local recording after upload attempt
+                        if rec_path:
+                            try:
+                                os.remove(rec_path)
+                            except Exception:
+                                logger.warning("Failed to clean up recording %s", rec_path, exc_info=True)
+
                 for cb in ctx._shutdown_callbacks:
                     try:
                         result = cb()

@@ -11,7 +11,10 @@ requires-python = ">=3.10"
 license = "MIT"
 
 [project.optional-dependencies]
-livekit = ["aiohttp", "livekit-agents>=1.5"]
+# livekit-agents 1.5.2 introduced the narrow Judge API + private `_LLMJudge`
+# that JudgeGroup and the built-in factories rely on; <1.6 caps before any
+# future major shape change. See `sip/livekit/judging.py:_check_livekit_agents_compat`.
+livekit = ["aiohttp", "livekit-agents>=1.5.2,<1.6"]
 pipecat = ["pipecat-ai>=0.0.108"]
 all = ["agent-transport[livekit,pipecat]"]
 
